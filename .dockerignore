@@ -1,0 +1,6 @@
+target
+media
+.git
+.gitignore
+*.md
+!README.md
