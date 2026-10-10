@@ -2,6 +2,7 @@
 name = "lcmediaserver-engine"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Multi-output canvas playback engine (WATCHOUT-style): arrange displays on a virtual canvas, place content across them, with per-output warp and edge-blend"
 license = "MIT"
 

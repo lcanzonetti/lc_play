@@ -14,6 +14,10 @@ use tokio_util::io::ReaderStream;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Read size for streamed bodies. `ReaderStream`'s 4 KiB default means one
+/// syscall and one body frame per 4 KiB — far too fine-grained for media.
+pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
+
 /// `GET /stream/{id}` — stream the original file, honouring `Range`.
 pub async fn stream_media(
     State(state): State<AppState>,
@@ -30,7 +34,7 @@ pub async fn stream_media(
     match parse_range(headers.get(header::RANGE), total)? {
         // Whole file: 200 OK.
         None => {
-            let stream = ReaderStream::new(file);
+            let stream = ReaderStream::with_capacity(file, STREAM_CHUNK);
             let body = Body::from_stream(stream);
             Ok((
                 [
@@ -47,7 +51,7 @@ pub async fn stream_media(
             let len = end - start + 1;
             let mut file = file;
             file.seek(std::io::SeekFrom::Start(start)).await?;
-            let stream = ReaderStream::new(file.take(len));
+            let stream = ReaderStream::with_capacity(file.take(len), STREAM_CHUNK);
             let body = Body::from_stream(stream);
 
             Ok((

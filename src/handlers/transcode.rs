@@ -22,11 +22,13 @@ use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use pin_project_lite::pin_project;
 use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
 use crate::error::AppError;
+use crate::handlers::stream::STREAM_CHUNK;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -80,7 +82,7 @@ pub async fn transcode_media(
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
@@ -95,10 +97,22 @@ pub async fn transcode_media(
         .take()
         .ok_or_else(|| AppError::Internal("ffmpeg produced no stdout".into()))?;
 
+    // Forward ffmpeg's diagnostics (`-loglevel error`, so only real problems)
+    // to our logs; otherwise a failed transcode is just a silent empty body.
+    if let Some(stderr) = child.stderr.take() {
+        let source = item.path.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(item = %source, "ffmpeg: {line}");
+            }
+        });
+    }
+
     tracing::debug!(item = %item.path, %format, "transcode started");
 
     let stream = TranscodeStream {
-        inner: ReaderStream::new(stdout),
+        inner: ReaderStream::with_capacity(stdout, STREAM_CHUNK),
         _child: child,
         _permit: permit,
     };

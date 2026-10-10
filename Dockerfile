@@ -3,14 +3,19 @@ FROM rust:1-slim AS build
 WORKDIR /app
 
 # Pre-cache dependencies: copy manifests, build a stub, then the real sources.
+# The repo is a Cargo workspace, so the engine's manifest (plus a stub source)
+# must exist for cargo to load it; `-p lcmediaserver` builds only the server.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
-    && cargo build --release \
+COPY engine/Cargo.toml engine/Cargo.toml
+RUN mkdir -p src engine/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > engine/src/main.rs \
+    && cargo build --release --locked -p lcmediaserver \
     && rm -rf src
 
 COPY src ./src
 # Touch main so cargo rebuilds it against the cached deps.
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked -p lcmediaserver
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim AS runtime

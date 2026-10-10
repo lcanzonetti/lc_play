@@ -6,15 +6,15 @@
   "outputs": [
     {
       "id": "left",
-      "canvas_rect": { "x": 0, "y": 0, "w": 960, "h": 1080 },
-      "window": { "size": [960, 1080], "position": [0, 0] },
-      "blend": { "right": 0.08, "gamma": 2.2 }
+      "canvas_rect": { "x": 0, "y": 0, "w": 1024, "h": 1080 },
+      "window": { "size": [1024, 1080], "position": [0, 0] },
+      "blend": { "right": 0.125 }
     },
     {
       "id": "right",
-      "canvas_rect": { "x": 960, "y": 0, "w": 960, "h": 1080 },
-      "window": { "size": [960, 1080], "position": [980, 0] },
-      "blend": { "left": 0.08, "gamma": 2.2 }
+      "canvas_rect": { "x": 896, "y": 0, "w": 1024, "h": 1080 },
+      "window": { "size": [1024, 1080], "position": [1044, 0] },
+      "blend": { "left": 0.125 }
     }
   ],
 

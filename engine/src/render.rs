@@ -5,16 +5,22 @@
 //! slice" texture, per-layer uniform buffers, and the warp mesh + blend uniform
 //! for that output.
 //!
-//! Per output, each frame runs two passes:
+//! A frame renders **every output together**: one show-clock sample, one
+//! command encoder, one queue submit, then all surfaces are presented. That is
+//! what keeps outputs in lockstep — they can never show different show times,
+//! and N windows don't serialize on N separate vsync waits.
+//!
+//! Per output, the frame runs two passes:
 //!   1. **scene** → render every visible layer into the slice texture using the
 //!      output's view-projection (so content spanning outputs is clipped per
 //!      output automatically);
-//!   2. **warp** → sample the slice through the warp mesh and multiply by the
-//!      edge-blend mask, writing to the window surface.
+//!   2. **warp** → sample the slice through the perspective warp mesh and
+//!      multiply by the edge-blend mask, writing to the window surface.
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
+use glam::{Mat3, Vec2, Vec3};
 use wgpu::util::DeviceExt as _;
 use winit::window::Window;
 
@@ -23,8 +29,10 @@ use crate::show::{Output, Show};
 
 /// Offscreen "canvas slice" format. sRGB so shader math stays in linear space.
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-/// Warp mesh resolution (cells per side). Higher = smoother non-linear warps.
-const WARP_GRID: u32 = 32;
+/// Warp mesh resolution (cells per side). The corner-pin warp is exact at any
+/// resolution (perspective-correct interpolation); the grid exists so freeform
+/// mesh warps (Phase 3) can move interior points.
+const WARP_GRID: u32 = 16;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -41,31 +49,44 @@ struct BlendUniform {
     right: f32,
     top: f32,
     bottom: f32,
-    gamma: f32,
+    gamma_exp: f32,
     _pad: [f32; 3],
 }
 
+// Uniform layouts must match the WGSL structs byte-for-byte.
+const _: () = assert!(std::mem::size_of::<SceneUniform>() == 80);
+const _: () = assert!(std::mem::size_of::<BlendUniform>() == 32);
+
+/// Unit-quad vertex for the scene pass.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct Vertex {
+struct QuadVertex {
     pos: [f32; 2],
     uv: [f32; 2],
 }
 
-const QUAD_VERTS: [Vertex; 4] = [
-    Vertex {
+/// Warp-mesh vertex: homogeneous clip position + slice UV.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct WarpVertex {
+    clip: [f32; 4],
+    uv: [f32; 2],
+}
+
+const QUAD_VERTS: [QuadVertex; 4] = [
+    QuadVertex {
         pos: [0.0, 0.0],
         uv: [0.0, 0.0],
     },
-    Vertex {
+    QuadVertex {
         pos: [1.0, 0.0],
         uv: [1.0, 0.0],
     },
-    Vertex {
+    QuadVertex {
         pos: [0.0, 1.0],
         uv: [0.0, 1.0],
     },
-    Vertex {
+    QuadVertex {
         pos: [1.0, 1.0],
         uv: [1.0, 1.0],
     },
@@ -106,16 +127,6 @@ impl Gpu {
         }))
         .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter found"))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("lcme-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))?;
-
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
@@ -124,20 +135,56 @@ impl Gpu {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        let gpu = Self::with_adapter(instance, adapter, surface_format)?;
+        Ok((gpu, surface))
+    }
+
+    /// A device with no window, for offscreen rendering tests. `None` when the
+    /// machine has no usable adapter (e.g. CI without a software rasterizer).
+    #[cfg(test)]
+    pub fn headless() -> Option<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+        Self::with_adapter(instance, adapter, SCENE_FORMAT).ok()
+    }
+
+    /// Create the device and build every pipeline for a given output format.
+    fn with_adapter(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        surface_format: wgpu::TextureFormat,
+    ) -> anyhow::Result<Self> {
+        // Request the adapter's real limits rather than the conservative
+        // defaults (8192px max texture): canvas-spanning content such as a
+        // 3×4K panorama needs the full size the GPU supports.
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("lcme-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))?;
+
+        let uniform_entry = |visibility| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene-uniform-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(wgpu::ShaderStages::VERTEX_FRAGMENT)],
         });
-
+        let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blend-bgl"),
+            entries: &[uniform_entry(wgpu::ShaderStages::FRAGMENT)],
+        });
         let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture-bgl"),
             entries: &[
@@ -160,20 +207,6 @@ impl Gpu {
             ],
         });
 
-        let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blend-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear-clamp"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -181,7 +214,6 @@ impl Gpu {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -194,81 +226,80 @@ impl Gpu {
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/warp.wgsl").into()),
         });
 
-        const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
+        const QUAD_ATTRS: [wgpu::VertexAttribute; 2] =
             wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+        const WARP_ATTRS: [wgpu::VertexAttribute; 2] =
+            wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x2];
+        let quad_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &VERTEX_ATTRS,
+            attributes: &QUAD_ATTRS,
+        };
+        let warp_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<WarpVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &WARP_ATTRS,
         };
 
-        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene-layout"),
-            bind_group_layouts: &[&uniform_bgl, &texture_bgl],
-            push_constant_ranges: &[],
-        });
-        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene-pipeline"),
-            layout: Some(&scene_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vs"),
-                buffers: std::slice::from_ref(&vertex_layout),
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: SCENE_FORMAT,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = |label: &str,
+                        layouts: &[&wgpu::BindGroupLayout],
+                        shader: &wgpu::ShaderModule,
+                        vertex_layout: wgpu::VertexBufferLayout,
+                        format: wgpu::TextureFormat,
+                        blend: Option<wgpu::BlendState>| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: layouts,
+                push_constant_ranges: &[],
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs"),
+                    buffers: &[vertex_layout],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
 
-        let warp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("warp-layout"),
-            bind_group_layouts: &[&blend_bgl, &texture_bgl],
-            push_constant_ranges: &[],
-        });
-        let warp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("warp-pipeline"),
-            layout: Some(&warp_layout),
-            vertex: wgpu::VertexState {
-                module: &warp_shader,
-                entry_point: Some("vs"),
-                buffers: std::slice::from_ref(&vertex_layout),
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &warp_shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        // Scene: premultiplied "over" compositing of layers.
+        let scene_pipeline = pipeline(
+            "scene-pipeline",
+            &[&uniform_bgl, &texture_bgl],
+            &scene_shader,
+            quad_layout,
+            SCENE_FORMAT,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
+        // Warp: the final image replaces the surface contents; no blending.
+        let warp_pipeline = pipeline(
+            "warp-pipeline",
+            &[&blend_bgl, &texture_bgl],
+            &warp_shader,
+            warp_vertex_layout,
+            surface_format,
+            None,
+        );
 
         let quad_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-vbo"),
@@ -281,24 +312,21 @@ impl Gpu {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        Ok((
-            Gpu {
-                instance,
-                adapter,
-                device,
-                queue,
-                surface_format,
-                scene_pipeline,
-                warp_pipeline,
-                uniform_bgl,
-                texture_bgl,
-                blend_bgl,
-                sampler,
-                quad_vbo,
-                quad_ibo,
-            },
-            surface,
-        ))
+        Ok(Gpu {
+            instance,
+            adapter,
+            device,
+            queue,
+            surface_format,
+            scene_pipeline,
+            warp_pipeline,
+            uniform_bgl,
+            texture_bgl,
+            blend_bgl,
+            sampler,
+            quad_vbo,
+            quad_ibo,
+        })
     }
 
     /// Create a surface for an additional window (outputs after the first).
@@ -326,31 +354,48 @@ impl Gpu {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&self.device, &config);
+        let res = self.build_resources(config.width, config.height, output, layer_count);
+        OutputGpu {
+            surface,
+            config,
+            res,
+        }
+    }
 
-        let (scene_tex, scene_bg) = self.make_scene_target(config.width, config.height);
+    /// Everything an output needs to render, independent of where the final
+    /// image goes (a window surface, or an offscreen texture in tests).
+    fn build_resources(
+        &self,
+        width: u32,
+        height: u32,
+        output: &Output,
+        layer_count: usize,
+    ) -> OutputResources {
+        // A 90°/270° display shows the slice sideways, so render the slice at
+        // the rotated resolution to keep it pixel-for-pixel with the display.
+        let rotated = matches!(output.rotation_degrees, 90 | 270);
+        let (scene_tex, scene_view, scene_bg) = self.make_scene_target(width, height, rotated);
 
         // Per-layer uniform buffers + bind groups (values rewritten each frame).
-        let mut layer_uniforms = Vec::with_capacity(layer_count);
-        let mut layer_uniform_bgs = Vec::with_capacity(layer_count);
-        for i in 0..layer_count {
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("scene-uniform"),
-                size: std::mem::size_of::<SceneUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("scene-uniform-bg"),
-                layout: &self.uniform_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buf.as_entire_binding(),
-                }],
-            });
-            let _ = i;
-            layer_uniforms.push(buf);
-            layer_uniform_bgs.push(bg);
-        }
+        let (layer_uniforms, layer_uniform_bgs) = (0..layer_count)
+            .map(|_| {
+                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("scene-uniform"),
+                    size: std::mem::size_of::<SceneUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene-uniform-bg"),
+                    layout: &self.uniform_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    }],
+                });
+                (buf, bg)
+            })
+            .unzip();
 
         // Warp mesh + blend uniform for this output.
         let (warp_vbo, warp_ibo, warp_index_count) = self.make_warp_mesh(output);
@@ -359,7 +404,7 @@ impl Gpu {
             right: output.blend.right,
             top: output.blend.top,
             bottom: output.blend.bottom,
-            gamma: output.blend.gamma,
+            gamma_exp: 2.2 / output.blend.gamma,
             _pad: [0.0; 3],
         };
         let blend_buf = self
@@ -378,10 +423,10 @@ impl Gpu {
             }],
         });
 
-        OutputGpu {
-            surface,
-            config,
-            scene_tex,
+        OutputResources {
+            rotated,
+            _scene_tex: scene_tex,
+            scene_view,
             scene_bg,
             layer_uniforms,
             layer_uniform_bgs,
@@ -393,7 +438,17 @@ impl Gpu {
         }
     }
 
-    fn make_scene_target(&self, width: u32, height: u32) -> (wgpu::Texture, wgpu::BindGroup) {
+    fn make_scene_target(
+        &self,
+        width: u32,
+        height: u32,
+        rotated: bool,
+    ) -> (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup) {
+        let (width, height) = if rotated {
+            (height, width)
+        } else {
+            (width, height)
+        };
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scene-slice"),
             size: wgpu::Extent3d {
@@ -423,63 +478,11 @@ impl Gpu {
                 },
             ],
         });
-        (tex, bg)
+        (tex, view, bg)
     }
 
-    /// Build the warp mesh for one output: a grid whose destination positions
-    /// come from bilinear interpolation of the four (optionally moved) corners,
-    /// then the display rotation, converted to NDC. UVs are the grid params.
     fn make_warp_mesh(&self, output: &Output) -> (wgpu::Buffer, wgpu::Buffer, u32) {
-        // Corners in normalized output space (TL, TR, BR, BL).
-        let corners =
-            output
-                .warp
-                .corners
-                .unwrap_or([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
-        let tl = glam::Vec2::from(corners[0]);
-        let tr = glam::Vec2::from(corners[1]);
-        let br = glam::Vec2::from(corners[2]);
-        let bl = glam::Vec2::from(corners[3]);
-
-        let theta = (output.rotation_degrees as f32).to_radians();
-        let (s, c) = theta.sin_cos();
-
-        let mut verts: Vec<Vertex> =
-            Vec::with_capacity(((WARP_GRID + 1) * (WARP_GRID + 1)) as usize);
-        for gy in 0..=WARP_GRID {
-            let v = gy as f32 / WARP_GRID as f32;
-            for gx in 0..=WARP_GRID {
-                let u = gx as f32 / WARP_GRID as f32;
-                // Bilinear interpolation of the four corners.
-                let top = tl.lerp(tr, u);
-                let bottom = bl.lerp(br, u);
-                let mut p = top.lerp(bottom, v); // normalized output space, y-down
-
-                // Display rotation about the center.
-                let d = p - glam::Vec2::splat(0.5);
-                p = glam::Vec2::new(0.5 + d.x * c - d.y * s, 0.5 + d.x * s + d.y * c);
-
-                // Normalized (y-down) -> NDC (y-up).
-                let ndc = [p.x * 2.0 - 1.0, 1.0 - p.y * 2.0];
-                verts.push(Vertex {
-                    pos: ndc,
-                    uv: [u, v],
-                });
-            }
-        }
-
-        let stride = WARP_GRID + 1;
-        let mut indices: Vec<u32> = Vec::with_capacity((WARP_GRID * WARP_GRID * 6) as usize);
-        for gy in 0..WARP_GRID {
-            for gx in 0..WARP_GRID {
-                let i0 = gy * stride + gx;
-                let i1 = i0 + 1;
-                let i2 = i0 + stride;
-                let i3 = i2 + 1;
-                indices.extend_from_slice(&[i0, i1, i2, i2, i1, i3]);
-            }
-        }
-
+        let (verts, indices) = warp_mesh(output);
         let vbo = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -504,68 +507,105 @@ impl Gpu {
         out.config.width = width;
         out.config.height = height;
         out.surface.configure(&self.device, &out.config);
-        let (tex, bg) = self.make_scene_target(width, height);
-        out.scene_tex = tex;
-        out.scene_bg = bg;
+        let res = &mut out.res;
+        let (tex, view, bg) = self.make_scene_target(width, height, res.rotated);
+        res._scene_tex = tex;
+        res.scene_view = view;
+        res.scene_bg = bg;
     }
 
-    /// Render one output for the current show time.
-    pub fn render_output(
+    /// Acquire every output's surface, encode all of them into one command
+    /// buffer for show time `now`, and submit once. Call
+    /// [`PendingFrame::present`] afterwards to put the frame on screen.
+    pub fn draw(
         &self,
-        out: &mut OutputGpu,
+        targets: &[(&OutputGpu, &Output)],
         show: &Show,
         now: f64,
-        contents: &mut [Box<dyn Content>],
+        contents: &[Box<dyn Content>],
         draw_order: &[usize],
-        canvas_output: &Output,
-    ) -> Result<(), wgpu::SurfaceError> {
-        let frame = out.surface.get_current_texture()?;
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+    ) -> PendingFrame {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame-encoder"),
+            });
+        let mut frames = Vec::with_capacity(targets.len());
+        let mut errors = Vec::new();
 
-        let view_proj = canvas_output.canvas_rect.view_projection();
-
-        // Write per-layer uniforms for this output.
-        for &i in draw_order {
-            let layer = &show.layers[i];
-            if !layer.timing.visible_at(now) {
-                continue;
+        for (ti, &(out, output)) in targets.iter().enumerate() {
+            match out.surface.get_current_texture() {
+                Ok(frame) => {
+                    let view = frame
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    self.encode_output(
+                        &mut encoder,
+                        &view,
+                        &out.res,
+                        output,
+                        show,
+                        now,
+                        contents,
+                        draw_order,
+                    );
+                    frames.push(frame);
+                }
+                Err(e) => errors.push((ti, e)),
             }
-            let mvp = view_proj * layer.transform.model_matrix();
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        PendingFrame { frames, errors }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_output(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_view: &wgpu::TextureView,
+        out: &OutputResources,
+        output: &Output,
+        show: &Show,
+        now: f64,
+        contents: &[Box<dyn Content>],
+        draw_order: &[usize],
+    ) {
+        let view_proj = output.canvas_rect.view_projection();
+        let visible = || {
+            draw_order
+                .iter()
+                .copied()
+                .filter(|&i| show.layers[i].timing.visible_at(now))
+        };
+
+        // Per-layer uniforms for this output (staged; applied at submit).
+        for i in visible() {
+            let t = &show.layers[i].transform;
             let u = SceneUniform {
-                mvp: mvp.to_cols_array_2d(),
-                opacity: layer.transform.opacity,
+                mvp: (view_proj * t.model_matrix()).to_cols_array_2d(),
+                opacity: t.opacity,
                 _pad: [0.0; 3],
             };
             self.queue
                 .write_buffer(&out.layer_uniforms[i], 0, bytemuck::bytes_of(&u));
         }
 
-        let scene_view = out
-            .scene_tex
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame-encoder"),
-            });
-
         // --- scene pass ---
         {
-            let bg = show.canvas.background;
+            // Clear color is premultiplied like everything else in the slice.
+            let [r, g, b, a] = show.canvas.background.map(f64::from);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &scene_view,
+                    view: &out.scene_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: bg[0] as f64,
-                            g: bg[1] as f64,
-                            b: bg[2] as f64,
-                            a: bg[3] as f64,
+                            r: r * a,
+                            g: g * a,
+                            b: b * a,
+                            a,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -577,10 +617,7 @@ impl Gpu {
             pass.set_pipeline(&self.scene_pipeline);
             pass.set_vertex_buffer(0, self.quad_vbo.slice(..));
             pass.set_index_buffer(self.quad_ibo.slice(..), wgpu::IndexFormat::Uint16);
-            for &i in draw_order {
-                if !show.layers[i].timing.visible_at(now) {
-                    continue;
-                }
+            for i in visible() {
                 pass.set_bind_group(0, &out.layer_uniform_bgs[i], &[]);
                 pass.set_bind_group(1, contents[i].bind_group(), &[]);
                 pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..1);
@@ -592,7 +629,7 @@ impl Gpu {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("warp-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame_view,
+                    view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -610,10 +647,6 @@ impl Gpu {
             pass.set_index_buffer(out.warp_ibo.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..out.warp_index_count, 0, 0..1);
         }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        Ok(())
     }
 
     /// Expose the adapter name for logging.
@@ -621,13 +654,87 @@ impl Gpu {
         let info = self.adapter.get_info();
         format!("{} ({:?})", info.name, info.backend)
     }
+
+    /// Largest texture edge this device accepts.
+    pub fn max_texture_dimension(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
 }
 
-/// Per-output GPU state.
+/// A frame that has been submitted but not yet shown.
+pub struct PendingFrame {
+    frames: Vec<wgpu::SurfaceTexture>,
+    /// Outputs whose surface could not be acquired, by index into `targets`.
+    pub errors: Vec<(usize, wgpu::SurfaceError)>,
+}
+
+impl PendingFrame {
+    /// Present every acquired surface back-to-back.
+    pub fn present(self) -> Vec<(usize, wgpu::SurfaceError)> {
+        for frame in self.frames {
+            frame.present();
+        }
+        self.errors
+    }
+}
+
+/// Build one output's warp mesh.
+///
+/// Each grid point `(u, v)` is pushed through the corner-pin homography, then
+/// the display rotation and the normalized→NDC mapping. Those last two are
+/// affine, so the whole chain is a single 3×3 matrix and the result stays
+/// homogeneous: we emit `(x, y, 0, w)` and let the GPU divide, which makes the
+/// interpolated slice UVs perspective-correct.
+fn warp_mesh(output: &Output) -> (Vec<WarpVertex>, Vec<u32>) {
+    let center = Vec2::splat(0.5);
+    let rotate = Mat3::from_translation(center)
+        * Mat3::from_angle((output.rotation_degrees as f32).to_radians())
+        * Mat3::from_translation(-center);
+    // Normalized output space (y down, 0..1) -> NDC (y up, -1..1).
+    let to_ndc = Mat3::from_cols(
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(0.0, -2.0, 0.0),
+        Vec3::new(-1.0, 1.0, 1.0),
+    );
+    let m = to_ndc * rotate * output.warp.homography();
+
+    let n = WARP_GRID;
+    let mut verts = Vec::with_capacity(((n + 1) * (n + 1)) as usize);
+    for gy in 0..=n {
+        let v = gy as f32 / n as f32;
+        for gx in 0..=n {
+            let u = gx as f32 / n as f32;
+            let p = m * Vec3::new(u, v, 1.0);
+            verts.push(WarpVertex {
+                clip: [p.x, p.y, 0.0, p.z],
+                uv: [u, v],
+            });
+        }
+    }
+
+    let stride = n + 1;
+    let mut indices = Vec::with_capacity((n * n * 6) as usize);
+    for gy in 0..n {
+        for gx in 0..n {
+            let i0 = gy * stride + gx;
+            let (i1, i2) = (i0 + 1, i0 + stride);
+            indices.extend_from_slice(&[i0, i1, i2, i2, i1, i2 + 1]);
+        }
+    }
+    (verts, indices)
+}
+
+/// Per-output GPU state: the window surface plus its render resources.
 pub struct OutputGpu {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    scene_tex: wgpu::Texture,
+    res: OutputResources,
+}
+
+struct OutputResources {
+    rotated: bool,
+    _scene_tex: wgpu::Texture,
+    scene_view: wgpu::TextureView,
     scene_bg: wgpu::BindGroup,
     layer_uniforms: Vec<wgpu::Buffer>,
     layer_uniform_bgs: Vec<wgpu::BindGroup>,
@@ -636,4 +743,211 @@ pub struct OutputGpu {
     warp_index_count: u32,
     _blend_buf: wgpu::Buffer,
     blend_bg: wgpu::BindGroup,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::show::Show;
+
+    fn output(json_extra: &str) -> Output {
+        let json = format!(
+            r#"{{ "canvas": {{ "width": 100, "height": 100 }},
+                 "outputs": [ {{ "id": "o", "canvas_rect": {{ "x": 0, "y": 0, "w": 100, "h": 100 }} {json_extra} }} ] }}"#
+        );
+        Show::from_json(&json).unwrap().outputs.remove(0)
+    }
+
+    fn ndc(v: &WarpVertex) -> Vec2 {
+        Vec2::new(v.clip[0] / v.clip[3], v.clip[1] / v.clip[3])
+    }
+
+    #[test]
+    fn identity_mesh_covers_the_full_viewport() {
+        let (verts, _) = warp_mesh(&output(""));
+        let n = WARP_GRID as usize;
+        assert!(ndc(&verts[0]).distance(Vec2::new(-1.0, 1.0)) < 1e-5); // TL
+        assert!(ndc(&verts[n]).distance(Vec2::new(1.0, 1.0)) < 1e-5); // TR
+        assert!(ndc(verts.last().unwrap()).distance(Vec2::new(1.0, -1.0)) < 1e-5);
+        // BR
+    }
+
+    #[test]
+    fn keystone_mesh_has_positive_w_everywhere() {
+        // w <= 0 would flip or clip geometry; a valid convex pin must avoid it.
+        let (verts, _) = warp_mesh(&output(
+            r#", "warp": { "corners": [[0.25,0.0],[0.75,0.0],[1.0,1.0],[0.0,1.0]] }"#,
+        ));
+        assert!(verts.iter().all(|v| v.clip[3] > 0.0));
+    }
+
+    #[test]
+    fn rotation_90_moves_top_left_to_top_right() {
+        // Rotating the image 90° (clockwise on a y-down display) sends the
+        // slice's top-left corner to the display's top-right.
+        let (verts, _) = warp_mesh(&output(r#", "rotation_degrees": 90"#));
+        assert!(ndc(&verts[0]).distance(Vec2::new(1.0, 1.0)) < 1e-5);
+    }
+
+    // ---- offscreen GPU tests -------------------------------------------------
+    //
+    // These run the real pipelines and shaders through `encode_output` and read
+    // the pixels back. They need a GPU adapter; a software one (Mesa lavapipe)
+    // is enough. Without any adapter they skip rather than fail.
+
+    use crate::content::{self, srgb_to_linear, TextureFactory};
+
+    fn gpu_or_skip() -> Option<Gpu> {
+        let gpu = Gpu::headless();
+        if gpu.is_none() {
+            eprintln!("skipping GPU test: no adapter (install mesa-vulkan-drivers)");
+        }
+        gpu
+    }
+
+    /// Render output `idx` of `show` at t=0 into a `w`×`h` offscreen target and
+    /// return its pixels as linear RGB. `w` must be a multiple of 64 (row
+    /// alignment for the readback copy).
+    fn render_offscreen(gpu: &Gpu, show: &Show, idx: usize, w: u32, h: u32) -> Vec<[f32; 3]> {
+        let factory = TextureFactory {
+            device: &gpu.device,
+            queue: &gpu.queue,
+            layout: &gpu.texture_bgl,
+            sampler: &gpu.sampler,
+            max_dimension: gpu.max_texture_dimension(),
+        };
+        let contents: Vec<_> = show
+            .layers
+            .iter()
+            .map(|l| content::build(&l.source, &factory).unwrap())
+            .collect();
+        let order: Vec<usize> = (0..show.layers.len()).collect();
+        let output = &show.outputs[idx];
+        let res = gpu.build_resources(w, h, output, show.layers.len());
+
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: gpu.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-readback"),
+            size: (w * h * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        let view = target.create_view(&Default::default());
+        gpu.encode_output(&mut enc, &view, &res, output, show, 0.0, &contents, &order);
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+            },
+            size,
+        );
+        gpu.queue.submit(Some(enc.finish()));
+
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        gpu.device.poll(wgpu::Maintain::Wait);
+        let bytes = readback.slice(..).get_mapped_range();
+        let lin = |b: u8| srgb_to_linear(b as f32 / 255.0);
+        bytes
+            .chunks_exact(4)
+            .map(|p| [lin(p[0]), lin(p[1]), lin(p[2])])
+            .collect()
+    }
+
+    #[test]
+    fn edge_blend_overlap_sums_to_full_light() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        // Two 128px outputs whose canvas slices overlap by 32px (25%).
+        let show = Show::from_json(
+            r#"{ "canvas": { "width": 224, "height": 64 },
+                 "outputs": [
+                   { "id": "a", "canvas_rect": { "x": 0,  "y": 0, "w": 128, "h": 64 }, "blend": { "right": 0.25 } },
+                   { "id": "b", "canvas_rect": { "x": 96, "y": 0, "w": 128, "h": 64 }, "blend": { "left": 0.25 } } ],
+                 "layers": [ { "id": "white", "source": { "type": "color", "rgba": [1,1,1,1] },
+                               "transform": { "position": [112,32], "size": [224,64] } } ] }"#,
+        )
+        .unwrap();
+        let a = render_offscreen(&gpu, &show, 0, 128, 64);
+        let b = render_offscreen(&gpu, &show, 1, 128, 64);
+        let row = 32 * 128;
+
+        assert!(
+            a[row + 10][0] > 0.99,
+            "left output dimmed outside the blend"
+        );
+        assert!(
+            b[row + 100][0] > 0.99,
+            "right output dimmed outside the blend"
+        );
+        // Canvas x 96..128 is seen by both: the light must add up to 1.
+        for j in 0..32 {
+            let (la, lb) = (a[row + 96 + j][0], b[row + j][0]);
+            assert!(
+                (la + lb - 1.0).abs() < 0.02,
+                "canvas x {}: {la:.3} + {lb:.3} != 1",
+                96 + j
+            );
+        }
+        // A real ramp, not a hard cut.
+        assert!((0.2..0.8).contains(&a[row + 112][0]));
+    }
+
+    #[test]
+    fn translucent_layer_composites_in_linear_light() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        let show = Show::from_json(
+            r#"{ "canvas": { "width": 64, "height": 64 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 64, "h": 64 } } ],
+                 "layers": [ { "id": "red", "source": { "type": "color", "rgba": [1,0,0,0.5] },
+                               "transform": { "position": [32,32], "size": [64,64] } } ] }"#,
+        )
+        .unwrap();
+        let px = render_offscreen(&gpu, &show, 0, 64, 64)[32 * 64 + 32];
+        assert!((px[0] - 0.5).abs() < 0.01, "red over black: {px:?}");
+        assert!(px[1] < 0.01 && px[2] < 0.01, "{px:?}");
+    }
+
+    #[test]
+    fn corner_pin_confines_the_image_to_the_quad() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        let show = Show::from_json(
+            r#"{ "canvas": { "width": 64, "height": 64 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 64, "h": 64 },
+                                "warp": { "corners": [[0.25,0.25],[0.75,0.25],[0.75,0.75],[0.25,0.75]] } } ],
+                 "layers": [ { "id": "white", "source": { "type": "color", "rgba": [1,1,1,1] },
+                               "transform": { "position": [32,32], "size": [64,64] } } ] }"#,
+        )
+        .unwrap();
+        let px = render_offscreen(&gpu, &show, 0, 64, 64);
+        let at = |x: usize, y: usize| px[y * 64 + x][0];
+        assert!(at(32, 32) > 0.99, "inside the pinned quad should be lit");
+        assert!(at(4, 4) < 0.01 && at(10, 32) < 0.01 && at(60, 60) < 0.01);
+    }
 }

@@ -1,10 +1,13 @@
 //! The windowing + event-loop layer (winit 0.30 `ApplicationHandler`).
 //!
 //! On start it creates one borderless window per output, brings up the GPU,
-//! loads each layer's content once, then drives a continuous frame loop. All
-//! windows read the same [`Clock`], so playback stays synchronized across
-//! outputs. Keyboard transport: Space = play/pause, ←/→ = seek ±5s,
-//! ↓/↑ = seek ±30s, Esc = quit.
+//! loads each layer's content once, then drives a continuous frame loop. Each
+//! frame samples the [`Clock`] **once** and renders every output from that
+//! single timestamp in one GPU submission, so outputs never disagree about
+//! show time. Pacing comes from vsync (FIFO present).
+//!
+//! Keyboard transport: Space = play/pause, ←/→ = seek ±5s, ↓/↑ = seek ±30s,
+//! Esc = quit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,7 +84,7 @@ impl App {
         let (gpu, first_surface) = Gpu::new(created[0].clone())?;
         tracing::info!("GPU: {}", gpu.adapter_info());
         self.gpu = Some(gpu);
-        self.build_contents()?;
+        self.build_contents();
 
         // 3. Build per-output GPU state.
         let gpu = self.gpu.as_ref().unwrap();
@@ -116,13 +119,17 @@ impl App {
         Ok(())
     }
 
-    fn build_contents(&mut self) -> anyhow::Result<()> {
+    /// Load every layer's content. A layer whose source fails (missing file,
+    /// oversized image, ...) gets a visible placeholder and an error log rather
+    /// than taking the whole show down.
+    fn build_contents(&mut self) {
         let gpu = self.gpu.as_ref().unwrap();
         let factory = TextureFactory {
             device: &gpu.device,
             queue: &gpu.queue,
             layout: &gpu.texture_bgl,
             sampler: &gpu.sampler,
+            max_dimension: gpu.max_texture_dimension(),
         };
         self.contents = self
             .show
@@ -130,38 +137,51 @@ impl App {
             .iter()
             .map(|layer| {
                 tracing::debug!(layer = %layer.id, "loading content");
-                content::build(&layer.source, &factory)
+                content::build(&layer.source, &factory).unwrap_or_else(|e| {
+                    tracing::error!(layer = %layer.id, "{e:#}; showing placeholder");
+                    content::placeholder(&factory)
+                })
             })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(())
+            .collect();
     }
 
-    fn render(&mut self, idx: usize) {
+    /// Render all outputs for one show-clock sample, then present them together.
+    fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
         let now = self.clock.now();
-        let rw = &mut self.windows[idx];
-        let output = &self.show.outputs[rw.output_idx];
+        for c in &mut self.contents {
+            c.update(now, &gpu.queue);
+        }
 
-        match gpu.render_output(
-            &mut rw.gpu,
-            &self.show,
-            now,
-            &mut self.contents,
-            &self.draw_order,
-            output,
-        ) {
-            Ok(()) => {}
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                let size = rw.window.inner_size();
-                gpu.resize_output(&mut rw.gpu, size.width, size.height);
+        let targets: Vec<_> = self
+            .windows
+            .iter()
+            .map(|rw| (&rw.gpu, &self.show.outputs[rw.output_idx]))
+            .collect();
+        let frame = gpu.draw(&targets, &self.show, now, &self.contents, &self.draw_order);
+        for rw in &self.windows {
+            rw.window.pre_present_notify();
+        }
+        let errors = frame.present();
+
+        for (idx, err) in errors {
+            let rw = &mut self.windows[idx];
+            match err {
+                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                    let size = rw.window.inner_size();
+                    gpu.resize_output(&mut rw.gpu, size.width, size.height);
+                }
+                wgpu::SurfaceError::OutOfMemory => {
+                    tracing::error!("GPU out of memory; exiting");
+                    event_loop.exit();
+                }
+                // Typical for a minimized/occluded window; it would otherwise
+                // log at the frame rate.
+                wgpu::SurfaceError::Timeout => tracing::debug!(output = idx, "surface timeout"),
+                e => tracing::warn!("surface error: {e:?}"),
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                tracing::error!("GPU out of memory; exiting");
-                std::process::exit(1);
-            }
-            Err(e) => tracing::warn!("surface error: {e:?}"),
         }
     }
 }
@@ -233,24 +253,15 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
-            WindowEvent::RedrawRequested => self.render(idx),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Continuous playback: advance dynamic content once per cycle, then ask
-        // every window to redraw. They all read the same clock, so they stay
-        // in sync.
-        if let Some(gpu) = self.gpu.as_ref() {
-            let now = self.clock.now();
-            for c in &mut self.contents {
-                c.update(now, &gpu.queue);
-            }
-            for rw in &self.windows {
-                rw.window.request_redraw();
-            }
-        }
+        // Frames are driven from here rather than per-window RedrawRequested so
+        // all outputs render together. FIFO present blocks on vsync, which
+        // paces the loop, so Poll does not spin the CPU.
+        self.render_frame(event_loop);
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     }
 }

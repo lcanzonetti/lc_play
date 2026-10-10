@@ -39,9 +39,12 @@ pub struct TextureFactory<'a> {
     /// Bind group layout for scene group(1) (texture + sampler).
     pub layout: &'a wgpu::BindGroupLayout,
     pub sampler: &'a wgpu::Sampler,
+    /// Largest texture edge the device accepts.
+    pub max_dimension: u32,
 }
 
 impl TextureFactory<'_> {
+    /// Upload sRGB-encoded, **premultiplied** RGBA8 pixels.
     fn upload_rgba8(&self, label: &str, width: u32, height: u32, rgba: &[u8]) -> StaticContent {
         let size = wgpu::Extent3d {
             width,
@@ -89,32 +92,43 @@ impl TextureFactory<'_> {
 pub fn build(source: &Source, factory: &TextureFactory) -> anyhow::Result<Box<dyn Content>> {
     match source {
         Source::Image { path } => {
-            let img = image::open(path)
+            let mut img = image::open(path)
                 .with_context(|| format!("loading image '{path}'"))?
                 .to_rgba8();
             let (w, h) = img.dimensions();
+            let max = factory.max_dimension;
+            if w > max || h > max {
+                anyhow::bail!("image '{path}' is {w}x{h}, larger than this GPU's {max}px limit");
+            }
+            premultiply_srgb(&mut img);
             Ok(Box::new(factory.upload_rgba8(path, w, h, &img)))
         }
         Source::Color { rgba } => {
+            let a = rgba[3].clamp(0.0, 1.0);
             let px = [
-                srgb8(rgba[0]),
-                srgb8(rgba[1]),
-                srgb8(rgba[2]),
-                (rgba[3].clamp(0.0, 1.0) * 255.0) as u8,
+                srgb8(rgba[0] * a),
+                srgb8(rgba[1] * a),
+                srgb8(rgba[2] * a),
+                (a * 255.0).round() as u8,
             ];
             Ok(Box::new(factory.upload_rgba8("color", 1, 1, &px)))
         }
         Source::Video { path } => build_video(path, factory),
         Source::Live { kind } => {
             tracing::warn!("live source '{kind}' not yet implemented; showing placeholder");
-            Ok(Box::new(factory.upload_rgba8(
-                "live-placeholder",
-                PLACEHOLDER_SIZE,
-                PLACEHOLDER_SIZE,
-                &placeholder_pixels(),
-            )))
+            Ok(placeholder(factory))
         }
     }
+}
+
+/// The magenta checkerboard shown for unimplemented or failed sources.
+pub fn placeholder(factory: &TextureFactory) -> Box<dyn Content> {
+    Box::new(factory.upload_rgba8(
+        "placeholder",
+        PLACEHOLDER_SIZE,
+        PLACEHOLDER_SIZE,
+        &placeholder_pixels(),
+    ))
 }
 
 #[cfg(not(feature = "video"))]
@@ -122,12 +136,7 @@ fn build_video(path: &str, factory: &TextureFactory) -> anyhow::Result<Box<dyn C
     tracing::warn!(
         "video '{path}' needs the `video` feature (cargo run --features video); showing placeholder"
     );
-    Ok(Box::new(factory.upload_rgba8(
-        "video-placeholder",
-        PLACEHOLDER_SIZE,
-        PLACEHOLDER_SIZE,
-        &placeholder_pixels(),
-    )))
+    Ok(placeholder(factory))
 }
 
 #[cfg(feature = "video")]
@@ -157,8 +166,36 @@ fn placeholder_pixels() -> Vec<u8> {
     px
 }
 
-/// Approximate linear→sRGB 8-bit encoding so a `Color` given in linear space
-/// round-trips correctly through an sRGB texture.
+/// Convert straight-alpha sRGB pixels to premultiplied alpha, multiplying in
+/// *linear* light (decode → × alpha → re-encode). Premultiplying the encoded
+/// bytes directly would make semi-transparent edges far too dark. Opaque
+/// pixels — usually the vast majority — are skipped.
+fn premultiply_srgb(rgba: &mut [u8]) {
+    let decode: [f32; 256] = std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
+    for px in rgba.chunks_exact_mut(4) {
+        match px[3] {
+            255 => {}
+            0 => px[..3].fill(0),
+            a => {
+                let a = a as f32 / 255.0;
+                for c in &mut px[..3] {
+                    *c = srgb8(decode[*c as usize] * a);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn srgb_to_linear(s: f32) -> f32 {
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear → sRGB 8-bit encoding, so values given in linear space round-trip
+/// correctly through an sRGB texture.
 fn srgb8(linear: f32) -> u8 {
     let l = linear.clamp(0.0, 1.0);
     let s = if l <= 0.0031308 {
@@ -167,4 +204,27 @@ fn srgb8(linear: f32) -> u8 {
         1.055 * l.powf(1.0 / 2.4) - 0.055
     };
     (s * 255.0).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srgb_round_trips() {
+        for b in [0u8, 1, 50, 128, 200, 255] {
+            assert_eq!(srgb8(srgb_to_linear(b as f32 / 255.0)), b);
+        }
+    }
+
+    #[test]
+    fn premultiply_is_linear_correct() {
+        // White at 50% alpha must become 50% *linear* light (sRGB byte ~188),
+        // not byte 128 (which is only ~21% linear light).
+        let mut px = [255, 255, 255, 128, 10, 20, 30, 255, 99, 99, 99, 0];
+        premultiply_srgb(&mut px);
+        assert!((186..=189).contains(&px[0]), "got {}", px[0]);
+        assert_eq!(&px[4..8], &[10, 20, 30, 255], "opaque pixels untouched");
+        assert_eq!(&px[8..12], &[0, 0, 0, 0], "transparent pixels zeroed");
+    }
 }

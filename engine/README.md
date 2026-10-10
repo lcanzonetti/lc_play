@@ -13,9 +13,9 @@ Built in Rust on **wgpu** (Vulkan/Metal/DX12) + **winit**.
 > content, full affine placement, per-output corner-warp + edge-blend +
 > orientation, and synchronized transport. Video, live sources, and audio are
 > scaffolded behind clear boundaries and land in later phases (see
-> [Roadmap](#roadmap)). It must be built and run on a machine with a GPU and
-> displays — it was developed headless and the rendering has not been run on
-> hardware yet, so treat the first bring-up as a bring-up.
+> [Roadmap](#roadmap)). The compositor is tested by rendering real frames
+> offscreen on a software GPU (blend, compositing, warp). Windowing on
+> physical multi-monitor hardware still needs a first bring-up on your machine.
 
 ## Concepts
 
@@ -33,11 +33,15 @@ Because layers live in **canvas** space and each output renders the slice of
 canvas it covers, **content spanning multiple outputs is automatic** — no
 special case.
 
-### Render pipeline (per output, per frame)
+### Render pipeline
+
+Each frame samples the show clock **once**, encodes **every** output into one
+GPU submission, then presents all outputs together — so outputs can never show
+different show times. Per output:
 
 ```
 layers ──▶ [scene pass] ──▶ canvas-slice texture ──▶ [warp + edge-blend] ──▶ display
-           draw each layer                            sample through warp mesh,
+           draw each layer                            perspective corner-pin,
            via output.view_proj                       multiply by blend mask
 ```
 
@@ -50,8 +54,12 @@ cargo run -p lcmediaserver-engine --release -- my-show.json
 ```
 
 The example show uses solid-color + placeholder sources, so it runs with **no
-external assets**: two windows form one 1920×1080 canvas, a teal banner spans
-the seam, an orange box is rotated 30°, and both outputs carry an 8% edge-blend.
+external assets**: two 1024px windows cover a 1920×1080 canvas with a 128px
+blended overlap, a teal banner spans the seam, and an orange box is rotated 30°.
+
+A layer whose source fails to load (missing file, image larger than the GPU's
+texture limit) shows a magenta checkerboard and logs an error; the rest of the
+show keeps running.
 
 ### Transport controls
 
@@ -72,12 +80,12 @@ the seam, an orange box is rotated 30°, and both outputs carry an 8% edge-blend
   "outputs": [
     {
       "id": "left",
-      "canvas_rect": { "x": 0, "y": 0, "w": 960, "h": 1080 },   // slice of canvas shown
-      "window": { "size": [960,1080], "position": [0,0],
+      "canvas_rect": { "x": 0, "y": 0, "w": 1024, "h": 1080 },  // slice of canvas shown
+      "window": { "size": [1024,1080], "position": [0,0],
                   "fullscreen": false, "monitor": 0 },           // physical window
       "rotation_degrees": 0,                                     // display orientation
       "warp": { "corners": [[0,0],[1,0],[1,1],[0,1]] },          // TL,TR,BR,BL (normalized)
-      "blend": { "left": 0, "right": 0.08, "top": 0, "bottom": 0, "gamma": 2.2 }
+      "blend": { "right": 0.125, "gamma": 2.2 }                  // overlap fraction per edge
     }
   ],
 
@@ -111,12 +119,31 @@ the seam, an orange box is rotated 30°, and both outputs carry an 8% edge-blend
 
 ### Projection mapping
 
-- **Warp**: move an output's four corners (normalized output space, TL/TR/BR/BL)
-  to keystone/soft-warp the image onto an off-axis surface. Interpolated across
-  a 32×32 mesh. Omit `corners` for identity. (Full freeform mesh warp is Phase 3.)
-- **Edge blend**: set `left`/`right`/`top`/`bottom` to the overlap fraction with
-  a neighboring projector; `gamma` shapes the falloff (2.2 is a good start).
-  Give adjacent outputs mirrored blends on their shared edge.
+- **Warp (corner-pin)**: move an output's four corners (normalized output
+  space, TL/TR/BR/BL) to keystone the image onto an off-axis flat surface. The
+  mapping is a true perspective transform (homography), so straight lines stay
+  straight. Corners must form a convex quad (validated at load). Omit
+  `corners` for identity. Freeform mesh warp for curved surfaces is Phase 3.
+- **Edge blend**: projector images must physically overlap, and their
+  `canvas_rect`s must overlap by the same amount. Set each output's blend on
+  the shared edge to that overlap as a fraction of the output (e.g. 128px of a
+  1024px output → `0.125`), mirrored on the neighbor. The ramp is
+  complementary, so the two projectors' light sums to exactly 100% across the
+  overlap. `gamma` is the projector's gamma (default `2.2` = no correction);
+  nudge it if the seam reads slightly bright or dark.
+
+## Development
+
+```bash
+cargo test -p lcmediaserver-engine
+```
+
+Besides unit tests for the math, the suite renders real frames offscreen and
+checks pixels: blend overlaps sum to full light, translucent layers composite
+correctly, the corner-pin confines the image. These need a GPU adapter; on a
+headless Linux box install Mesa's software Vulkan driver
+(`apt install mesa-vulkan-drivers`). Without an adapter they skip. CI runs them
+on every push.
 
 ## Roadmap
 
