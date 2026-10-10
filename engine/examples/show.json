@@ -1,0 +1,44 @@
+{
+  "canvas": { "width": 1920, "height": 1080, "background": [0.05, 0.06, 0.09, 1.0] },
+
+  "playback": { "autoplay": true, "loop": true, "duration": 20.0 },
+
+  "outputs": [
+    {
+      "id": "left",
+      "canvas_rect": { "x": 0, "y": 0, "w": 960, "h": 1080 },
+      "window": { "size": [960, 1080], "position": [0, 0] },
+      "blend": { "right": 0.08, "gamma": 2.2 }
+    },
+    {
+      "id": "right",
+      "canvas_rect": { "x": 960, "y": 0, "w": 960, "h": 1080 },
+      "window": { "size": [960, 1080], "position": [980, 0] },
+      "blend": { "left": 0.08, "gamma": 2.2 }
+    }
+  ],
+
+  "layers": [
+    {
+      "id": "background",
+      "source": { "type": "color", "rgba": [0.10, 0.12, 0.18, 1.0] },
+      "transform": { "position": [960, 540], "size": [1920, 1080], "z": 0 }
+    },
+    {
+      "id": "banner-spanning-the-seam",
+      "source": { "type": "color", "rgba": [0.10, 0.65, 0.62, 1.0] },
+      "transform": { "position": [960, 300], "size": [1400, 220], "z": 1 }
+    },
+    {
+      "id": "rotated-box",
+      "source": { "type": "color", "rgba": [0.95, 0.55, 0.15, 1.0] },
+      "transform": { "position": [960, 760], "size": [320, 320], "rotation": 30, "z": 2 }
+    },
+    {
+      "id": "video-placeholder",
+      "source": { "type": "video", "path": "examples/media/clip.mp4" },
+      "transform": { "position": [480, 760], "size": [360, 240], "z": 3 },
+      "timing": { "start": 2.0 }
+    }
+  ]
+}

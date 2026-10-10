@@ -153,27 +153,42 @@ mod tests {
 
     #[test]
     fn open_ended_range() {
-        assert_eq!(parse_range(Some(&hv("bytes=500-")), 1000).unwrap(), Some((500, 999)));
+        assert_eq!(
+            parse_range(Some(&hv("bytes=500-")), 1000).unwrap(),
+            Some((500, 999))
+        );
     }
 
     #[test]
     fn closed_range_is_inclusive() {
-        assert_eq!(parse_range(Some(&hv("bytes=0-499")), 1000).unwrap(), Some((0, 499)));
+        assert_eq!(
+            parse_range(Some(&hv("bytes=0-499")), 1000).unwrap(),
+            Some((0, 499))
+        );
     }
 
     #[test]
     fn end_is_clamped_to_size() {
-        assert_eq!(parse_range(Some(&hv("bytes=0-99999")), 1000).unwrap(), Some((0, 999)));
+        assert_eq!(
+            parse_range(Some(&hv("bytes=0-99999")), 1000).unwrap(),
+            Some((0, 999))
+        );
     }
 
     #[test]
     fn suffix_range_returns_last_n_bytes() {
-        assert_eq!(parse_range(Some(&hv("bytes=-200")), 1000).unwrap(), Some((800, 999)));
+        assert_eq!(
+            parse_range(Some(&hv("bytes=-200")), 1000).unwrap(),
+            Some((800, 999))
+        );
     }
 
     #[test]
     fn suffix_larger_than_file_is_whole_file() {
-        assert_eq!(parse_range(Some(&hv("bytes=-5000")), 1000).unwrap(), Some((0, 999)));
+        assert_eq!(
+            parse_range(Some(&hv("bytes=-5000")), 1000).unwrap(),
+            Some((0, 999))
+        );
     }
 
     #[test]

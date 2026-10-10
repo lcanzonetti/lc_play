@@ -1,3 +1,7 @@
+[workspace]
+members = ["engine"]
+resolver = "2"
+
 [package]
 name = "lcmediaserver"
 version = "0.1.0"

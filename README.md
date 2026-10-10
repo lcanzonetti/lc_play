@@ -9,6 +9,13 @@ single static binary with an in-memory index and no database.
 
 A minimal built-in web player is served at `/` for testing.
 
+> **This repository is a Cargo workspace with two components:**
+> - **`lcmediaserver`** (this crate) — the HTTP streaming/transcoding server documented below.
+> - **[`engine/`](engine/README.md)** (`lcmediaserver-engine`) — a **multi-output canvas
+>   playback engine** (WATCHOUT-style): arrange displays on a virtual canvas, place
+>   content across them, span outputs, with per-output warp + edge-blend. See
+>   [`engine/README.md`](engine/README.md).
+
 ---
 
 ## Why it's lightweight, optimized, and scalable

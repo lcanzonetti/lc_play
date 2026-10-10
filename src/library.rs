@@ -234,7 +234,10 @@ mod tests {
     fn classify_recognises_video_and_audio_ignores_others() {
         assert_eq!(classify(&PathBuf::from("v.MP4")), Some(MediaKind::Video));
         assert_eq!(classify(&PathBuf::from("v.mkv")), Some(MediaKind::Video));
-        assert_eq!(classify(&PathBuf::from("song.FLAC")), Some(MediaKind::Audio));
+        assert_eq!(
+            classify(&PathBuf::from("song.FLAC")),
+            Some(MediaKind::Audio)
+        );
         assert_eq!(classify(&PathBuf::from("readme.txt")), None);
         assert_eq!(classify(&PathBuf::from("noext")), None);
     }
