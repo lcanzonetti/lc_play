@@ -36,7 +36,7 @@
     },
     {
       "id": "video-placeholder",
-      "source": { "type": "video", "path": "examples/media/clip.mp4" },
+      "source": { "type": "video", "path": "media/clip.mp4" },
       "transform": { "position": [480, 760], "size": [360, 240], "z": 3 },
       "timing": { "start": 2.0 }
     }

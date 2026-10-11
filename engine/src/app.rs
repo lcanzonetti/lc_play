@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -40,6 +41,28 @@ pub struct App {
     by_id: HashMap<WindowId, usize>,
     /// Layer indices sorted back-to-front by z.
     draw_order: Vec<usize>,
+    stats: FrameStats,
+}
+
+/// Logs the frame rate every few seconds so a show's performance is visible.
+struct FrameStats {
+    frames: u32,
+    since: Instant,
+}
+
+impl FrameStats {
+    const PERIOD: Duration = Duration::from_secs(5);
+
+    fn tick(&mut self, show_time: f64) {
+        self.frames += 1;
+        let elapsed = self.since.elapsed();
+        if elapsed >= Self::PERIOD {
+            let fps = self.frames as f64 / elapsed.as_secs_f64();
+            tracing::info!("{fps:.1} fps (show time {show_time:.1}s)");
+            self.frames = 0;
+            self.since = Instant::now();
+        }
+    }
 }
 
 impl App {
@@ -67,11 +90,29 @@ impl App {
             windows: Vec::new(),
             by_id: HashMap::new(),
             draw_order,
+            stats: FrameStats {
+                frames: 0,
+                since: Instant::now(),
+            },
         }
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let layer_count = self.show.layers.len();
+
+        // List the monitors so a show's `"monitor": N` can be set correctly.
+        for (i, m) in event_loop.available_monitors().enumerate() {
+            let (pos, size) = (m.position(), m.size());
+            tracing::info!(
+                "monitor {i}: {} — {}x{} at ({}, {}), scale {}",
+                m.name().unwrap_or_else(|| "unnamed".into()),
+                size.width,
+                size.height,
+                pos.x,
+                pos.y,
+                m.scale_factor()
+            );
+        }
 
         // 1. Create one window per output.
         let mut created: Vec<Arc<Window>> = Vec::with_capacity(self.show.outputs.len());
@@ -165,6 +206,7 @@ impl App {
             rw.window.pre_present_notify();
         }
         let errors = frame.present();
+        self.stats.tick(now);
 
         for (idx, err) in errors {
             let rw = &mut self.windows[idx];
@@ -204,11 +246,16 @@ fn window_attributes(
         attrs = attrs.with_position(PhysicalPosition::new(x, y));
     }
     if output.window.fullscreen {
-        let monitor = output
-            .window
-            .monitor
-            .and_then(|i| event_loop.available_monitors().nth(i))
-            .or_else(|| event_loop.primary_monitor());
+        let monitor = match output.window.monitor {
+            Some(i) => event_loop.available_monitors().nth(i).or_else(|| {
+                tracing::warn!(
+                    "output '{}': monitor {i} not found; using the primary monitor",
+                    output.id
+                );
+                event_loop.primary_monitor()
+            }),
+            None => event_loop.primary_monitor(),
+        };
         attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor)));
     }
     attrs

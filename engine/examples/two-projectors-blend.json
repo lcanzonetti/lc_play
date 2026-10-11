@@ -1,0 +1,34 @@
+{
+  "_note": "Two 1920x1080 projectors, side by side with a 240px soft-edge overlap. Canvas = 1920 + 1920 - 240 = 3600 wide. Adjust the overlap physically first (point the projectors so their images overlap by ~12.5%), then fine-tune corners and blend here.",
+
+  "canvas": { "width": 3600, "height": 1080, "background": [0.0, 0.0, 0.0, 1.0] },
+  "playback": { "autoplay": true },
+
+  "outputs": [
+    {
+      "id": "projector-1",
+      "_note": "Canvas x 0..1920. Its right 240px (= 0.125 of 1920) overlaps projector-2.",
+      "canvas_rect": { "x": 0, "y": 0, "w": 1920, "h": 1080 },
+      "window": { "fullscreen": true, "monitor": 0 },
+      "warp": { "corners": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] },
+      "blend": { "right": 0.125, "gamma": 2.2 }
+    },
+    {
+      "id": "projector-2",
+      "_note": "Canvas x 1680..3600 (starts 240px before projector-1 ends). Mirrored blend on its left edge.",
+      "canvas_rect": { "x": 1680, "y": 0, "w": 1920, "h": 1080 },
+      "window": { "fullscreen": true, "monitor": 1 },
+      "warp": { "corners": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] },
+      "blend": { "left": 0.125, "gamma": 2.2 }
+    }
+  ],
+
+  "layers": [
+    {
+      "id": "alignment-grid",
+      "_note": "ONE grid across the whole canvas: in the overlap, both projectors draw the same lines, so misalignment shows up as doubled lines.",
+      "source": { "type": "image", "path": "media/grid-3600x1080.png" },
+      "transform": { "position": [1800, 540], "size": [3600, 1080], "z": 0 }
+    }
+  ]
+}

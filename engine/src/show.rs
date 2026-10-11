@@ -7,6 +7,8 @@
 //! layer can span several outputs: each output simply renders whatever slice of
 //! the canvas it covers.
 
+use std::path::Path;
+
 use glam::{Mat3, Mat4, Vec2, Vec3};
 use serde::Deserialize;
 
@@ -333,6 +335,20 @@ impl Show {
     }
 }
 
+impl Show {
+    /// Rewrite relative media paths to be relative to `base` (the show file's
+    /// folder), so a show and its media folder work from any directory.
+    pub fn resolve_paths(&mut self, base: &Path) {
+        for layer in &mut self.layers {
+            if let Source::Image { path } | Source::Video { path } = &mut layer.source {
+                if Path::new(path.as_str()).is_relative() {
+                    *path = base.join(&*path).to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+}
+
 /// True if the four points form a strictly convex quad (either winding).
 /// Non-convex or self-intersecting corners have no valid perspective mapping.
 fn is_convex(c: &[[f32; 2]; 4]) -> bool {
@@ -398,14 +414,66 @@ mod tests {
     }
 
     #[test]
-    fn bundled_example_show_is_valid() {
-        let show = Show::from_json(include_str!("../examples/show.json")).unwrap();
-        assert_eq!(show.outputs.len(), 2);
-        // The blend only works if the two slices really overlap.
-        let (a, b) = (&show.outputs[0], &show.outputs[1]);
-        let overlap = a.canvas_rect.x + a.canvas_rect.w - b.canvas_rect.x;
-        assert_eq!(overlap, a.blend.right * a.canvas_rect.w);
-        assert_eq!(overlap, b.blend.left * b.canvas_rect.w);
+    fn bundled_examples_are_valid_with_media_and_consistent_blends() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let file = entry.unwrap().path();
+            if file.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let name = file.display();
+            let mut show = Show::from_json(&std::fs::read_to_string(&file).unwrap())
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            show.resolve_paths(&dir);
+
+            for layer in &show.layers {
+                if let Source::Image { path } = &layer.source {
+                    assert!(Path::new(path).exists(), "{name}: missing {path}");
+                }
+            }
+            // A blend only works if the neighbors' slices overlap by exactly
+            // the blend width.
+            for a in &show.outputs {
+                for b in &show.outputs {
+                    let (ra, rb) = (a.canvas_rect, b.canvas_rect);
+                    if a.blend.right > 0.0 && b.blend.left > 0.0 && rb.x > ra.x {
+                        let overlap = ra.x + ra.w - rb.x;
+                        assert_eq!(overlap, a.blend.right * ra.w, "{name}: {} right", a.id);
+                        assert_eq!(overlap, b.blend.left * rb.w, "{name}: {} left", b.id);
+                    }
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "expected the bundled templates, found {checked}"
+        );
+    }
+
+    #[test]
+    fn relative_media_paths_resolve_against_the_show_folder() {
+        let mut show = Show::from_json(
+            r#"{ "canvas": { "width": 10, "height": 10 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 } } ],
+                 "layers": [
+                   { "id": "rel", "source": { "type": "image", "path": "media/a.png" },
+                     "transform": { "position": [5,5], "size": [10,10] } },
+                   { "id": "abs", "source": { "type": "image", "path": "/srv/b.png" },
+                     "transform": { "position": [5,5], "size": [10,10] } } ] }"#,
+        )
+        .unwrap();
+        show.resolve_paths(Path::new("/shows/demo"));
+        let paths: Vec<_> = show
+            .layers
+            .iter()
+            .map(|l| match &l.source {
+                Source::Image { path } => path.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(paths, ["/shows/demo/media/a.png", "/srv/b.png"]);
     }
 
     fn warp(c: [[f32; 2]; 4]) -> Warp {

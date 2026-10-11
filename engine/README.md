@@ -48,18 +48,62 @@ layers ──▶ [scene pass] ──▶ canvas-slice texture ──▶ [warp + e
 ## Build & run
 
 ```bash
-# from the repo root (Cargo workspace)
-cargo run -p lcmediaserver-engine --release            # loads engine/examples/show.json
-cargo run -p lcmediaserver-engine --release -- my-show.json
+cargo run -p lcmediaserver-engine --release                                       # bundled examples/show.json
+cargo run -p lcmediaserver-engine --release -- engine/examples/preview-3-screens.json
+cargo run -p lcmediaserver-engine --release -- /path/to/my-show.json
 ```
 
-The example show uses solid-color + placeholder sources, so it runs with **no
-external assets**: two 1024px windows cover a 1920×1080 canvas with a 128px
-blended overlap, a teal banner spans the seam, and an orange box is rotated 30°.
+On Linux the windowing layer needs `libxkbcommon-x11-0` (present on desktop
+distros) and a Vulkan or GL driver.
 
-A layer whose source fails to load (missing file, image larger than the GPU's
-texture limit) shows a magenta checkerboard and logs an error; the rest of the
-show keeps running.
+At startup the engine logs every monitor (`monitor 0: … 1920x1080 at (0, 0)`)
+so you can set `"monitor": N`, and every 5 s it logs the frame rate and show
+time. A layer whose source fails to load (missing file, image larger than the
+GPU's texture limit) shows a magenta checkerboard and logs an error; the rest
+of the show keeps running.
+
+### Starter shows
+
+| File | Setup | Use it to test |
+|------|-------|----------------|
+| `examples/preview-3-screens.json` | 3-screen wall, previewed as 3 small windows on **one** monitor | layout, content spanning, timing — on a laptop |
+| `examples/two-monitors.json` | 2 monitors side by side, fullscreen | real multi-display output |
+| `examples/two-projectors-blend.json` | 2 projectors with a 240px soft-edge overlap | corner-pin + edge blend alignment |
+| `examples/show.json` | 2 windows, colors only | zero-asset smoke test |
+
+Copy one next to your media and edit it. JSON has no comments, but unknown keys
+are ignored, so the templates document themselves with `"_note"` fields.
+
+### Writing your own show
+
+1. **Canvas** = the whole stage in pixels: usually the outputs' resolutions put
+   together (minus blend overlaps).
+2. **One output per display.** `canvas_rect` is the part of the canvas it shows;
+   keep its aspect equal to the display's, or the image stretches. The window
+   size can be smaller (a scaled preview) as long as the aspect matches.
+3. **Layers** are placed in canvas pixels. `position` is where the layer's
+   anchor (default: its center) lands, so a layer filling `x..x+w` sits at
+   `x + w/2`. A layer crossing an output boundary simply appears on both.
+4. **Media paths** are relative to the show file.
+5. **Projectors:** overlap the `canvas_rect`s by the physical overlap and set
+   the mirrored `blend` to `overlap / output width` (validated as consistent in
+   the bundled examples). Then move `warp.corners` (0..1, TL/TR/BR/BL) in small
+   steps such as `0.01` until grid lines meet.
+6. **Portrait display:** if the OS already rotates it, just use a portrait
+   `canvas_rect` and window size. If the panel is physically rotated but the
+   OS isn't, keep the landscape window, use a portrait `canvas_rect`, and set
+   `rotation_degrees` to 90 or 270.
+
+Load errors name the problem (`output 'B': canvas_rect must have positive w
+and h`, `warp corners must form a convex quad…`), and nothing is drawn until
+the show is valid.
+
+**Test patterns** for your own canvas size (lines must stay straight across
+seams, the circle must stay round, corner blocks show orientation):
+
+```bash
+python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
+```
 
 ### Transport controls
 

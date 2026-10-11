@@ -26,12 +26,15 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Default to the bundled example wherever `cargo run` is invoked from.
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "examples/show.json".to_string());
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/examples/show.json").to_string());
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading show file '{path}'"))?;
-    let show = Show::from_json(&text).with_context(|| format!("parsing show file '{path}'"))?;
+    let mut show = Show::from_json(&text).with_context(|| format!("parsing show file '{path}'"))?;
+    // Media paths in a show are relative to the show file, not the shell.
+    show.resolve_paths(std::path::Path::new(&path).parent().unwrap_or(".".as_ref()));
 
     tracing::info!(
         canvas = format!("{}x{}", show.canvas.width, show.canvas.height),

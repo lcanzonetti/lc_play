@@ -1,0 +1,62 @@
+{
+  "_note": "Preview a 3-screen video wall (3 x 1920x1080 = 5760x1080 canvas) on ONE monitor: each output is a small window. Use this to test layout and content spanning on a laptop.",
+
+  "canvas": { "width": 5760, "height": 1080, "background": [0.02, 0.02, 0.03, 1.0] },
+  "playback": { "autoplay": true, "loop": true, "duration": 10.0 },
+
+  "outputs": [
+    {
+      "id": "screen-A",
+      "_note": "Shows canvas x 0..1920. Window is 1/3 scale (640x360) but keeps the 16:9 aspect, so nothing is distorted.",
+      "canvas_rect": { "x": 0, "y": 0, "w": 1920, "h": 1080 },
+      "window": { "size": [640, 360], "position": [0, 40] }
+    },
+    {
+      "id": "screen-B",
+      "canvas_rect": { "x": 1920, "y": 0, "w": 1920, "h": 1080 },
+      "window": { "size": [640, 360], "position": [650, 40] }
+    },
+    {
+      "id": "screen-C",
+      "canvas_rect": { "x": 3840, "y": 0, "w": 1920, "h": 1080 },
+      "window": { "size": [640, 360], "position": [1300, 40] }
+    }
+  ],
+
+  "layers": [
+    {
+      "id": "grid-A",
+      "_note": "position = where the layer's CENTER goes (default anchor), so a full-screen layer sits at the screen's center.",
+      "source": { "type": "image", "path": "media/grid-1920x1080.png" },
+      "transform": { "position": [960, 540], "size": [1920, 1080], "z": 0 }
+    },
+    {
+      "id": "grid-B",
+      "source": { "type": "image", "path": "media/grid-1920x1080.png" },
+      "transform": { "position": [2880, 540], "size": [1920, 1080], "z": 0 }
+    },
+    {
+      "id": "grid-C",
+      "source": { "type": "image", "path": "media/grid-1920x1080.png" },
+      "transform": { "position": [4800, 540], "size": [1920, 1080], "z": 0 }
+    },
+    {
+      "id": "banner-across-the-wall",
+      "_note": "One layer spanning all three screens.",
+      "source": { "type": "color", "rgba": [0.10, 0.65, 0.62, 1.0] },
+      "transform": { "position": [2880, 300], "size": [5200, 160], "opacity": 0.85, "z": 1 }
+    },
+    {
+      "id": "diamond-on-seam-AB",
+      "source": { "type": "color", "rgba": [0.95, 0.55, 0.15, 1.0] },
+      "transform": { "position": [1920, 760], "size": [360, 360], "rotation": 45, "z": 2 }
+    },
+    {
+      "id": "timed-box-on-seam-BC",
+      "_note": "Visible from 3s to 8s of the 10s loop.",
+      "source": { "type": "color", "rgba": [0.85, 0.20, 0.45, 1.0] },
+      "transform": { "position": [3840, 760], "size": [700, 260], "z": 2 },
+      "timing": { "start": 3.0, "end": 8.0 }
+    }
+  ]
+}
