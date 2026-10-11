@@ -876,7 +876,9 @@ mod tests {
         let bytes = readback.slice(..).get_mapped_range();
         let lin = |b: u8| srgb_to_linear(b as f32 / 255.0);
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| [lin(p[0]), lin(p[1]), lin(p[2])])
             .collect()
     }

@@ -172,7 +172,7 @@ fn placeholder_pixels() -> Vec<u8> {
 /// pixels — usually the vast majority — are skipped.
 fn premultiply_srgb(rgba: &mut [u8]) {
     let decode: [f32; 256] = std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         match px[3] {
             255 => {}
             0 => px[..3].fill(0),
