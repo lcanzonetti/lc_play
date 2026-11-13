@@ -15,7 +15,8 @@ struct BlendUniform {
     bottom: f32,
     // 2.2 / projector_gamma (1.0 for a standard 2.2 projector).
     gamma_exp: f32,
-    _pad0: f32,
+    // 1.0 when the surface has no hardware sRGB format: encode here instead.
+    encode_srgb: f32,
     _pad1: f32,
     _pad2: f32,
 };
@@ -57,5 +58,18 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     // Output is sRGB-encoded (≈ gamma 2.2); compensate for the projector's own
     // gamma so the *light* (not the signal) sums to 1 across the overlap.
     f = pow(f, b.gamma_exp);
-    return vec4<f32>(c.rgb * f, 1.0);
+    var rgb = c.rgb * f;
+    if (b.encode_srgb > 0.5) {
+        rgb = linear_to_srgb(rgb);
+    }
+    return vec4<f32>(rgb, 1.0);
+}
+
+// Exact sRGB transfer function (IEC 61966-2-1), as the GPU applies on write
+// to an *Srgb format.
+fn linear_to_srgb(l: vec3<f32>) -> vec3<f32> {
+    let c = clamp(l, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, c <= vec3<f32>(0.0031308));
 }

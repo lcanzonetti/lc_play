@@ -1233,6 +1233,7 @@ dependencies = [
  "ffmpeg-next",
  "glam",
  "image",
+ "naga",
  "pollster",
  "serde",
  "serde_json",

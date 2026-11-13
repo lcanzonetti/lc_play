@@ -50,7 +50,9 @@ struct BlendUniform {
     top: f32,
     bottom: f32,
     gamma_exp: f32,
-    _pad: [f32; 3],
+    /// 1.0 = encode linear → sRGB in the shader (surface has no sRGB format).
+    encode_srgb: f32,
+    _pad: [f32; 2],
 }
 
 // Uniform layouts must match the WGSL structs byte-for-byte.
@@ -99,12 +101,15 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 
-    /// Format the window surfaces are configured with.
+    /// Format the window surfaces are configured with (and rendered to).
     surface_format: wgpu::TextureFormat,
-    /// Format we render the final image through: always the sRGB variant of
-    /// `surface_format` when one exists, so the GPU encodes our linear shader
-    /// output to sRGB. Equal to `surface_format` when it is already sRGB.
-    target_format: wgpu::TextureFormat,
+    /// The shaders produce linear light. On an sRGB surface the GPU encodes it
+    /// on write; otherwise the warp shader must encode it itself, or the
+    /// picture and the blend ramps come out too dark. Done in the shader, not
+    /// through an sRGB view of the surface: surface view formats need
+    /// `DownlevelFlags::SURFACE_VIEW_FORMATS`, which GL/Metal/DX12 and many
+    /// Vulkan drivers lack, and `configure` would then fail with a panic.
+    encode_srgb: bool,
 
     scene_pipeline: wgpu::RenderPipeline,
     warp_pipeline: wgpu::RenderPipeline,
@@ -140,18 +145,10 @@ impl Gpu {
                     .formats
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("surface reports no supported formats"))?;
-                // The shaders write linear light. Without sRGB encoding the
-                // picture (and the blend ramps) come out too dark, so render
-                // through an sRGB *view* of the surface when the format has one.
-                if f.add_srgb_suffix() != f {
-                    tracing::info!(
-                        "surface has no sRGB format; rendering through an sRGB view of {f:?}"
-                    );
+                if needs_shader_srgb(f) {
+                    tracing::info!("surface has no sRGB format; sRGB-encoding {f:?} in the shader");
                 } else {
-                    tracing::warn!(
-                        "surface format {f:?} has no sRGB variant: output will not be \
-                         sRGB-encoded and will look too dark"
-                    );
+                    tracing::info!("surface format {f:?} takes linear values; no sRGB encoding");
                 }
                 f
             }
@@ -164,12 +161,13 @@ impl Gpu {
     /// A device with no window, for offscreen rendering tests. Errors when the
     /// machine has no usable adapter (e.g. CI without a software rasterizer)
     /// or when the device request fails; the error says which.
+    /// `format` is the output format (normally [`SCENE_FORMAT`]).
     #[cfg(test)]
-    pub fn headless() -> anyhow::Result<Self> {
+    pub fn headless(format: wgpu::TextureFormat) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
             .ok_or_else(|| anyhow::anyhow!("no GPU adapter found"))?;
-        Self::with_adapter(instance, adapter, SCENE_FORMAT)
+        Self::with_adapter(instance, adapter, format)
     }
 
     /// Create the device and build every pipeline for a given output format.
@@ -316,13 +314,12 @@ impl Gpu {
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
         // Warp: the final image replaces the surface contents; no blending.
-        let target_format = surface_format.add_srgb_suffix();
         let warp_pipeline = pipeline(
             "warp-pipeline",
             &[&blend_bgl, &texture_bgl],
             &warp_shader,
             warp_vertex_layout,
-            target_format,
+            surface_format,
             None,
         );
 
@@ -343,7 +340,7 @@ impl Gpu {
             device,
             queue,
             surface_format,
-            target_format,
+            encode_srgb: needs_shader_srgb(surface_format),
             scene_pipeline,
             warp_pipeline,
             uniform_bgl,
@@ -376,12 +373,7 @@ impl Gpu {
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            // Allow the sRGB view `draw` renders through (see `target_format`).
-            view_formats: if self.target_format != self.surface_format {
-                vec![self.target_format]
-            } else {
-                vec![]
-            },
+            view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&self.device, &config);
@@ -436,7 +428,8 @@ impl Gpu {
             top: output.blend.top,
             bottom: output.blend.bottom,
             gamma_exp: 2.2 / output.blend.gamma,
-            _pad: [0.0; 3],
+            encode_srgb: if self.encode_srgb { 1.0 } else { 0.0 },
+            _pad: [0.0; 2],
         };
         let blend_buf = self
             .device
@@ -567,10 +560,9 @@ impl Gpu {
         for (ti, &(out, output)) in targets.iter().enumerate() {
             match out.surface.get_current_texture() {
                 Ok(frame) => {
-                    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-                        format: Some(self.target_format),
-                        ..Default::default()
-                    });
+                    let view = frame
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
                     self.encode_output(
                         &mut encoder,
                         &view,
@@ -691,6 +683,19 @@ impl Gpu {
     pub fn max_texture_dimension(&self) -> u32 {
         self.device.limits().max_texture_dimension_2d
     }
+}
+
+/// Whether linear shader output must be sRGB-encoded by hand before writing to
+/// a surface of `format`: true for 8/10-bit UNORM formats without hardware
+/// sRGB. Float formats (e.g. `Rgba16Float`, scRGB on Windows) take linear
+/// values as they are.
+fn needs_shader_srgb(format: wgpu::TextureFormat) -> bool {
+    use wgpu::TextureFormat as F;
+    !format.is_srgb()
+        && !matches!(
+            format,
+            F::Rgba16Float | F::Rgba32Float | F::Rg11b10Ufloat | F::Rgb9e5Ufloat
+        )
 }
 
 /// A frame that has been submitted but not yet shown.
@@ -873,10 +878,14 @@ mod tests {
     use crate::content::{self, srgb_to_linear, TextureFactory};
 
     fn gpu_or_skip() -> Option<Gpu> {
+        gpu_with_format_or_skip(SCENE_FORMAT)
+    }
+
+    fn gpu_with_format_or_skip(format: wgpu::TextureFormat) -> Option<Gpu> {
         let required = ["CI", "LCME_REQUIRE_GPU"]
             .iter()
             .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty() && s != "0"));
-        match Gpu::headless() {
+        match Gpu::headless(format) {
             Ok(gpu) => {
                 eprintln!("GPU test adapter: {}", gpu.adapter_info());
                 Some(gpu)
@@ -1018,6 +1027,52 @@ mod tests {
         let px = render_offscreen(&gpu, &show, 0, 64, 64)[32 * 64 + 32];
         assert!((px[0] - 0.5).abs() < 0.01, "red over black: {px:?}");
         assert!(px[1] < 0.01 && px[2] < 0.01, "{px:?}");
+    }
+
+    #[test]
+    fn non_srgb_surface_is_encoded_in_the_shader() {
+        // Same scene as the linear-light test, rendered to a plain UNORM
+        // target: the shader must apply the sRGB curve itself, so the bytes
+        // decode to the same 0.5 linear red (not ~0.21, i.e. too dark).
+        let Some(gpu) = gpu_with_format_or_skip(wgpu::TextureFormat::Rgba8Unorm) else {
+            return;
+        };
+        assert!(gpu.encode_srgb);
+        let show = Show::from_json(
+            r#"{ "canvas": { "width": 64, "height": 64 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 64, "h": 64 } } ],
+                 "layers": [ { "id": "red", "source": { "type": "color", "rgba": [1,0,0,0.5] },
+                               "transform": { "position": [32,32], "size": [64,64] } } ] }"#,
+        )
+        .unwrap();
+        let px = render_offscreen(&gpu, &show, 0, 64, 64)[32 * 64 + 32];
+        assert!((px[0] - 0.5).abs() < 0.01, "red over black: {px:?}");
+    }
+
+    #[test]
+    fn shaders_parse_and_validate_without_a_gpu() {
+        for (name, src) in [
+            ("scene.wgsl", include_str!("../shaders/scene.wgsl")),
+            ("warp.wgsl", include_str!("../shaders/warp.wgsl")),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn shader_srgb_only_for_unorm_formats() {
+        use wgpu::TextureFormat as F;
+        assert!(!needs_shader_srgb(F::Bgra8UnormSrgb));
+        assert!(needs_shader_srgb(F::Bgra8Unorm));
+        assert!(needs_shader_srgb(F::Rgb10a2Unorm));
+        assert!(!needs_shader_srgb(F::Rgba16Float));
     }
 
     #[test]

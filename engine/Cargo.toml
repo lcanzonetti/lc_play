@@ -33,3 +33,9 @@ default = []
 video = ["dep:ffmpeg-next"]
 # Enables audio output via cpal.
 audio = ["dep:cpal"]
+
+[dev-dependencies]
+# Parse + validate the WGSL shaders in unit tests, so a shader error is caught
+# even on machines (or CI runs) where the GPU tests have no adapter. Same naga
+# version wgpu already uses, so nothing new is downloaded or compiled twice.
+naga = { version = "24", features = ["wgsl-in"] }
