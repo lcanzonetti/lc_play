@@ -36,8 +36,11 @@ special case.
 ### Render pipeline
 
 Each frame samples the show clock **once**, encodes **every** output into one
-GPU submission, then presents all outputs together — so outputs can never show
-different show times. Per output:
+GPU submission, then presents all outputs together — so every output renders
+the same show time. Each display still refreshes on its own clock: without
+genlocked/synchronized displays (or a sync-capable GPU setup) outputs can be up
+to one refresh apart on screen, which can show as a brief tear on fast motion
+across a seam. Per output:
 
 ```
 layers ──▶ [scene pass] ──▶ canvas-slice texture ──▶ [warp + edge-blend] ──▶ display
@@ -69,7 +72,11 @@ of the show keeps running.
 | `examples/preview-3-screens.json` | 3-screen wall, previewed as 3 small windows on **one** monitor | layout, content spanning, timing — on a laptop |
 | `examples/two-monitors.json` | 2 monitors side by side, fullscreen | real multi-display output |
 | `examples/two-projectors-blend.json` | 2 projectors with a 240px soft-edge overlap | corner-pin + edge blend alignment |
-| `examples/show.json` | 2 windows, colors only | zero-asset smoke test |
+| `examples/show.json` | 2 windows at 75% size, colors only | zero-asset smoke test |
+
+Window `position` is honoured on Windows, macOS and X11. Wayland compositors
+ignore client-requested positions, so there windows open wherever the
+compositor puts them (use `fullscreen` + `monitor` for real outputs).
 
 Copy one next to your media and edit it. JSON has no comments, but unknown keys
 are ignored, so the templates document themselves with `"_note"` fields.
@@ -158,7 +165,7 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 |--------|--------|-------|
 | `color` | ✅ Phase 1 | `{ "rgba": [r,g,b,a] }`, linear 0..1 |
 | `image` | ✅ Phase 1 | `{ "path": "..." }` (PNG/JPEG/BMP/GIF/WebP) |
-| `video` | ⏳ Phase 2 | `{ "path": "..." }`; needs `--features video` (ffmpeg/libav). Placeholder otherwise. |
+| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder and logs an error, with or without `--features video` (that feature only links ffmpeg/libav, so it also needs their dev libraries to build). |
 | `live`  | ⏳ Phase 3 | `{ "kind": "..." }` (capture/NDI). Placeholder otherwise. |
 
 ### Projection mapping

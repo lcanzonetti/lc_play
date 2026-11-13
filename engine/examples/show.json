@@ -1,4 +1,5 @@
 {
+  "_note": "Zero-asset smoke test: 2 windows at 75% scale (fits a 1080p screen), colors only, 128px blend overlap.",
   "canvas": { "width": 1920, "height": 1080, "background": [0.05, 0.06, 0.09, 1.0] },
 
   "playback": { "autoplay": true, "loop": true, "duration": 20.0 },
@@ -7,13 +8,13 @@
     {
       "id": "left",
       "canvas_rect": { "x": 0, "y": 0, "w": 1024, "h": 1080 },
-      "window": { "size": [1024, 1080], "position": [0, 0] },
+      "window": { "size": [768, 810], "position": [0, 0] },
       "blend": { "right": 0.125 }
     },
     {
       "id": "right",
       "canvas_rect": { "x": 896, "y": 0, "w": 1024, "h": 1080 },
-      "window": { "size": [1024, 1080], "position": [1044, 0] },
+      "window": { "size": [768, 810], "position": [778, 0] },
       "blend": { "left": 0.125 }
     }
   ],
@@ -33,12 +34,6 @@
       "id": "rotated-box",
       "source": { "type": "color", "rgba": [0.95, 0.55, 0.15, 1.0] },
       "transform": { "position": [960, 760], "size": [320, 320], "rotation": 30, "z": 2 }
-    },
-    {
-      "id": "video-placeholder",
-      "source": { "type": "video", "path": "media/clip.mp4" },
-      "transform": { "position": [480, 760], "size": [360, 240], "z": 3 },
-      "timing": { "start": 2.0 }
     }
   ]
 }

@@ -464,7 +464,7 @@ mod tests {
             show.resolve_paths(&dir);
 
             for layer in &show.layers {
-                if let Source::Image { path } = &layer.source {
+                if let Source::Image { path } | Source::Video { path } = &layer.source {
                     assert!(Path::new(path).exists(), "{name}: missing {path}");
                 }
             }
@@ -477,6 +477,11 @@ mod tests {
                         let overlap = ra.x + ra.w - rb.x;
                         assert_eq!(overlap, a.blend.right * ra.w, "{name}: {} right", a.id);
                         assert_eq!(overlap, b.blend.left * rb.w, "{name}: {} left", b.id);
+                    }
+                    if a.blend.bottom > 0.0 && b.blend.top > 0.0 && rb.y > ra.y {
+                        let overlap = ra.y + ra.h - rb.y;
+                        assert_eq!(overlap, a.blend.bottom * ra.h, "{name}: {} bottom", a.id);
+                        assert_eq!(overlap, b.blend.top * rb.h, "{name}: {} top", b.id);
                     }
                 }
             }

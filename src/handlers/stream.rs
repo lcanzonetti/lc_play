@@ -177,12 +177,12 @@ impl Validators {
 /// Parse a single-range `Range: bytes=start-end` header.
 ///
 /// Returns:
-///   * `Ok(None)` when there is no range header (serve the whole file),
+///   * `Ok(None)` → serve the whole file with `200`. That covers no header, an
+///     unknown unit, a syntactically invalid range, and multi-range requests
+///     (`bytes=0-99,200-299`; no `multipart/byteranges` support). RFC 9110
+///     §14.2 lets a server ignore a Range it can't or won't honour.
 ///   * `Ok(Some((start, end)))` for a satisfiable inclusive byte range,
-///   * `Err(RangeNotSatisfiable)` / `Err(BadRequest)` otherwise.
-///
-/// Multi-range requests are intentionally not supported; we serve the whole
-/// file instead, which is valid per RFC 7233.
+///   * `Err(RangeNotSatisfiable)` for a valid range outside the file (`416`).
 fn parse_range(
     value: Option<&axum::http::HeaderValue>,
     total: u64,
@@ -190,53 +190,50 @@ fn parse_range(
     let Some(value) = value else {
         return Ok(None);
     };
-    let value = value
-        .to_str()
-        .map_err(|_| AppError::BadRequest("invalid Range header".into()))?;
-
-    let Some(spec) = value.strip_prefix("bytes=") else {
-        return Ok(None); // unsupported unit; ignore and serve whole file
+    // Anything we can't parse is ignored (whole file), never a 400.
+    let Ok(value) = value.to_str() else {
+        return Ok(None);
     };
-
-    // Only the first range of a possible list is honoured.
-    let spec = spec.split(',').next().unwrap_or("").trim();
-    let (start_s, end_s) = spec
-        .split_once('-')
-        .ok_or_else(|| AppError::BadRequest("malformed Range".into()))?;
-
-    if total == 0 {
-        return Err(AppError::RangeNotSatisfiable { size: total });
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return Ok(None); // unsupported unit
+    };
+    if spec.contains(',') {
+        return Ok(None); // multi-range: not supported, serve the whole file
     }
+    let Some((start_s, end_s)) = spec.trim().split_once('-') else {
+        return Ok(None);
+    };
+    let num = |s: &str| s.parse::<u64>().ok();
 
     let (start, end) = match (start_s.trim(), end_s.trim()) {
+        ("", "") => return Ok(None),
         // "bytes=-N" -> last N bytes
         ("", n) => {
-            let n: u64 = n
-                .parse()
-                .map_err(|_| AppError::BadRequest("malformed Range".into()))?;
-            let n = n.min(total);
-            (total - n, total - 1)
+            let Some(n) = num(n) else { return Ok(None) };
+            if n == 0 || total == 0 {
+                // A zero-length suffix, or any suffix of an empty file.
+                return Err(AppError::RangeNotSatisfiable { size: total });
+            }
+            (total - n.min(total), total - 1)
         }
         // "bytes=N-" -> from N to end
         (s, "") => {
-            let s: u64 = s
-                .parse()
-                .map_err(|_| AppError::BadRequest("malformed Range".into()))?;
-            (s, total - 1)
+            let Some(s) = num(s) else { return Ok(None) };
+            (s, total.saturating_sub(1))
         }
         // "bytes=S-E"
         (s, e) => {
-            let s: u64 = s
-                .parse()
-                .map_err(|_| AppError::BadRequest("malformed Range".into()))?;
-            let e: u64 = e
-                .parse()
-                .map_err(|_| AppError::BadRequest("malformed Range".into()))?;
-            (s, e.min(total - 1))
+            let (Some(s), Some(e)) = (num(s), num(e)) else {
+                return Ok(None);
+            };
+            if e < s {
+                return Ok(None); // invalid per RFC 9110 §14.1.1: ignore
+            }
+            (s, e.min(total.saturating_sub(1)))
         }
     };
 
-    if start > end || start >= total {
+    if total == 0 || start > end || start >= total {
         return Err(AppError::RangeNotSatisfiable { size: total });
     }
 
@@ -359,10 +356,27 @@ mod tests {
     }
 
     #[test]
-    fn only_first_range_of_a_set_is_used() {
+    fn multi_range_serves_whole_file() {
         assert_eq!(
             parse_range(Some(&hv("bytes=0-99,200-299")), 1000).unwrap(),
-            Some((0, 99))
+            None
         );
+    }
+
+    #[test]
+    fn malformed_ranges_are_ignored_not_rejected() {
+        for bad in ["bytes=abc", "bytes=5", "bytes=-", "bytes=9-3", "bytes=x-9"] {
+            assert_eq!(parse_range(Some(&hv(bad)), 1000).unwrap(), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn any_range_of_an_empty_file_is_not_satisfiable() {
+        for r in ["bytes=0-", "bytes=-5", "bytes=0-0"] {
+            assert!(matches!(
+                parse_range(Some(&hv(r)), 0),
+                Err(AppError::RangeNotSatisfiable { .. })
+            ));
+        }
     }
 }

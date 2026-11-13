@@ -29,7 +29,7 @@ const PLAYER_HTML: &str = include_str!("web/player.html");
 
 #[tokio::main]
 async fn main() {
-    // Logging honours RUST_LOG; defaults to `info`.
+    // Logging honours RUST_LOG; defaults to `info,tower_http=warn`.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

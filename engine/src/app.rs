@@ -187,9 +187,10 @@ impl App {
     }
 
     /// Render all outputs for one show-clock sample, then present them together.
-    fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
+    /// Returns how many outputs were actually presented.
+    fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> usize {
         let Some(gpu) = self.gpu.as_ref() else {
-            return;
+            return 0;
         };
         let now = self.clock.now();
         for c in &mut self.contents {
@@ -205,8 +206,11 @@ impl App {
         for rw in &self.windows {
             rw.window.pre_present_notify();
         }
+        let presented = frame.presented();
         let errors = frame.present();
-        self.stats.tick(now);
+        if presented > 0 {
+            self.stats.tick(now);
+        }
 
         for (idx, err) in errors {
             let rw = &mut self.windows[idx];
@@ -225,6 +229,7 @@ impl App {
                 e => tracing::warn!("surface error: {e:?}"),
             }
         }
+        presented
     }
 }
 
@@ -310,8 +315,17 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Frames are driven from here rather than per-window RedrawRequested so
         // all outputs render together. FIFO present blocks on vsync, which
-        // paces the loop, so Poll does not spin the CPU.
-        self.render_frame(event_loop);
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        // paces the loop, so Poll does not spin the CPU — but only while at
+        // least one output presents. With every window minimized (size 0),
+        // acquiring returns at once with an error, so back off instead of
+        // spinning a core; restore/resize events wake the loop earlier.
+        use winit::event_loop::ControlFlow;
+        if self.render_frame(event_loop) > 0 {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
+        }
     }
 }

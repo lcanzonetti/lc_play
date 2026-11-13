@@ -13,6 +13,7 @@ What to look for on the displays:
 """
 
 import argparse
+import os
 import struct
 import zlib
 
@@ -77,6 +78,12 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--cell", type=int, default=120, help="grid spacing in px (default 120)")
     a = ap.parse_args()
+    if a.width < 1 or a.height < 1:
+        ap.error("width and height must be at least 1")
+    if a.cell < 4:
+        ap.error("--cell must be at least 4 (grid lines are 2 px wide)")
+    # Create the output folder (e.g. my-show/media/) if it doesn't exist yet.
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     write_png(a.out, a.width, a.height, pattern(a.width, a.height, a.cell))
     print(f"wrote {a.out} ({a.width}x{a.height})")
 

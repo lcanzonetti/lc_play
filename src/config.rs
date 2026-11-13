@@ -27,53 +27,74 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build a [`Config`] from the process environment, falling back to
-    /// defaults for anything unset or unparseable.
+    /// Build a [`Config`] from the process environment. Unset variables take
+    /// their default. A variable that is set but can't be parsed logs a
+    /// warning and falls back to the default — except `LCMS_BIND`, which
+    /// stops startup: silently binding `0.0.0.0` when you meant `127.0.0.1`
+    /// would expose the server on every interface.
     pub fn from_env() -> Self {
-        let bind = env_or("LCMS_BIND", "0.0.0.0:8080")
-            .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
+        let bind = match std::env::var("LCMS_BIND") {
+            Err(_) => SocketAddr::from(([0, 0, 0, 0], 8080)),
+            Ok(v) => v.parse().unwrap_or_else(|e| {
+                eprintln!("LCMS_BIND={v:?} is not a valid address (e.g. 0.0.0.0:8080): {e}");
+                std::process::exit(2);
+            }),
+        };
 
         let media_dir = PathBuf::from(env_or("LCMS_MEDIA_DIR", "./media"));
 
         let ffmpeg = env_or("LCMS_FFMPEG", "ffmpeg");
 
-        let scan_interval = Duration::from_secs(
-            env_or("LCMS_SCAN_INTERVAL_SECS", "300")
-                .parse()
-                .unwrap_or(300),
-        );
+        let scan_interval = Duration::from_secs(parse_env("LCMS_SCAN_INTERVAL_SECS", 300));
 
         // Default concurrency tracks the available CPU parallelism so the box
-        // is used but not overwhelmed.
+        // is used but not overwhelmed. `0` (or unset) means "use the default".
         let default_transcodes = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let max_transcodes = env_or("LCMS_MAX_TRANSCODES", "0")
-            .parse()
-            .ok()
-            .filter(|&n: &usize| n > 0)
-            .unwrap_or(default_transcodes);
+        let max_transcodes = match parse_env::<usize>("LCMS_MAX_TRANSCODES", 0) {
+            0 => default_transcodes,
+            n => n,
+        };
 
-        let cors = matches!(
-            env_or("LCMS_CORS", "false").to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        );
+        let cors = match env_or("LCMS_CORS", "false").to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" | "" => false,
+            other => {
+                tracing::warn!("LCMS_CORS={other:?} is not a boolean; CORS stays disabled");
+                false
+            }
+        };
 
-        let cache_max_age = env_or("LCMS_CACHE_MAX_AGE_SECS", "0").parse().unwrap_or(0);
+        let cache_max_age = parse_env("LCMS_CACHE_MAX_AGE_SECS", 0);
 
         Config {
-            cache_max_age,
             bind,
             media_dir,
             ffmpeg,
             scan_interval,
             max_transcodes,
             cors,
+            cache_max_age,
         }
     }
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse `key` as a `T`; unset → `default`, unparseable → warn + `default`.
+fn parse_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(v) => v.trim().parse().unwrap_or_else(|e| {
+            tracing::warn!("{key}={v:?} is invalid ({e}); using the default {default}");
+            default
+        }),
+    }
 }

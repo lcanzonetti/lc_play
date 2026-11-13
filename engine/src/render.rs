@@ -99,7 +99,12 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 
+    /// Format the window surfaces are configured with.
     surface_format: wgpu::TextureFormat,
+    /// Format we render the final image through: always the sRGB variant of
+    /// `surface_format` when one exists, so the GPU encodes our linear shader
+    /// output to sRGB. Equal to `surface_format` when it is already sRGB.
+    target_format: wgpu::TextureFormat,
 
     scene_pipeline: wgpu::RenderPipeline,
     warp_pipeline: wgpu::RenderPipeline,
@@ -128,12 +133,29 @@ impl Gpu {
         .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter found"))?;
 
         let caps = surface.get_capabilities(&adapter);
-        let surface_format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+        let surface_format = match caps.formats.iter().copied().find(|f| f.is_srgb()) {
+            Some(f) => f,
+            None => {
+                let f = *caps
+                    .formats
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("surface reports no supported formats"))?;
+                // The shaders write linear light. Without sRGB encoding the
+                // picture (and the blend ramps) come out too dark, so render
+                // through an sRGB *view* of the surface when the format has one.
+                if f.add_srgb_suffix() != f {
+                    tracing::info!(
+                        "surface has no sRGB format; rendering through an sRGB view of {f:?}"
+                    );
+                } else {
+                    tracing::warn!(
+                        "surface format {f:?} has no sRGB variant: output will not be \
+                         sRGB-encoded and will look too dark"
+                    );
+                }
+                f
+            }
+        };
 
         let gpu = Self::with_adapter(instance, adapter, surface_format)?;
         Ok((gpu, surface))
@@ -294,12 +316,13 @@ impl Gpu {
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
         );
         // Warp: the final image replaces the surface contents; no blending.
+        let target_format = surface_format.add_srgb_suffix();
         let warp_pipeline = pipeline(
             "warp-pipeline",
             &[&blend_bgl, &texture_bgl],
             &warp_shader,
             warp_vertex_layout,
-            surface_format,
+            target_format,
             None,
         );
 
@@ -320,6 +343,7 @@ impl Gpu {
             device,
             queue,
             surface_format,
+            target_format,
             scene_pipeline,
             warp_pipeline,
             uniform_bgl,
@@ -352,7 +376,12 @@ impl Gpu {
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
+            // Allow the sRGB view `draw` renders through (see `target_format`).
+            view_formats: if self.target_format != self.surface_format {
+                vec![self.target_format]
+            } else {
+                vec![]
+            },
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&self.device, &config);
@@ -538,9 +567,10 @@ impl Gpu {
         for (ti, &(out, output)) in targets.iter().enumerate() {
             match out.surface.get_current_texture() {
                 Ok(frame) => {
-                    let view = frame
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(self.target_format),
+                        ..Default::default()
+                    });
                     self.encode_output(
                         &mut encoder,
                         &view,
@@ -671,6 +701,11 @@ pub struct PendingFrame {
 }
 
 impl PendingFrame {
+    /// Number of outputs whose surface was acquired and will be presented.
+    pub fn presented(&self) -> usize {
+        self.frames.len()
+    }
+
     /// Present every acquired surface back-to-back.
     pub fn present(self) -> Vec<(usize, wgpu::SurfaceError)> {
         for frame in self.frames {

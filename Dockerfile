@@ -1,5 +1,7 @@
 # ---- build stage ----
-FROM rust:1-slim AS build
+# Build on the same Debian release as the runtime image, so the binary never
+# needs a newer glibc than the runtime provides.
+FROM rust:1-slim-bookworm AS build
 WORKDIR /app
 
 # Pre-cache dependencies: copy manifests, build a stub, then the real sources.

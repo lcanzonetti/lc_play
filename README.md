@@ -5,7 +5,8 @@ A **lightweight, well-optimized, scalable** media server written in Rust.
 It scans a directory of media, exposes a small JSON API to browse it, streams
 files directly with full HTTP Range support (seeking), and transcodes on the
 fly with `ffmpeg` when a client needs a different format or bitrate — all from a
-single static binary with an in-memory index and no database.
+single self-contained binary (it only needs the system C library) with an
+in-memory index and no database.
 
 A minimal built-in web player is served at `/` for testing.
 
@@ -54,7 +55,9 @@ and browsing work without it.
 
 ## Configuration
 
-All configuration is via environment variables; every one has a default.
+All configuration is via environment variables; every one has a default. A
+value that can't be parsed logs a warning and uses the default, except an
+invalid `LCMS_BIND`, which stops the server at startup.
 
 | Variable                 | Default        | Description                                                        |
 | ------------------------ | -------------- | ------------------------------------------------------------------ |
@@ -65,7 +68,7 @@ All configuration is via environment variables; every one has a default.
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
 | `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
 | `LCMS_CACHE_MAX_AGE_SECS`| `0`            | `Cache-Control: max-age` on `/stream`. `0` = caches may store files but revalidate (cheap `304`) before each reuse. Raise it only if files are never replaced in place. |
-| `RUST_LOG`               | `info`         | Log level (`tracing` env filter syntax).                           |
+| `RUST_LOG`               | `info,tower_http=warn` | Log level (`tracing` env filter syntax).                   |
 
 ## HTTP API
 
@@ -92,7 +95,7 @@ All configuration is via environment variables; every one has a default.
 | `abitrate` | `128`   | Audio bitrate in kbps (clamped to 32–512).                           |
 | `copy`     | `false` | Remux only (`-c copy`) — no re-encode. Fastest when codecs already fit. |
 
-Example — get any file as seekable, 720p MP4 that plays in every browser:
+Example — get any file as a 720p MP4 that plays in every browser:
 
 ```
 /transcode/<id>?format=mp4&height=720
@@ -158,7 +161,7 @@ more replicas that mount the same media directory:
 ## Development
 
 ```bash
-cargo test           # unit tests (range parsing, id encoding, classification)
+cargo test           # unit tests (range parsing, cache validators, scanning, transcode args)
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
