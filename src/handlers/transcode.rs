@@ -100,8 +100,15 @@ pub async fn transcode_media(
 
     if method == Method::HEAD {
         // Crawlers and link previews send HEAD; don't burn a slot and an
-        // encoder on them. axum strips the (empty) body for HEAD anyway.
-        return Ok((response_headers(content_type), Body::empty()).into_response());
+        // encoder on them. Use a body with *no* size hint: `Body::empty()`
+        // would advertise `content-length: 0`, but a HEAD must carry the same
+        // headers as the GET, which is streamed with no length.
+        let unsized_body = futures::stream::empty::<std::io::Result<Bytes>>();
+        return Ok((
+            response_headers(content_type),
+            Body::from_stream(unsized_body),
+        )
+            .into_response());
     }
 
     // Acquire a transcode slot. We hold this permit for the whole stream so the
