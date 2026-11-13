@@ -75,7 +75,22 @@ impl Config {
         let root_marker = std::env::var("LCMS_ROOT_MARKER")
             .ok()
             .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
+            .filter(|m| !m.is_empty())
+            .map(|m| {
+                // Must be one plain file name inside the media root: an
+                // absolute path would replace the root in `join` (bypassing
+                // the check), and the name is shown by the public health
+                // endpoints, which must not reveal paths.
+                if is_plain_file_name(&m) {
+                    m
+                } else {
+                    eprintln!(
+                        "LCMS_ROOT_MARKER={m:?} must be a plain file name in the media root \
+                         (e.g. .lcms-root), not a path"
+                    );
+                    std::process::exit(2);
+                }
+            });
 
         Config {
             bind,
@@ -88,6 +103,15 @@ impl Config {
             root_marker,
         }
     }
+}
+
+/// `true` if `name` is exactly one normal path component (no `/`, `..`, root).
+fn is_plain_file_name(name: &str) -> bool {
+    let mut parts = std::path::Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -106,5 +130,19 @@ where
             tracing::warn!("{key}={v:?} is invalid ({e}); using the default {default}");
             default
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_must_be_a_plain_file_name() {
+        assert!(is_plain_file_name(".lcms-root"));
+        assert!(is_plain_file_name("MOUNTED"));
+        for bad in ["/etc/hostname", "../x", "a/b", ".", "..", "/"] {
+            assert!(!is_plain_file_name(bad), "{bad}");
+        }
     }
 }

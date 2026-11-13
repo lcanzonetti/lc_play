@@ -62,8 +62,9 @@ pub struct MediaItem {
 struct Index {
     /// id -> item
     by_id: HashMap<String, MediaItem>,
-    /// Why the most recent scan could not read the media root, if it failed.
-    /// `by_id` then still holds the last good index.
+    /// Why the most recent scan was rejected (unreadable root, missing
+    /// marker, or root turned empty), if it was. `by_id` then still holds the
+    /// last good index.
     scan_error: Option<String>,
 }
 
@@ -106,8 +107,9 @@ impl Library {
         self.len() == 0
     }
 
-    /// `Some(reason)` when the last scan could not read the media root. The
-    /// index then still serves the previous good scan (possibly empty).
+    /// `Some(reason)` when the last scan was rejected (unreadable root,
+    /// missing marker, or root turned empty). The index then still serves the
+    /// previous good scan (possibly empty).
     pub fn scan_error(&self) -> Option<String> {
         self.index.read().unwrap().scan_error.clone()
     }
@@ -135,10 +137,12 @@ impl Library {
     ///   * the configured marker file is missing from the root — the reliable
     ///     way to detect an unmounted share, whose mount point usually stays
     ///     behind as an empty but readable directory;
-    ///   * the scan finds nothing although the current index is non-empty.
-    ///     Without a marker this is how an unmounted share looks. It stays
-    ///     degraded until media reappears; if you emptied the library on
-    ///     purpose, restart the server (the first scan accepts an empty root).
+    ///   * no marker is configured and the scan finds nothing although the
+    ///     current index is non-empty — without a marker this is how an
+    ///     unmounted share looks. It stays degraded until media reappears; if
+    ///     you emptied the library on purpose, restart the server (the first
+    ///     scan accepts an empty root). With a marker present the share is
+    ///     known to be mounted, so an empty scan is accepted as real.
     ///
     /// Errors below the root (an unreadable subfolder, a broken symlink) are
     /// logged and skipped: they are usually permanent, and refusing to ever
@@ -216,7 +220,7 @@ impl Library {
 
         let count = by_id.len();
         let previous = self.len();
-        if count == 0 && previous > 0 {
+        if count == 0 && previous > 0 && self.marker.is_none() {
             self.keep_previous(format!(
                 "media root is now empty (previously {previous} items); storage not mounted?"
             ));
@@ -253,6 +257,9 @@ fn encode_id(rel: &str) -> String {
     s
 }
 
+/// How often a degraded library retries when periodic rescans are disabled.
+const DEGRADED_RETRY: Duration = Duration::from_secs(30);
+
 /// Spawn the periodic background rescan loop. The first scan runs immediately.
 pub async fn spawn_rescan(library: std::sync::Arc<Library>, interval: Duration) {
     // Initial scan runs on a blocking thread so we never stall the runtime.
@@ -262,7 +269,20 @@ pub async fn spawn_rescan(library: std::sync::Arc<Library>, interval: Duration) 
     }
 
     if interval.is_zero() {
-        return; // periodic rescanning disabled
+        // Periodic rescanning is disabled, but a node that started before its
+        // share was mounted would otherwise stay degraded until restarted:
+        // retry slowly until one scan succeeds, then stop.
+        if library.scan_error().is_some() {
+            tokio::spawn(async move {
+                while library.scan_error().is_some() {
+                    tokio::time::sleep(DEGRADED_RETRY).await;
+                    let lib = library.clone();
+                    let _ = tokio::task::spawn_blocking(move || lib.rescan()).await;
+                }
+                tracing::info!("library recovered; periodic rescans stay disabled");
+            });
+        }
+        return;
     }
 
     tokio::spawn(async move {
@@ -374,6 +394,24 @@ mod tests {
         lib.rescan();
         assert_eq!(lib.len(), 1);
         assert!(lib.scan_error().unwrap().contains("marker"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn with_marker_present_an_empty_root_is_real() {
+        // The marker proves the share is mounted, so deleting the last file
+        // must empty the index, not mark the node degraded.
+        let root = temp_dir("marker-empty");
+        std::fs::write(root.join(".lcms-root"), b"").unwrap();
+        std::fs::write(root.join("a.mp4"), b"x").unwrap();
+        let lib = Library::new(root.clone(), Some(".lcms-root".into()));
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+
+        std::fs::remove_file(root.join("a.mp4")).unwrap();
+        lib.rescan();
+        assert_eq!(lib.len(), 0);
+        assert!(lib.scan_error().is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

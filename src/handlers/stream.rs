@@ -103,11 +103,6 @@ struct Validators {
     etag: Option<String>,
     /// Modification time, truncated to whole seconds as HTTP dates are.
     last_modified: Option<SystemTime>,
-    /// Whether `last_modified` is a *strong* validator (RFC 9110 §8.8.2.2):
-    /// the file was last changed at least a second ago, so two versions can't
-    /// share the same one-second timestamp. Only then may a date `If-Range`
-    /// match.
-    date_is_strong: bool,
     cache_control: String,
 }
 
@@ -118,8 +113,6 @@ impl Validators {
             etag: since_epoch.map(|d| format!("\"{size:x}-{:x}\"", d.as_nanos())),
             last_modified: since_epoch
                 .map(|d| UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())),
-            date_is_strong: modified
-                .is_some_and(|m| m + std::time::Duration::from_secs(1) <= SystemTime::now()),
             cache_control: format!("public, max-age={max_age}, must-revalidate"),
         }
     }
@@ -162,23 +155,22 @@ impl Validators {
         }
     }
 
-    /// `true` if a `Range` may be honoured: there is no `If-Range`, or it
-    /// still matches this version (strong ETag, or exact `Last-Modified` when
-    /// that date is a strong validator).
+    /// `true` if a `Range` may be honoured: there is no `If-Range`, or it is
+    /// an ETag that strongly matches this version.
+    ///
+    /// A *date* in `If-Range` never matches (the full file is sent instead):
+    /// a one-second timestamp can't prove the client's bytes come from this
+    /// version, since two versions can be saved within the same second. That
+    /// costs nothing in practice: every response that carries
+    /// `Last-Modified` also carries an `ETag`, and RFC 9110 §13.1.5 tells
+    /// clients to prefer the ETag.
     fn if_range_holds(&self, req: &HeaderMap) -> bool {
         let Some(v) = req.get(header::IF_RANGE) else {
             return true;
         };
         let Ok(v) = v.to_str() else { return false };
-        let v = v.trim();
-        if v.starts_with('"') || v.starts_with("W/") {
-            // Strong comparison: a weak tag never matches.
-            return self.etag.as_deref() == Some(v);
-        }
-        match (httpdate::parse_http_date(v), self.last_modified) {
-            (Ok(date), Some(lm)) => self.date_is_strong && date == lm,
-            _ => false,
-        }
+        // Strong comparison: a weak tag (W/...) or a date never matches.
+        self.etag.as_deref() == Some(v.trim())
     }
 }
 
@@ -202,7 +194,13 @@ fn parse_range(
     let Ok(value) = value.to_str() else {
         return Ok(None);
     };
-    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+    // Range units are case-insensitive (RFC 9110 §14.1): accept `Bytes=`.
+    let value = value.trim();
+    let Some(spec) = value
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| &value[6..])
+    else {
         return Ok(None); // unsupported unit
     };
     if spec.contains(',') {
@@ -294,20 +292,9 @@ mod tests {
         assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &etag)])));
         assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, "\"stale\"")])));
         assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, &format!("W/{etag}"))])));
-        let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
-        assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &lm)])));
-    }
-
-    #[test]
-    fn date_if_range_needs_a_strong_date() {
-        // Modified "now": another change could land within the same second,
-        // so a date can't prove the client's bytes are from this version.
-        let v = Validators::new(1000, Some(SystemTime::now()), 0);
+        // Even the exact Last-Modified date doesn't count (see if_range_holds).
         let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
         assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, &lm)])));
-        // The ETag (which has nanoseconds) still works.
-        let etag = v.etag.clone().unwrap();
-        assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &etag)])));
     }
 
     #[test]
@@ -373,6 +360,14 @@ mod tests {
     #[test]
     fn unknown_unit_serves_whole_file() {
         assert_eq!(parse_range(Some(&hv("items=0-1")), 1000).unwrap(), None);
+    }
+
+    #[test]
+    fn range_unit_is_case_insensitive() {
+        assert_eq!(
+            parse_range(Some(&hv("Bytes=0-9")), 1000).unwrap(),
+            Some((0, 9))
+        );
     }
 
     #[test]

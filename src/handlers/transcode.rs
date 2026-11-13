@@ -288,9 +288,15 @@ fn build_ffmpeg_args(
     let abitrate = params.abitrate.unwrap_or(128).clamp(32, 512);
 
     let copy = params.copy.unwrap_or(false);
-    let scale_filter = params
-        .height
-        .map(|h| format!("scale=-2:{}", h.clamp(144, 4320)));
+    // Target height: clamped, and rounded down to even because libx264
+    // (4:2:0) rejects odd frame sizes. `min(ih, …)` never upscales a smaller
+    // source, and `trunc(…/2)*2` keeps that result even too (`-2` already
+    // does the same for the width). The comma inside `min()` is escaped for
+    // ffmpeg's filter-graph parser; no shell is involved.
+    let scale_filter = params.height.map(|h| {
+        let h = h.clamp(144, 4320) & !1;
+        format!("scale=-2:trunc(min(ih\\,{h})/2)*2")
+    });
 
     let content_type: &'static str = match format {
         "mp4" => {
@@ -433,6 +439,18 @@ mod tests {
         )
         .unwrap();
         assert!(args.contains(&"512k".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn scale_height_is_even_and_never_upscales() {
+        let (_, args) = build_ffmpeg_args(
+            "mp4",
+            std::path::Path::new("/m/a.mkv"),
+            &params(r#"{"height": 145}"#),
+        )
+        .unwrap();
+        let vf = &args[args.iter().position(|a| a == "-vf").unwrap() + 1];
+        assert_eq!(vf, r"scale=-2:trunc(min(ih\,144)/2)*2");
     }
 
     #[test]

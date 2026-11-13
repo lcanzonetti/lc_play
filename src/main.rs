@@ -86,8 +86,9 @@ async fn healthz(
     body
 }
 
-/// Readiness probe for load balancers: 503 while the last library scan could
-/// not read the media root, so traffic goes to nodes that can serve files.
+/// Readiness probe for load balancers: 503 while the last library scan was
+/// rejected (unreadable root, missing marker, or root turned empty), so
+/// traffic goes to nodes that can serve files.
 async fn readyz(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {

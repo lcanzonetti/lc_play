@@ -69,7 +69,7 @@
           <option value="360">360p</option>
         </select>
       </label>
-      <button id="reload">Rescan list</button>
+      <button id="reload" title="Re-fetch the list. The server rescans the media folder on its own schedule (LCMS_SCAN_INTERVAL_SECS).">Refresh list</button>
     </div>
     <div id="player"><p class="empty">Select something from the library to play.</p></div>
   </main>
@@ -95,8 +95,17 @@ function textEl(tag, className, text) {
 }
 
 async function load() {
-  const res = await fetch("/api/library");
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch("/api/library");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (e) {
+    // Keep the previous list (if any) and say what went wrong, instead of
+    // leaving "loading library…" on screen forever.
+    $("#count").textContent = `couldn't load the library (${e.message}) — try Refresh`;
+    return;
+  }
   items = data.items;
   $("#count").textContent = data.count + " item" + (data.count === 1 ? "" : "s");
   const list = $("#list");
@@ -107,7 +116,7 @@ async function load() {
   }
   for (const it of items) {
     const el = document.createElement("div");
-    el.className = "item";
+    el.className = it.id === currentId ? "item active" : "item";
     el.dataset.id = it.id;
     // Build with textContent, never innerHTML: file names come from the
     // filesystem and may contain markup (stored XSS otherwise).
@@ -120,13 +129,15 @@ async function load() {
   }
 }
 
+// URL for the current mode: the original file, or a transcode at the chosen
+// quality.
 function srcFor(it) {
   const mode = $("#mode").value;
   const height = $("#height").value;
-  if (mode === "direct") return { url: it.stream_url, type: it.mime };
+  if (mode === "direct") return it.stream_url;
   const params = new URLSearchParams({ format: mode });
   if (height) params.set("height", height);
-  return { url: `${it.transcode_url}?${params}`, type: mode === "mp4" ? "video/mp4" : "video/webm" };
+  return `${it.transcode_url}?${params}`;
 }
 
 function play(id) {
@@ -135,7 +146,7 @@ function play(id) {
   if (!it) return;
   document.querySelectorAll(".item").forEach((e) =>
     e.classList.toggle("active", e.dataset.id === id));
-  const { url, type } = srcFor(it);
+  const url = srcFor(it);
   const media = document.createElement(it.kind === "audio" ? "audio" : "video");
   media.controls = true;
   media.autoplay = true;

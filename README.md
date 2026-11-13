@@ -5,7 +5,8 @@ A **lightweight, well-optimized, scalable** media server written in Rust.
 It scans a directory of media, exposes a small JSON API to browse it, streams
 files directly with full HTTP Range support (seeking), and transcodes on the
 fly with `ffmpeg` when a client needs a different format or bitrate — all from a
-single self-contained binary (it only needs the system C library) with an
+single self-contained binary (it only needs the standard system libraries:
+libc, libm, libgcc_s) with an
 in-memory index and no database.
 
 A minimal built-in web player is served at `/` for testing.
@@ -64,10 +65,10 @@ invalid `LCMS_BIND`, which stops the server at startup.
 | `LCMS_BIND`              | `0.0.0.0:8080` | Address to bind the HTTP server to.                                |
 | `LCMS_MEDIA_DIR`         | `./media`      | Root directory scanned for media.                                  |
 | `LCMS_FFMPEG`            | `ffmpeg`       | Path to the `ffmpeg` binary used for transcoding.                  |
-| `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
+| `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans (a degraded node still retries every 30 s until one scan succeeds). |
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
 | `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
-| `LCMS_ROOT_MARKER`       | *(unset)*      | File name that must exist directly in the media root (e.g. `.lcms-root`). If it's missing, the scan is rejected and the node reports degraded. Recommended on network storage: an unmounted share usually leaves an empty, readable mount point. |
+| `LCMS_ROOT_MARKER`       | *(unset)*      | File name that must exist directly in the media root (e.g. `.lcms-root`); a path is refused at startup. If it's missing, the scan is rejected and the node reports degraded. Recommended on network storage: an unmounted share usually leaves an empty, readable mount point. |
 | `LCMS_CACHE_MAX_AGE_SECS`| `0`            | `Cache-Control: max-age` on `/stream`. `0` = caches may store files but revalidate (cheap `304`) before each reuse. Raise it only if files are never replaced in place. |
 | `RUST_LOG`               | `info,tower_http=warn` | Log level (`tracing` env filter syntax).                   |
 
@@ -76,7 +77,7 @@ invalid `LCMS_BIND`, which stops the server at startup.
 | Method & path            | Description                                              |
 | ------------------------ | ------------------------------------------------------- |
 | `GET /`                  | Built-in web player (HTML).                             |
-| `GET /healthz`           | Liveness probe; always `200`. `{ "status": "ok", "items": N }`, or `"degraded"` plus `"error"` when the last scan couldn't read the media root. |
+| `GET /healthz`           | Liveness probe; always `200`. `{ "status": "ok", "items": N }`, or `"degraded"` plus `"error"` when the last scan was rejected (unreadable media root, missing marker, or root turned empty). |
 | `GET /readyz`            | Readiness probe; same body, but `503` while degraded.   |
 | `GET /api/library`       | List every indexed item.                                |
 | `GET /api/items/{id}`    | Metadata for one item.                                  |
@@ -90,7 +91,7 @@ invalid `LCMS_BIND`, which stops the server at startup.
 | Param      | Default | Description                                                          |
 | ---------- | ------- | -------------------------------------------------------------------- |
 | `format`   | `mp4`   | Output profile: `mp4` (H.264/AAC) or `webm` (VP9/Opus).              |
-| `height`   | *(source)* | Scale to this output height, preserving aspect (e.g. `720`).     |
+| `height`   | *(source)* | Max output height, preserving aspect (e.g. `720`). Clamped to 144–4320 and rounded down to even; never upscales a smaller source. |
 | `t`        | `0`     | Seek to this many seconds before encoding (fast input-side seek).    |
 | `crf`      | `23`/`32` | Quality (lower = better; x264 0–51, VP9 0–63).                     |
 | `abitrate` | `128`   | Audio bitrate in kbps (clamped to 32–512).                           |
@@ -157,13 +158,14 @@ more replicas that mount the same media directory:
 - Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
   the only CPU-heavy path.
 - Use `GET /readyz` as the load-balancer health check: it returns `503` while
-  the media root is unreachable, turns empty after having media, or (with
-  `LCMS_ROOT_MARKER`) lacks the marker file. The node keeps its last good
-  index meanwhile. Without a marker, a node that *starts* while the share is
-  unmounted can't tell, and reports ready with 0 items; set the marker on
-  network storage. If you empty a library on purpose, restart the node. Use `GET /healthz` for
-  liveness (it stays `200`), so an orchestrator doesn't restart nodes over a
-  storage outage a restart can't fix.
+  the media root is unreachable, lacks the marker file (with
+  `LCMS_ROOT_MARKER`), or (without a marker) turns empty after having media.
+  The node keeps its last good index meanwhile. Set the marker on network
+  storage: without it, a node that *starts* while the share is unmounted can't
+  tell and reports ready with 0 items, and a library you empty on purpose
+  stays degraded until the node restarts. With a marker, an empty library is
+  simply empty. Use `GET /healthz` for liveness (it stays `200`), so an
+  orchestrator doesn't restart nodes over a storage outage a restart can't fix.
 
 ## Development
 
