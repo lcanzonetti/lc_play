@@ -246,6 +246,12 @@ pub struct Playback {
     /// Total show duration in seconds, used for looping. `None` = run forever.
     #[serde(default)]
     pub duration: Option<f64>,
+    /// Show mode: the output windows ignore the keyboard (no seek, no
+    /// play/pause, no Esc) and window-close requests, so a stray key or a
+    /// KVM switch can't change or end the show. Stop the engine from its
+    /// terminal (Ctrl+C) or service manager instead.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 impl Default for Playback {
@@ -254,6 +260,7 @@ impl Default for Playback {
             autoplay: true,
             looping: false,
             duration: None,
+            locked: false,
         }
     }
 }
@@ -297,7 +304,32 @@ impl Show {
     /// Parse a show from JSON text and validate it, so mistakes surface as a
     /// clear message at load time instead of a garbled image (or a GPU panic).
     pub fn from_json(text: &str) -> anyhow::Result<Self> {
-        let show: Show = serde_json::from_str(text)?;
+        // Collect every key serde would silently skip. A typo such as
+        // `"rotation"` on an output (the layer field) or `"rigth"` in a blend
+        // would otherwise load "fine" and show an unrotated, unblended
+        // output. Keys starting with `_` (e.g. `"_note"`) are comments.
+        let mut unknown = Vec::new();
+        let mut de = serde_json::Deserializer::from_str(text);
+        let show: Show = serde_ignored::deserialize(&mut de, |path| {
+            let is_comment =
+                matches!(&path, serde_ignored::Path::Map { key, .. } if key.starts_with('_'));
+            if !is_comment {
+                unknown.push(path.to_string());
+            }
+        })?;
+        de.end()?;
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "unknown key{} {} — check the spelling (keys starting with '_' are \
+                 allowed as comments)",
+                if unknown.len() == 1 { "" } else { "s" },
+                unknown
+                    .iter()
+                    .map(|k| format!("'{k}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if show.outputs.is_empty() {
             anyhow::bail!("show has no outputs");
         }
@@ -346,6 +378,11 @@ impl Show {
             }
             if !(o.canvas_rect.w > 0.0 && o.canvas_rect.h > 0.0) {
                 anyhow::bail!("output '{id}': canvas_rect must have positive w and h");
+            }
+            if let Some([w, h]) = o.window.size {
+                if w == 0 || h == 0 {
+                    anyhow::bail!("output '{id}': window.size must be at least 1x1");
+                }
             }
             let b = &o.blend;
             let edges = [b.left, b.right, b.top, b.bottom];
@@ -507,6 +544,33 @@ mod tests {
 
     fn err(r: anyhow::Result<Show>) -> String {
         format!("{:#}", r.expect_err("show should be rejected"))
+    }
+
+    #[test]
+    fn rejects_misspelled_keys_but_allows_comments() {
+        let e = err(Show::from_json(
+            r#"{ "canvas": { "width": 10, "height": 10 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 },
+                                "rotation": 90, "blend": { "rigth": 0.2 } } ] }"#,
+        ));
+        assert!(e.contains("'outputs.0.rotation'"), "{e}");
+        assert!(e.contains("'outputs.0.blend.rigth'"), "{e}");
+
+        assert!(Show::from_json(
+            r#"{ "_note": "top", "canvas": { "width": 10, "height": 10, "_why": "x" },
+                 "outputs": [ { "_note": "o", "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 } } ] }"#,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_window_size() {
+        let e = err(Show::from_json(
+            r#"{ "canvas": { "width": 10, "height": 10 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 },
+                                "window": { "size": [0, 10] } } ] }"#,
+        ));
+        assert!(e.contains("window.size"), "{e}");
     }
 
     #[test]

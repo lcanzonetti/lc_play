@@ -17,7 +17,8 @@
 //!   2. **warp** → sample the slice through the perspective warp mesh and
 //!      multiply by the edge-blend mask, writing to the window surface.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec2, Vec3};
@@ -124,6 +125,36 @@ pub struct Gpu {
 
     quad_vbo: wgpu::Buffer,
     quad_ibo: wgpu::Buffer,
+
+    /// GPU errors reported since start (see [`install_error_handlers`]).
+    error_count: Arc<AtomicU64>,
+    /// Set by the device-lost callback: why the device is gone.
+    lost: Arc<Mutex<Option<String>>>,
+}
+
+/// Replace wgpu's default error handling, which **panics** on any validation
+/// error and so would take every output down. Errors are logged instead
+/// (first few in full, then every 1000th so a per-frame error can't flood the
+/// log) and counted; a lost device is recorded for the frame loop to act on.
+fn install_error_handlers(device: &wgpu::Device) -> (Arc<AtomicU64>, Arc<Mutex<Option<String>>>) {
+    let count = Arc::new(AtomicU64::new(0));
+    let c = count.clone();
+    device.on_uncaptured_error(Box::new(move |err| {
+        let n = c.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 10 || n.is_multiple_of(1000) {
+            tracing::error!("GPU error #{n} (rendering continues): {err}");
+        }
+    }));
+    let lost = Arc::new(Mutex::new(None));
+    let l = lost.clone();
+    device.set_device_lost_callback(move |reason, msg| {
+        // `Destroyed` is our own shutdown, not a failure.
+        if reason != wgpu::DeviceLostReason::Destroyed {
+            tracing::error!("GPU device lost ({reason:?}): {msg}");
+            *l.lock().unwrap() = Some(format!("{reason:?}: {msg}"));
+        }
+    });
+    (count, lost)
 }
 
 impl Gpu {
@@ -190,6 +221,7 @@ impl Gpu {
             },
             None,
         ))?;
+        let (error_count, lost) = install_error_handlers(&device);
 
         let uniform_entry = |visibility| wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -351,7 +383,20 @@ impl Gpu {
             sampler,
             quad_vbo,
             quad_ibo,
+            error_count,
+            lost,
         })
+    }
+
+    /// `Some(reason)` once the GPU device has been lost.
+    pub fn device_lost(&self) -> Option<String> {
+        self.lost.lock().unwrap().clone()
+    }
+
+    /// GPU errors reported since start (each is logged, none is fatal).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn error_count(&self) -> u64 {
+        self.error_count.load(Ordering::Relaxed)
     }
 
     /// Create a surface for an additional window (outputs after the first).
@@ -528,6 +573,14 @@ impl Gpu {
 
     pub fn resize_output(&self, out: &mut OutputGpu, width: u32, height: u32) {
         if width == 0 || height == 0 {
+            return;
+        }
+        let max = self.max_texture_dimension();
+        if width > max || height > max {
+            // Can't be configured; keep the last good configuration rather
+            // than raise a GPU error every frame. (Start-up refuses such
+            // sizes; this guards a window resized afterwards.)
+            tracing::warn!("ignoring resize to {width}x{height}: exceeds the GPU limit of {max}px");
             return;
         }
         out.config.width = width;
@@ -1066,6 +1119,23 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
+    }
+
+    #[test]
+    fn gpu_validation_errors_are_logged_not_fatal() {
+        // wgpu's default handler panics on a validation error; ours must
+        // count it and let rendering continue.
+        let Some(gpu) = gpu_or_skip() else { return };
+        let _bad = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("invalid-on-purpose"),
+            size: 16,
+            // MAP_READ and MAP_WRITE together are invalid.
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        assert!(gpu.error_count() >= 1);
+        assert!(gpu.device_lost().is_none());
     }
 
     #[test]

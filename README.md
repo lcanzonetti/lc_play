@@ -138,7 +138,9 @@ are ignored, so the templates document themselves with `"_note"` fields.
 
 Load errors name the problem (`output 'B': canvas_rect must have positive w
 and h`, `warp corners must form a convex quad…`), and nothing is drawn until
-the show is valid.
+the show is valid. **Unknown keys are errors too** (`unknown key
+'outputs.0.rotation'`), so a misspelling can't silently do nothing; keys that
+start with `_` (like `"_note"`) are comments and are always allowed.
 
 **Test patterns** for your own canvas size (lines must stay straight across
 seams, the circle must stay round, corner blocks show orientation):
@@ -154,14 +156,33 @@ python3 tools/test_pattern.py 3840 1080 my-show/media/grid.png
 | `Space` | play / pause |
 | `→` / `←` | seek ±5 s |
 | `↑` / `↓` | seek ±30 s |
-| `Esc` | quit |
+| `Esc` `Esc` | quit (press twice within 1.5 s; one stray press does nothing) |
+
+Holding a key acts once; auto-repeat is ignored.
+
+**Show mode:** set `"playback": { "locked": true }` for the actual show. The
+output windows then ignore the keyboard and window-close requests (Alt+F4,
+⌘Q, the close button), so a stray key, a KVM switch or a misdirected click
+can't seek, pause or end the show. Stop a locked show from its terminal
+(Ctrl+C) or service manager.
+
+**Startup:** windows, GPU and all media load first; with `autoplay` the clock
+starts at 0 only once the first frame is on screen, so loading time never
+skips the opening of the show. Fullscreen outputs hide the mouse pointer.
+
+**Exit codes:** `0` after a normal quit; non-zero when the engine stops
+because of a failure (bad show file, no usable GPU, an output window larger
+than the GPU supports, GPU device lost or out of memory), so a launch script
+or service manager can restart it. GPU errors during the show are logged and
+counted but don't stop rendering.
 
 ## Show file format
 
 ```jsonc
 {
   "canvas": { "width": 1920, "height": 1080, "background": [0.05,0.06,0.09,1.0] },
-  "playback": { "autoplay": true, "loop": true, "duration": 20.0 }, // loop needs duration
+  "playback": { "autoplay": true, "loop": true, "duration": 20.0,  // loop needs duration
+                "locked": false },                                  // true = show mode
 
   "outputs": [
     {

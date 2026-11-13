@@ -6,8 +6,14 @@
 //! single timestamp in one GPU submission, so outputs never disagree about
 //! show time. Pacing comes from vsync (FIFO present).
 //!
-//! Keyboard transport: Space = play/pause, ←/→ = seek ±5s, ↓/↑ = seek ±30s,
-//! Esc = quit.
+//! Keyboard transport (only when the show is not `locked`): Space =
+//! play/pause, ←/→ = seek ±5s, ↓/↑ = seek ±30s, Esc twice within
+//! [`QUIT_CONFIRM_WINDOW`] = quit. A locked show ignores keys and window-close
+//! requests entirely.
+//!
+//! Startup order matters for a show: windows, GPU and all content are loaded
+//! first, and the clock starts (with `autoplay`) only after the first frame
+//! has been presented, so the opening of the show is never skipped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,9 +38,20 @@ struct RenderWindow {
     output_idx: usize,
 }
 
+/// A second Esc must follow the first within this window to quit.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
+
 pub struct App {
     show: Show,
     clock: Clock,
+    /// `playback.autoplay` not yet honoured: the clock starts on the first
+    /// presented frame, not at construction.
+    autoplay_pending: bool,
+    /// Esc must be pressed twice to quit.
+    quit_guard: QuitGuard,
+    /// Why the engine stopped, if it stopped because of a failure. `main`
+    /// returns it, so the process exits non-zero and a supervisor can react.
+    fatal: Option<anyhow::Error>,
     gpu: Option<Gpu>,
     contents: Vec<Box<dyn Content>>,
     windows: Vec<RenderWindow>,
@@ -42,6 +59,25 @@ pub struct App {
     /// Layer indices sorted back-to-front by z.
     draw_order: Vec<usize>,
     stats: FrameStats,
+}
+
+/// Two-press quit: the first press arms it, a second press within
+/// [`QUIT_CONFIRM_WINDOW`] confirms. A single stray Esc does nothing.
+#[derive(Default)]
+struct QuitGuard {
+    armed_at: Option<Instant>,
+}
+
+impl QuitGuard {
+    /// Register a press at `now`; `true` means "quit now".
+    fn press(&mut self, now: Instant) -> bool {
+        let confirmed = self
+            .armed_at
+            .is_some_and(|t| now.saturating_duration_since(t) <= QUIT_CONFIRM_WINDOW);
+        // A confirmed press is consumed; otherwise this press arms the guard.
+        self.armed_at = if confirmed { None } else { Some(now) };
+        confirmed
+    }
 }
 
 /// Logs the frame rate every few seconds so a show's performance is visible.
@@ -73,7 +109,8 @@ impl App {
             .looping
             .then_some(show.playback.duration)
             .flatten();
-        let clock = Clock::new(show.playback.autoplay, loop_len);
+        let clock = Clock::new(loop_len);
+        let autoplay_pending = show.playback.autoplay;
         let mut draw_order: Vec<usize> = (0..show.layers.len()).collect();
         draw_order.sort_by(|&a, &b| {
             show.layers[a]
@@ -85,6 +122,9 @@ impl App {
         App {
             show,
             clock,
+            autoplay_pending,
+            quit_guard: QuitGuard::default(),
+            fatal: None,
             gpu: None,
             contents: Vec::new(),
             windows: Vec::new(),
@@ -95,6 +135,19 @@ impl App {
                 since: Instant::now(),
             },
         }
+    }
+
+    /// The error that stopped the engine, if any (see [`App::fatal`]).
+    pub fn take_fatal(&mut self) -> Option<anyhow::Error> {
+        self.fatal.take()
+    }
+
+    /// Stop the engine because of `err`: log it, remember it for the exit
+    /// code, and end the event loop.
+    fn fail(&mut self, event_loop: &ActiveEventLoop, err: anyhow::Error) {
+        tracing::error!("{err:#}");
+        self.fatal.get_or_insert(err);
+        event_loop.exit();
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
@@ -118,12 +171,35 @@ impl App {
         let mut created: Vec<Arc<Window>> = Vec::with_capacity(self.show.outputs.len());
         for output in &self.show.outputs {
             let attrs = window_attributes(output, event_loop);
-            created.push(Arc::new(event_loop.create_window(attrs)?));
+            let window = event_loop.create_window(attrs)?;
+            if output.window.fullscreen {
+                // Never show a mouse pointer on an audience-facing output.
+                // Windowed outputs (previews, setup) keep it for the operator.
+                window.set_cursor_visible(false);
+            }
+            created.push(Arc::new(window));
         }
 
         // 2. Bring up the GPU on the first window, then load content once.
         let (gpu, first_surface) = Gpu::new(created[0].clone())?;
         tracing::info!("GPU: {}", gpu.adapter_info());
+
+        // A surface or slice larger than the GPU's texture limit can't be
+        // configured. Refuse to start with a clear message instead of
+        // failing validation inside the frame loop.
+        let max = gpu.max_texture_dimension();
+        for (window, output) in created.iter().zip(&self.show.outputs) {
+            let size = window.inner_size();
+            if size.width > max || size.height > max {
+                anyhow::bail!(
+                    "output '{}': window is {}x{}, larger than this GPU's limit of {max}px per \
+                     side; set a smaller window.size (or use fullscreen on a real display)",
+                    output.id,
+                    size.width,
+                    size.height
+                );
+            }
+        }
         self.gpu = Some(gpu);
         self.build_contents();
 
@@ -209,7 +285,19 @@ impl App {
         let presented = frame.presented();
         let errors = frame.present();
         if presented > 0 {
-            self.stats.tick(now);
+            if self.autoplay_pending {
+                // The first frame (show time 0) is on screen: start the show
+                // now, and measure fps from here rather than from load.
+                self.autoplay_pending = false;
+                self.clock.play();
+                self.stats = FrameStats {
+                    frames: 0,
+                    since: Instant::now(),
+                };
+                tracing::info!("first frame presented; playback started");
+            } else {
+                self.stats.tick(now);
+            }
         }
 
         for (idx, err) in errors {
@@ -220,6 +308,8 @@ impl App {
                     gpu.resize_output(&mut rw.gpu, size.width, size.height);
                 }
                 wgpu::SurfaceError::OutOfMemory => {
+                    self.fatal
+                        .get_or_insert_with(|| anyhow::anyhow!("GPU out of memory"));
                     tracing::error!("GPU out of memory; exiting");
                     event_loop.exit();
                 }
@@ -228,6 +318,13 @@ impl App {
                 wgpu::SurfaceError::Timeout => tracing::debug!(output = idx, "surface timeout"),
                 e => tracing::warn!("surface error: {e:?}"),
             }
+        }
+
+        if let Some(reason) = self.gpu.as_ref().and_then(Gpu::device_lost) {
+            // A lost device (driver reset, GPU removed) can't render again.
+            // Exit non-zero so a supervisor restarts the engine. (Rebuilding
+            // the GPU state in-process is future work.)
+            self.fail(event_loop, anyhow::anyhow!("GPU device lost: {reason}"));
         }
         presented
     }
@@ -287,8 +384,7 @@ impl ApplicationHandler for App {
             return; // already initialized
         }
         if let Err(e) = self.initialize(event_loop) {
-            tracing::error!("initialization failed: {e:#}");
-            event_loop.exit();
+            self.fail(event_loop, e.context("initialization failed"));
         }
     }
 
@@ -302,20 +398,35 @@ impl ApplicationHandler for App {
             return;
         };
 
+        let locked = self.show.playback.locked;
         match event {
+            WindowEvent::CloseRequested if locked => {
+                tracing::warn!("window close ignored: the show is locked (stop it with Ctrl+C)");
+            }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.gpu.as_ref() {
                     gpu.resize_output(&mut self.windows[idx].gpu, size.width, size.height);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            // Locked show: the keyboard does nothing. Auto-repeat is ignored
+            // for every key, so a held or stuck key acts once, not ~30x/s
+            // (holding → used to jump a live show ~150 s per second).
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat && !locked =>
+            {
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    // Ignore auto-repeat: a held or sticky Space would
-                    // otherwise toggle play/pause many times a second.
-                    // (Arrow keys keep repeating, so holding one scrubs.)
-                    Key::Named(NamedKey::Space) if !event.repeat => self.clock.toggle(),
+                    Key::Named(NamedKey::Escape) => {
+                        if self.quit_guard.press(Instant::now()) {
+                            event_loop.exit();
+                        } else {
+                            tracing::warn!(
+                                "press Esc again within {:.1} s to quit",
+                                QUIT_CONFIRM_WINDOW.as_secs_f64()
+                            );
+                        }
+                    }
+                    Key::Named(NamedKey::Space) => self.clock.toggle(),
                     Key::Named(NamedKey::ArrowRight) => self.clock.seek_by(5.0),
                     Key::Named(NamedKey::ArrowLeft) => self.clock.seek_by(-5.0),
                     Key::Named(NamedKey::ArrowUp) => self.clock.seek_by(30.0),
@@ -355,6 +466,21 @@ mod tests {
                  "outputs": [ {{ "id": "o", "canvas_rect": {{ "x": 0, "y": 0, "w": 1080, "h": 1920 }} {extra} }} ] }}"#
         );
         Show::from_json(&json).unwrap().outputs.remove(0)
+    }
+
+    #[test]
+    fn quit_needs_two_presses_close_together() {
+        let t0 = Instant::now();
+        let mut g = QuitGuard::default();
+        assert!(!g.press(t0), "a single press must not quit");
+        assert!(g.press(t0 + Duration::from_millis(500)));
+
+        let mut g = QuitGuard::default();
+        assert!(!g.press(t0));
+        // Too late: this press re-arms instead of quitting...
+        assert!(!g.press(t0 + Duration::from_secs(3)));
+        // ...and a quick follow-up then confirms.
+        assert!(g.press(t0 + Duration::from_millis(3500)));
     }
 
     #[test]

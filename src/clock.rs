@@ -18,10 +18,13 @@ pub struct Clock {
 }
 
 impl Clock {
-    pub fn new(autoplay: bool, loop_len: Option<f64>) -> Self {
+    /// A clock at show time 0, **paused**. Autoplay is the caller's job: the
+    /// engine calls [`Clock::play`] only once the first frame is on screen, so
+    /// loading time never eats into the start of the show.
+    pub fn new(loop_len: Option<f64>) -> Self {
         Clock {
             base: 0.0,
-            running_since: autoplay.then(Instant::now),
+            running_since: None,
             loop_len: loop_len.filter(|&d| d > 0.0),
         }
     }
@@ -84,7 +87,7 @@ mod tests {
 
     #[test]
     fn paused_clock_does_not_advance() {
-        let mut c = Clock::new(false, None);
+        let mut c = Clock::new(None);
         assert_eq!(c.now(), 0.0);
         c.seek_to(10.0);
         assert!((c.now() - 10.0).abs() < 1e-6);
@@ -93,18 +96,29 @@ mod tests {
 
     #[test]
     fn looping_wraps() {
-        let mut c = Clock::new(false, Some(5.0));
+        let mut c = Clock::new(Some(5.0));
         c.seek_to(7.5);
         assert!((c.now() - 2.5).abs() < 1e-6);
     }
 
     #[test]
     fn toggle_flips_state() {
-        let mut c = Clock::new(false, None);
+        let mut c = Clock::new(None);
         assert!(!c.is_playing());
         c.toggle();
         assert!(c.is_playing());
         c.toggle();
         assert!(!c.is_playing());
+    }
+
+    #[test]
+    fn new_clock_is_paused_at_zero_until_played() {
+        // Time spent loading must not count as show time.
+        let mut c = Clock::new(None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(c.now(), 0.0);
+        c.play();
+        assert!(c.is_playing());
+        assert!(c.now() < 0.02, "clock counted load time: {}", c.now());
     }
 }

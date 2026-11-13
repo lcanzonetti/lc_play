@@ -47,5 +47,11 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = App::new(show);
     event_loop.run_app(&mut app)?;
-    Ok(())
+    // A failure that ended the event loop (init error, lost GPU, out of
+    // memory) must reach the exit code: a launch script or service manager
+    // has to see that the outputs went dark, not a clean exit.
+    match app.take_fatal() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
