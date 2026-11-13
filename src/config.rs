@@ -24,6 +24,9 @@ pub struct Config {
     /// `max-age` for `/stream` responses. `0` (default) lets caches store
     /// files but makes them revalidate (cheap `304`s) before every reuse.
     pub cache_max_age: u64,
+    /// File that must exist in `media_dir` for a scan to count. Unset = no
+    /// check. Recommended on network storage (detects an unmounted share).
+    pub root_marker: Option<String>,
 }
 
 impl Config {
@@ -52,7 +55,8 @@ impl Config {
         let default_transcodes = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let max_transcodes = match parse_env::<usize>("LCMS_MAX_TRANSCODES", 0) {
+        // Pass the real default so an invalid value's warning names it.
+        let max_transcodes = match parse_env("LCMS_MAX_TRANSCODES", default_transcodes) {
             0 => default_transcodes,
             n => n,
         };
@@ -68,6 +72,11 @@ impl Config {
 
         let cache_max_age = parse_env("LCMS_CACHE_MAX_AGE_SECS", 0);
 
+        let root_marker = std::env::var("LCMS_ROOT_MARKER")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+
         Config {
             bind,
             media_dir,
@@ -76,6 +85,7 @@ impl Config {
             max_transcodes,
             cors,
             cache_max_age,
+            root_marker,
         }
     }
 }

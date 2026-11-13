@@ -103,6 +103,11 @@ struct Validators {
     etag: Option<String>,
     /// Modification time, truncated to whole seconds as HTTP dates are.
     last_modified: Option<SystemTime>,
+    /// Whether `last_modified` is a *strong* validator (RFC 9110 §8.8.2.2):
+    /// the file was last changed at least a second ago, so two versions can't
+    /// share the same one-second timestamp. Only then may a date `If-Range`
+    /// match.
+    date_is_strong: bool,
     cache_control: String,
 }
 
@@ -113,6 +118,8 @@ impl Validators {
             etag: since_epoch.map(|d| format!("\"{size:x}-{:x}\"", d.as_nanos())),
             last_modified: since_epoch
                 .map(|d| UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())),
+            date_is_strong: modified
+                .is_some_and(|m| m + std::time::Duration::from_secs(1) <= SystemTime::now()),
             cache_control: format!("public, max-age={max_age}, must-revalidate"),
         }
     }
@@ -156,7 +163,8 @@ impl Validators {
     }
 
     /// `true` if a `Range` may be honoured: there is no `If-Range`, or it
-    /// still matches this version (strong ETag, or exact `Last-Modified`).
+    /// still matches this version (strong ETag, or exact `Last-Modified` when
+    /// that date is a strong validator).
     fn if_range_holds(&self, req: &HeaderMap) -> bool {
         let Some(v) = req.get(header::IF_RANGE) else {
             return true;
@@ -168,7 +176,7 @@ impl Validators {
             return self.etag.as_deref() == Some(v);
         }
         match (httpdate::parse_http_date(v), self.last_modified) {
-            (Ok(date), Some(lm)) => date == lm,
+            (Ok(date), Some(lm)) => self.date_is_strong && date == lm,
             _ => false,
         }
     }
@@ -288,6 +296,18 @@ mod tests {
         assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, &format!("W/{etag}"))])));
         let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
         assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &lm)])));
+    }
+
+    #[test]
+    fn date_if_range_needs_a_strong_date() {
+        // Modified "now": another change could land within the same second,
+        // so a date can't prove the client's bytes are from this version.
+        let v = Validators::new(1000, Some(SystemTime::now()), 0);
+        let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
+        assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, &lm)])));
+        // The ETag (which has nanoseconds) still works.
+        let etag = v.etag.clone().unwrap();
+        assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &etag)])));
     }
 
     #[test]

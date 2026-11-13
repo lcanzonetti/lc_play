@@ -69,15 +69,31 @@ struct Index {
 
 pub struct Library {
     root: PathBuf,
+    /// Optional file name that must exist directly in `root` for a scan to
+    /// count (see `LCMS_ROOT_MARKER`). Distinguishes the real share from the
+    /// empty mount-point directory left behind when it unmounts.
+    marker: Option<String>,
     index: RwLock<Index>,
 }
 
 impl Library {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, marker: Option<String>) -> Self {
         Library {
             root,
+            marker,
             index: RwLock::new(Index::default()),
         }
+    }
+
+    /// Record why this scan was rejected and keep serving the previous index.
+    /// `public` goes to the health endpoints, so it must not contain paths.
+    fn keep_previous(&self, public: String) {
+        tracing::error!(
+            root = %self.root.display(),
+            "{public}; keeping the previous index ({} items)",
+            self.len()
+        );
+        self.index.write().unwrap().scan_error = Some(public);
     }
 
     /// Number of items currently indexed.
@@ -113,23 +129,32 @@ impl Library {
     /// Blocking filesystem work is done before taking the write lock so readers
     /// are only ever blocked for the duration of a `HashMap` move.
     ///
-    /// If the root itself cannot be read (unmounted NFS share, renamed or
-    /// missing folder) the previous index is **kept** and the failure is
-    /// recorded, so a storage hiccup does not empty the catalogue; readiness
-    /// (`/readyz`) reports it. Errors below the root (an unreadable
-    /// subfolder, a broken symlink) are logged and skipped: they are usually
-    /// permanent, and refusing to ever update would be worse.
+    /// The previous index is **kept**, the failure recorded and readiness
+    /// (`/readyz`) set to 503, when:
+    ///   * the root can't be read (missing, renamed, permission denied);
+    ///   * the configured marker file is missing from the root — the reliable
+    ///     way to detect an unmounted share, whose mount point usually stays
+    ///     behind as an empty but readable directory;
+    ///   * the scan finds nothing although the current index is non-empty.
+    ///     Without a marker this is how an unmounted share looks. It stays
+    ///     degraded until media reappears; if you emptied the library on
+    ///     purpose, restart the server (the first scan accepts an empty root).
+    ///
+    /// Errors below the root (an unreadable subfolder, a broken symlink) are
+    /// logged and skipped: they are usually permanent, and refusing to ever
+    /// update would be worse.
     pub fn rescan(&self) {
         if let Err(e) = std::fs::read_dir(&self.root) {
-            // The path goes to the log only: `scan_error` is shown by the
-            // public health endpoints, which must not leak absolute paths.
-            tracing::error!(
-                root = %self.root.display(),
-                "cannot read media root: {e}; keeping the previous index ({} items)",
-                self.len()
-            );
-            self.index.write().unwrap().scan_error = Some(format!("cannot read media root: {e}"));
+            self.keep_previous(format!("cannot read media root: {e}"));
             return;
+        }
+        if let Some(marker) = &self.marker {
+            if !self.root.join(marker).exists() {
+                self.keep_previous(format!(
+                    "marker file '{marker}' is missing from the media root (storage not mounted?)"
+                ));
+                return;
+            }
         }
 
         let mut by_id = HashMap::new();
@@ -141,12 +166,10 @@ impl Library {
                 Err(e) => {
                     if e.depth() == 0 {
                         // The root vanished between the check above and now.
-                        tracing::error!("cannot walk media root: {e}; keeping the previous index");
-                        let reason = match e.io_error() {
+                        self.keep_previous(match e.io_error() {
                             Some(io) => format!("cannot walk media root: {io}"),
                             None => "cannot walk media root".to_string(),
-                        };
-                        self.index.write().unwrap().scan_error = Some(reason);
+                        });
                         return;
                     }
                     if skipped == 0 {
@@ -192,6 +215,13 @@ impl Library {
         }
 
         let count = by_id.len();
+        let previous = self.len();
+        if count == 0 && previous > 0 {
+            self.keep_previous(format!(
+                "media root is now empty (previously {previous} items); storage not mounted?"
+            ));
+            return;
+        }
         {
             let mut idx = self.index.write().unwrap();
             idx.by_id = by_id;
@@ -250,7 +280,10 @@ pub async fn spawn_rescan(library: std::sync::Arc<Library>, interval: Duration) 
 
 /// Convenience constructor used by `main`.
 pub fn from_config(config: &Config) -> std::sync::Arc<Library> {
-    std::sync::Arc::new(Library::new(config.media_dir.clone()))
+    std::sync::Arc::new(Library::new(
+        config.media_dir.clone(),
+        config.root_marker.clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -286,7 +319,7 @@ mod tests {
     fn unreadable_root_keeps_the_previous_index() {
         let root = temp_dir("root");
         std::fs::write(root.join("a.mp4"), b"x").unwrap();
-        let lib = Library::new(root.clone());
+        let lib = Library::new(root.clone(), None);
         lib.rescan();
         assert_eq!(lib.len(), 1);
         assert!(lib.scan_error().is_none());
@@ -302,6 +335,54 @@ mod tests {
         std::fs::rename(&moved, &root).unwrap();
         lib.rescan();
         assert_eq!(lib.len(), 1);
+        assert!(lib.scan_error().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn root_that_turns_empty_keeps_the_previous_index() {
+        // An unmounted share usually leaves an empty, readable mount point.
+        let root = temp_dir("empty");
+        std::fs::write(root.join("a.mp4"), b"x").unwrap();
+        let lib = Library::new(root.clone(), None);
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+
+        std::fs::remove_file(root.join("a.mp4")).unwrap();
+        lib.rescan();
+        assert_eq!(lib.len(), 1, "an empty root must not empty the index");
+        assert!(lib.scan_error().unwrap().contains("empty"));
+
+        std::fs::write(root.join("b.mp4"), b"x").unwrap();
+        lib.rescan();
+        assert_eq!(lib.list()[0].name, "b.mp4");
+        assert!(lib.scan_error().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_marker_keeps_the_previous_index() {
+        let root = temp_dir("marker");
+        std::fs::write(root.join(".lcms-root"), b"").unwrap();
+        std::fs::write(root.join("a.mp4"), b"x").unwrap();
+        let lib = Library::new(root.clone(), Some(".lcms-root".into()));
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+        assert!(lib.scan_error().is_none());
+
+        std::fs::remove_file(root.join(".lcms-root")).unwrap();
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+        assert!(lib.scan_error().unwrap().contains("marker"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn first_scan_accepts_an_empty_root() {
+        let root = temp_dir("first");
+        let lib = Library::new(root.clone(), None);
+        lib.rescan();
+        assert_eq!(lib.len(), 0);
         assert!(lib.scan_error().is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }

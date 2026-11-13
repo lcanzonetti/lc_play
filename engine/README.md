@@ -165,7 +165,7 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 |--------|--------|-------|
 | `color` | ✅ Phase 1 | `{ "rgba": [r,g,b,a] }`, linear 0..1 |
 | `image` | ✅ Phase 1 | `{ "path": "..." }` (PNG/JPEG/BMP/GIF/WebP) |
-| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder and logs an error, with or without `--features video` (that feature only links ffmpeg/libav, so it also needs their dev libraries to build). |
+| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder (logs a warning without `--features video`, an error with it) (that feature only links ffmpeg/libav, so it also needs their dev libraries to build). |
 | `live`  | ⏳ Phase 3 | `{ "kind": "..." }` (capture/NDI). Placeholder otherwise. |
 
 ### Projection mapping
@@ -183,7 +183,10 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
   1024px output → `0.125`), mirrored on the neighbor. The ramp is
   complementary, so the two projectors' light sums to exactly 100% across the
   overlap. `gamma` is the projector's gamma (default `2.2` = no correction);
-  nudge it if the seam reads slightly bright or dark.
+  nudge it if the seam reads slightly bright or dark. Blend edges are in
+  canvas-slice space, *before* `rotation_degrees`: on a 90° output, `left`
+  is the slice's left edge, which lands at the display's top. (Warp corners,
+  by contrast, are in display space.)
 
 ## Development
 

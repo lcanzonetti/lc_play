@@ -67,6 +67,7 @@ invalid `LCMS_BIND`, which stops the server at startup.
 | `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
 | `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
+| `LCMS_ROOT_MARKER`       | *(unset)*      | File name that must exist directly in the media root (e.g. `.lcms-root`). If it's missing, the scan is rejected and the node reports degraded. Recommended on network storage: an unmounted share usually leaves an empty, readable mount point. |
 | `LCMS_CACHE_MAX_AGE_SECS`| `0`            | `Cache-Control: max-age` on `/stream`. `0` = caches may store files but revalidate (cheap `304`) before each reuse. Raise it only if files are never replaced in place. |
 | `RUST_LOG`               | `info,tower_http=warn` | Log level (`tracing` env filter syntax).                   |
 
@@ -122,6 +123,9 @@ The image bundles `ffmpeg`, so transcoding works out of the box.
 ```bash
 docker build -t lcmediaserver .
 docker run --rm -p 8080:8080 -v /path/to/media:/media:ro lcmediaserver
+# with a marker file, so an unmounted share is detected:
+touch /path/to/media/.lcms-root
+docker run --rm -p 8080:8080 -e LCMS_ROOT_MARKER=.lcms-root -v /path/to/media:/media:ro lcmediaserver
 ```
 
 ## Scaling out
@@ -153,16 +157,19 @@ more replicas that mount the same media directory:
 - Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
   the only CPU-heavy path.
 - Use `GET /readyz` as the load-balancer health check: it returns `503` while
-  the media root is unreachable. The node keeps its last good index meanwhile,
-  so a storage blip never empties the catalogue. Use `GET /healthz` for
+  the media root is unreachable, turns empty after having media, or (with
+  `LCMS_ROOT_MARKER`) lacks the marker file. The node keeps its last good
+  index meanwhile. Without a marker, a node that *starts* while the share is
+  unmounted can't tell, and reports ready with 0 items; set the marker on
+  network storage. If you empty a library on purpose, restart the node. Use `GET /healthz` for
   liveness (it stays `200`), so an orchestrator doesn't restart nodes over a
   storage outage a restart can't fix.
 
 ## Development
 
 ```bash
-cargo test           # unit tests (range parsing, cache validators, scanning, transcode args)
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace     # server + engine unit tests (plain `cargo test` runs only the server)
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
 ```
 
