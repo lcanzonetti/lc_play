@@ -9,7 +9,7 @@ streaming / Plex-style media server.
   work, and judge findings by it. Browser compatibility, HTTP caching, CDN or
   load-balancer concerns are out of scope here.
 - The old HTTP streaming server that used to live at this repository's root
-  was moved to its own repository (`lcstream`) on 2026-11-13. Older commits
+  was moved to its own repository (`lcanzonetti/lcserver`) on 2026-11-13. Older commits
   that mention `/stream`, `/transcode`, `LCMS_*`, Docker or a web player are
   about that server.
 - Priorities: show reliability (nothing a bad file or an operator does may

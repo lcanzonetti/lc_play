@@ -39,7 +39,7 @@ without dropping out.
 > **History:** until 2026-11-13 this repository also contained an HTTP
 > streaming/transcoding server (the *IT* kind of media server) at its root,
 > with this engine in `engine/`. That server was split into its own
-> repository, **`lcstream`**, with its history. If old commits, issues or
+> repository, **[`lcanzonetti/lcserver`](https://github.com/lcanzonetti/lcserver)**, with its history. If old commits, issues or
 > sessions mention `/stream`, `/transcode`, `LCMS_*` variables, Docker or a
 > web player, they refer to that server, not to this product.
 
