@@ -99,7 +99,8 @@ are ignored, so the templates document themselves with `"_note"` fields.
 6. **Portrait display:** if the OS already rotates it, just use a portrait
    `canvas_rect` and window size. If the panel is physically rotated but the
    OS isn't, keep the landscape window, use a portrait `canvas_rect`, and set
-   `rotation_degrees` to 90 or 270.
+   `rotation_degrees` to 90 or 270. If you omit `window.size`, the window
+   already defaults to the rotated (landscape) size.
 
 Load errors name the problem (`output 'B': canvas_rect must have positive w
 and h`, `warp corners must form a convex quad…`), and nothing is drawn until
@@ -165,7 +166,7 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 |--------|--------|-------|
 | `color` | ✅ Phase 1 | `{ "rgba": [r,g,b,a] }`, linear 0..1 |
 | `image` | ✅ Phase 1 | `{ "path": "..." }` (PNG/JPEG/BMP/GIF/WebP) |
-| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder (logs a warning without `--features video`, an error with it) (that feature only links ffmpeg/libav, so it also needs their dev libraries to build). |
+| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder. Without `--features video` it logs a warning; with it, an error. The feature only links ffmpeg/libav, so building with it also needs their dev libraries. |
 | `live`  | ⏳ Phase 3 | `{ "kind": "..." }` (capture/NDI). Placeholder otherwise. |
 
 ### Projection mapping

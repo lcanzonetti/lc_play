@@ -233,16 +233,31 @@ impl App {
     }
 }
 
+/// Window size used when `window.size` is omitted: the `canvas_rect` size,
+/// with width and height swapped for a 90/270° output.
+fn default_window_size(output: &crate::show::Output) -> [u32; 2] {
+    let w = output.canvas_rect.w.max(1.0) as u32;
+    let h = output.canvas_rect.h.max(1.0) as u32;
+    if matches!(output.rotation_degrees, 90 | 270) {
+        [h, w]
+    } else {
+        [w, h]
+    }
+}
+
 /// Build the winit window attributes for one output.
 fn window_attributes(
     output: &crate::show::Output,
     event_loop: &ActiveEventLoop,
 ) -> winit::window::WindowAttributes {
-    // Window geometry: explicit window size, else the canvas-rect size.
-    let size = output.window.size.unwrap_or([
-        output.canvas_rect.w.max(1.0) as u32,
-        output.canvas_rect.h.max(1.0) as u32,
-    ]);
+    // Window geometry: explicit window size, else the canvas-rect size —
+    // turned by `rotation_degrees`, since the window is the *display* and a
+    // 90/270 rotation lays a portrait slice across a landscape display.
+    // Without the swap the slice would be squeezed into a portrait window.
+    let size = output
+        .window
+        .size
+        .unwrap_or_else(|| default_window_size(output));
     let mut attrs = Window::default_attributes()
         .with_title(format!("lcme · {}", output.id))
         .with_inner_size(PhysicalSize::new(size[0], size[1]));
@@ -327,5 +342,37 @@ impl ApplicationHandler for App {
                 Instant::now() + Duration::from_millis(50),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(extra: &str) -> crate::show::Output {
+        let json = format!(
+            r#"{{ "canvas": {{ "width": 1080, "height": 1920 }},
+                 "outputs": [ {{ "id": "o", "canvas_rect": {{ "x": 0, "y": 0, "w": 1080, "h": 1920 }} {extra} }} ] }}"#
+        );
+        Show::from_json(&json).unwrap().outputs.remove(0)
+    }
+
+    #[test]
+    fn default_window_follows_the_display_orientation() {
+        // Portrait slice on an unrotated output: portrait window.
+        assert_eq!(default_window_size(&output("")), [1080, 1920]);
+        // Same slice on a physically rotated landscape panel: landscape window.
+        assert_eq!(
+            default_window_size(&output(r#", "rotation_degrees": 90"#)),
+            [1920, 1080]
+        );
+        assert_eq!(
+            default_window_size(&output(r#", "rotation_degrees": 270"#)),
+            [1920, 1080]
+        );
+        assert_eq!(
+            default_window_size(&output(r#", "rotation_degrees": 180"#)),
+            [1080, 1920]
+        );
     }
 }

@@ -107,8 +107,10 @@ pub struct Gpu {
     /// on write; otherwise the warp shader must encode it itself, or the
     /// picture and the blend ramps come out too dark. Done in the shader, not
     /// through an sRGB view of the surface: surface view formats need
-    /// `DownlevelFlags::SURFACE_VIEW_FORMATS`, which GL/Metal/DX12 and many
-    /// Vulkan drivers lack, and `configure` would then fail with a panic.
+    /// `DownlevelFlags::SURFACE_VIEW_FORMATS`, which the GL backend and Vulkan
+    /// drivers without `VK_KHR_swapchain_mutable_format` lack (Metal and DX12
+    /// have it), and `configure` would then fail with a panic. The shader
+    /// path works on every backend.
     encode_srgb: bool,
 
     scene_pipeline: wgpu::RenderPipeline,

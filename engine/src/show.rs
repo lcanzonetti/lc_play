@@ -61,7 +61,8 @@ pub struct WindowPlacement {
     /// Top-left position in desktop pixels (windowed mode).
     #[serde(default)]
     pub position: Option<[i32; 2]>,
-    /// Window size in pixels. Defaults to the canvas_rect size when omitted.
+    /// Window size in pixels. Defaults to the canvas_rect size when omitted,
+    /// with width and height swapped when `rotation_degrees` is 90 or 270.
     #[serde(default)]
     pub size: Option<[u32; 2]>,
 }
