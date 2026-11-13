@@ -86,6 +86,14 @@ function fmtSize(n) {
   return n + " B";
 }
 
+// Element whose content is set as plain text (safe for untrusted strings).
+function textEl(tag, className, text) {
+  const el = document.createElement(tag);
+  el.className = className;
+  el.textContent = text;
+  return el;
+}
+
 async function load() {
   const res = await fetch("/api/library");
   const data = await res.json();
@@ -101,8 +109,12 @@ async function load() {
     const el = document.createElement("div");
     el.className = "item";
     el.dataset.id = it.id;
-    el.innerHTML = `<div class="name">${it.name}</div>
-      <div class="meta">${it.kind} · ${fmtSize(it.size)}</div>`;
+    // Build with textContent, never innerHTML: file names come from the
+    // filesystem and may contain markup (stored XSS otherwise).
+    el.append(
+      textEl("div", "name", it.name),
+      textEl("div", "meta", `${it.kind} · ${fmtSize(it.size)}`),
+    );
     el.onclick = () => play(it.id);
     list.appendChild(el);
   }
@@ -124,10 +136,13 @@ function play(id) {
   document.querySelectorAll(".item").forEach((e) =>
     e.classList.toggle("active", e.dataset.id === id));
   const { url, type } = srcFor(it);
-  const tag = it.kind === "audio" ? "audio" : "video";
-  $("#player").innerHTML =
-    `<${tag} controls autoplay src="${url}"></${tag}>
-     <p class="meta" style="color:var(--muted);margin-top:12px">${it.path}</p>`;
+  const media = document.createElement(it.kind === "audio" ? "audio" : "video");
+  media.controls = true;
+  media.autoplay = true;
+  media.src = url; // property assignment: no HTML parsing of the URL
+  const path = textEl("p", "meta", it.path);
+  path.style.cssText = "color:var(--muted);margin-top:12px";
+  $("#player").replaceChildren(media, path);
 }
 
 $("#mode").onchange = () => currentId && play(currentId);
