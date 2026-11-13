@@ -139,13 +139,15 @@ impl Gpu {
         Ok((gpu, surface))
     }
 
-    /// A device with no window, for offscreen rendering tests. `None` when the
-    /// machine has no usable adapter (e.g. CI without a software rasterizer).
+    /// A device with no window, for offscreen rendering tests. Errors when the
+    /// machine has no usable adapter (e.g. CI without a software rasterizer)
+    /// or when the device request fails; the error says which.
     #[cfg(test)]
-    pub fn headless() -> Option<Self> {
+    pub fn headless() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-        Self::with_adapter(instance, adapter, SCENE_FORMAT).ok()
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .ok_or_else(|| anyhow::anyhow!("no GPU adapter found"))?;
+        Self::with_adapter(instance, adapter, SCENE_FORMAT)
     }
 
     /// Create the device and build every pipeline for a given output format.
@@ -680,9 +682,12 @@ impl PendingFrame {
 
 /// Build one output's warp mesh.
 ///
-/// Each grid point `(u, v)` is pushed through the corner-pin homography, then
-/// the display rotation and the normalized→NDC mapping. Those last two are
-/// affine, so the whole chain is a single 3×3 matrix and the result stays
+/// Each grid point `(u, v)` (slice space) is pushed through the display
+/// rotation, then the corner-pin homography, then the normalized→NDC mapping.
+/// Rotating *before* the pin means `warp.corners` are in display space: the
+/// TL corner is always the top-left of the physical display, whatever the
+/// rotation. The blend still uses the un-rotated slice UVs. Rotation and the
+/// NDC map are affine, so the whole chain is a single 3×3 matrix and the result stays
 /// homogeneous: we emit `(x, y, 0, w)` and let the GPU divide, which makes the
 /// interpolated slice UVs perspective-correct.
 fn warp_mesh(output: &Output) -> (Vec<WarpVertex>, Vec<u32>) {
@@ -696,7 +701,7 @@ fn warp_mesh(output: &Output) -> (Vec<WarpVertex>, Vec<u32>) {
         Vec3::new(0.0, -2.0, 0.0),
         Vec3::new(-1.0, 1.0, 1.0),
     );
-    let m = to_ndc * rotate * output.warp.homography();
+    let m = to_ndc * output.warp.homography() * rotate;
 
     let n = WARP_GRID;
     let mut verts = Vec::with_capacity(((n + 1) * (n + 1)) as usize);
@@ -789,20 +794,64 @@ mod tests {
         assert!(ndc(&verts[0]).distance(Vec2::new(1.0, 1.0)) < 1e-5);
     }
 
+    #[test]
+    fn warp_corners_are_in_display_space_when_rotated() {
+        // Pull the display's top-left corner 10% to the right. On a rotated
+        // output the pin must still move the display's TL, not whichever
+        // corner the slice's TL lands on after rotation.
+        let pin = r#", "warp": { "corners": [[0.1,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0]] }"#;
+        let n = WARP_GRID as usize;
+        let last = (n + 1) * (n + 1) - 1;
+        // display TL in NDC after the pin: x = 2*0.1 - 1
+        let display_tl = Vec2::new(-0.8, 1.0);
+        for (deg, slice_corner) in [(0, 0), (90, n * (n + 1)), (180, last), (270, n)] {
+            let (verts, _) = warp_mesh(&output(&format!(r#", "rotation_degrees": {deg}{pin}"#)));
+            let p = ndc(&verts[slice_corner]);
+            assert!(
+                p.distance(display_tl) < 1e-4,
+                "rotation {deg}: display TL at {p:?}, expected {display_tl:?}"
+            );
+            // Every display corner other than TL stays put.
+            let others = [
+                Vec2::new(1.0, 1.0),
+                Vec2::new(1.0, -1.0),
+                Vec2::new(-1.0, -1.0),
+            ];
+            for c in [0, n, last, n * (n + 1)] {
+                let q = ndc(&verts[c]);
+                assert!(
+                    q.distance(display_tl) < 1e-4 || others.iter().any(|o| q.distance(*o) < 1e-4),
+                    "rotation {deg}: slice corner {c} landed at {q:?}"
+                );
+            }
+        }
+    }
+
     // ---- offscreen GPU tests -------------------------------------------------
     //
     // These run the real pipelines and shaders through `encode_output` and read
     // the pixels back. They need a GPU adapter; a software one (Mesa lavapipe)
-    // is enough. Without any adapter they skip rather than fail.
+    // is enough. Without one they skip on a dev machine, but fail when `CI` or
+    // `LCME_REQUIRE_GPU` is set, so a broken CI driver can't turn them into
+    // silent passes.
 
     use crate::content::{self, srgb_to_linear, TextureFactory};
 
     fn gpu_or_skip() -> Option<Gpu> {
-        let gpu = Gpu::headless();
-        if gpu.is_none() {
-            eprintln!("skipping GPU test: no adapter (install mesa-vulkan-drivers)");
+        let required = ["CI", "LCME_REQUIRE_GPU"]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty() && s != "0"));
+        match Gpu::headless() {
+            Ok(gpu) => {
+                eprintln!("GPU test adapter: {}", gpu.adapter_info());
+                Some(gpu)
+            }
+            Err(e) if required => panic!("GPU required (CI/LCME_REQUIRE_GPU set): {e:#}"),
+            Err(e) => {
+                eprintln!("skipping GPU test: {e:#} (install mesa-vulkan-drivers)");
+                None
+            }
         }
-        gpu
     }
 
     /// Render output `idx` of `show` at t=0 into a `w`×`h` offscreen target and

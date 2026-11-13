@@ -163,11 +163,13 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 
 ### Projection mapping
 
-- **Warp (corner-pin)**: move an output's four corners (normalized output
+- **Warp (corner-pin)**: move an output's four corners (normalized display
   space, TL/TR/BR/BL) to keystone the image onto an off-axis flat surface. The
   mapping is a true perspective transform (homography), so straight lines stay
   straight. Corners must form a convex quad (validated at load). Omit
-  `corners` for identity. Freeform mesh warp for curved surfaces is Phase 3.
+  `corners` for identity. Corners always refer to the physical display, after
+  `rotation_degrees` is applied: on a rotated output, TL is still the
+  display's top-left. Freeform mesh warp for curved surfaces is Phase 3.
 - **Edge blend**: projector images must physically overlap, and their
   `canvas_rect`s must overlap by the same amount. Set each output's blend on
   the shared edge to that overlap as a fraction of the output (e.g. 128px of a
@@ -186,8 +188,10 @@ Besides unit tests for the math, the suite renders real frames offscreen and
 checks pixels: blend overlaps sum to full light, translucent layers composite
 correctly, the corner-pin confines the image. These need a GPU adapter; on a
 headless Linux box install Mesa's software Vulkan driver
-(`apt install mesa-vulkan-drivers`). Without an adapter they skip. CI runs them
-on every push.
+(`apt install mesa-vulkan-drivers`). Without an adapter they skip on a dev
+machine, but fail when `CI` or `LCME_REQUIRE_GPU` is set (GitHub Actions sets
+`CI`), so they can't pass silently there. CI runs them on pushes to `main` and
+on pull requests.
 
 ## Roadmap
 
