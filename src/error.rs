@@ -13,6 +13,11 @@ pub enum AppError {
     BadRequest(String),
     /// Requested range cannot be satisfied.
     RangeNotSatisfiable { size: u64 },
+    /// Every transcode slot stayed busy for the whole wait; retry later.
+    Busy { retry_after_secs: u64 },
+    /// The request was valid but the source can't be processed as asked
+    /// (e.g. `copy=true` with codecs the container can't hold).
+    Unprocessable(String),
     /// An unexpected server-side failure.
     Internal(String),
 }
@@ -35,6 +40,19 @@ impl IntoResponse for AppError {
                 );
                 return resp;
             }
+            AppError::Busy { retry_after_secs } => {
+                let mut resp = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "all transcode slots are busy, retry later" })),
+                )
+                    .into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after_secs.to_string().parse().unwrap(),
+                );
+                return resp;
+            }
+            AppError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             AppError::Internal(m) => {
                 tracing::error!("internal error: {m}");
                 (

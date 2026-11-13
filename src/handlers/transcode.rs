@@ -4,26 +4,36 @@
 //! fragmented container that plays while it downloads, and writes to `pipe:1`,
 //! which we forward straight to the HTTP response. Nothing is buffered to disk.
 //!
-//! Scalability / safety properties:
-//!   * a [`Semaphore`] caps concurrent jobs (see [`AppState::transcode_slots`]);
-//!   * `kill_on_drop` + holding the child in the response stream means a client
-//!     disconnect tears down the `ffmpeg` process promptly (no zombies);
-//!   * input-side `-ss` seeking makes `?t=` cheap, so a client can jump ahead
-//!     without re-encoding everything before the seek point.
+//! Request flow, in order:
+//!   1. validate the query and build the `ffmpeg` arguments (bad input gets a
+//!      400 at once, without touching a slot);
+//!   2. answer `HEAD` with headers only — never spawn `ffmpeg` for it;
+//!   3. take a slot from a [`Semaphore`] (see [`AppState::transcode_slots`]),
+//!      waiting at most [`SLOT_WAIT`], else `503` + `Retry-After`;
+//!   4. spawn `ffmpeg` and wait for its **first output chunk** plus a short
+//!      grace window ([`STARTUP_GRACE`]) before sending the status line. If it
+//!      exits non-zero by then, the client gets a real error (422 for a failed
+//!      `copy=true` remux, else 500) instead of `200` with a stub body;
+//!   5. stream the rest. If `ffmpeg` exits non-zero mid-stream, the body ends
+//!      with an error so the client sees a truncated transfer, not a clean end.
+//!
+//! The child and the permit live inside the body stream: when the body is
+//! dropped (completion or client disconnect) `kill_on_drop` tears `ffmpeg`
+//! down and the slot is released. Input-side `-ss` makes `?t=` seeks cheap.
 
-use std::pin::Pin;
+use std::collections::VecDeque;
 use std::process::Stdio;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{header, Method};
 use axum::response::{IntoResponse, Response};
-use futures::Stream;
-use pin_project_lite::pin_project;
+use futures::StreamExt;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
@@ -54,29 +64,62 @@ pub struct TranscodeParams {
     copy: Option<bool>,
 }
 
-/// `GET /transcode/{id}` — transcode/remux and stream the result.
+/// How long a request waits for a free transcode slot before getting `503`.
+/// Long enough to cover a player switching quality (the old stream's slot is
+/// released a moment after it disconnects), short enough not to hang clients.
+const SLOT_WAIT: Duration = Duration::from_secs(5);
+
+/// After the first output chunk, how long to keep watching for an early
+/// `ffmpeg` failure before committing to a `200`. Adds at most this much to
+/// startup latency.
+const STARTUP_GRACE: Duration = Duration::from_millis(300);
+
+/// Stop the grace window early once this much output is buffered, so a fast
+/// remux can't pile up memory before the response starts.
+const STARTUP_BUFFER: usize = 1024 * 1024;
+
+/// Lines of `ffmpeg` stderr kept for the log when a transcode fails.
+const STDERR_TAIL: usize = 8;
+
+/// `GET`/`HEAD /transcode/{id}` — transcode/remux and stream the result.
 pub async fn transcode_media(
     State(state): State<AppState>,
+    method: Method,
     Path(id): Path<String>,
     Query(params): Query<TranscodeParams>,
 ) -> Result<Response, AppError> {
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
 
-    // Acquire a transcode slot. We hold this permit for the whole stream so the
-    // number of live `ffmpeg` processes never exceeds `max_transcodes`.
-    let permit = state
-        .transcode_slots
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| AppError::Internal("transcode semaphore closed".into()))?;
-
+    // Validate before anything else, so a bad request never waits for a slot.
     let format = params
         .format
         .as_deref()
         .unwrap_or("mp4")
         .to_ascii_lowercase();
     let (content_type, args) = build_ffmpeg_args(&format, &item.abs_path, &params)?;
+
+    if method == Method::HEAD {
+        // Crawlers and link previews send HEAD; don't burn a slot and an
+        // encoder on them. axum strips the (empty) body for HEAD anyway.
+        return Ok((response_headers(content_type), Body::empty()).into_response());
+    }
+
+    // Acquire a transcode slot. We hold this permit for the whole stream so the
+    // number of live `ffmpeg` processes never exceeds `max_transcodes`.
+    let permit = match tokio::time::timeout(
+        SLOT_WAIT,
+        state.transcode_slots.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(AppError::Internal("transcode semaphore closed".into())),
+        Err(_) => {
+            return Err(AppError::Busy {
+                retry_after_secs: SLOT_WAIT.as_secs(),
+            })
+        }
+    };
 
     let mut cmd = Command::new(&state.config.ffmpeg);
     cmd.args(&args)
@@ -98,36 +141,115 @@ pub async fn transcode_media(
         .ok_or_else(|| AppError::Internal("ffmpeg produced no stdout".into()))?;
 
     // Forward ffmpeg's diagnostics (`-loglevel error`, so only real problems)
-    // to our logs; otherwise a failed transcode is just a silent empty body.
-    if let Some(stderr) = child.stderr.take() {
+    // to our logs, and keep the last few lines for the failure message.
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
+    let stderr_task = child.stderr.take().map(|stderr| {
         let source = item.path.clone();
+        let tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::warn!(item = %source, "ffmpeg: {line}");
+                let mut tail = tail.lock().unwrap();
+                if tail.len() == STDERR_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
             }
-        });
-    }
+        })
+    });
 
     tracing::debug!(item = %item.path, %format, "transcode started");
 
-    let stream = TranscodeStream {
-        inner: ReaderStream::with_capacity(stdout, STREAM_CHUNK),
-        _child: child,
-        _permit: permit,
-    };
+    // Hold the status line until ffmpeg has produced something *and* has
+    // survived a short grace window. Some failures (e.g. `copy=true` into a
+    // container that can't hold the codecs) write a few hundred bytes of
+    // container header before exiting non-zero, so the first chunk alone
+    // proves nothing. If the client disconnects meanwhile, this future is
+    // dropped and so is the child (`kill_on_drop`). A slow source (or a far
+    // `-ss` seek) simply waits for its first chunk.
+    let mut out = ReaderStream::with_capacity(stdout, STREAM_CHUNK);
+    let mut prefix: VecDeque<Bytes> = VecDeque::new();
+    let mut buffered = 0usize;
+    let mut eof = false;
+    match out.next().await {
+        Some(Ok(chunk)) => {
+            buffered += chunk.len();
+            prefix.push_back(chunk);
+        }
+        Some(Err(e)) => return Err(AppError::Internal(format!("reading ffmpeg output: {e}"))),
+        None => eof = true,
+    }
+    if !eof {
+        let grace = tokio::time::sleep(STARTUP_GRACE);
+        tokio::pin!(grace);
+        // Keep draining stdout during the window so ffmpeg never blocks on a
+        // full pipe; stop early once STARTUP_BUFFER is held (fast remuxes).
+        while buffered < STARTUP_BUFFER {
+            tokio::select! {
+                _ = &mut grace => break,
+                next = out.next() => match next {
+                    Some(Ok(chunk)) => {
+                        buffered += chunk.len();
+                        prefix.push_back(chunk);
+                    }
+                    Some(Err(e)) => {
+                        return Err(AppError::Internal(format!("reading ffmpeg output: {e}")))
+                    }
+                    None => {
+                        eof = true;
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    if eof {
+        // ffmpeg already finished. A clean exit (tiny output) is served as
+        // is; a failure becomes a real error status instead of a 200.
+        let status = child.wait().await;
+        if !matches!(&status, Ok(s) if s.success()) {
+            if let Some(task) = stderr_task {
+                // stderr closes when ffmpeg exits; bounded just in case.
+                let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+            }
+            let tail: Vec<String> = stderr_tail.lock().unwrap().iter().cloned().collect();
+            let status = status.map_or_else(|e| e.to_string(), |s| s.to_string());
+            tracing::error!(item = %item.path, %format, %status, stderr = ?tail, "transcode failed at startup");
+            // ffmpeg's text includes absolute paths, so it stays in the log.
+            return Err(if params.copy.unwrap_or(false) {
+                AppError::Unprocessable(format!(
+                    "remux to {format} failed: the source codecs probably don't fit the \
+                     container; retry without copy=true"
+                ))
+            } else {
+                AppError::Internal(format!("ffmpeg failed ({status}): {}", tail.join(" | ")))
+            });
+        }
+    }
 
+    let body = TranscodeBody {
+        prefix,
+        out,
+        child,
+        _permit: permit,
+        source: item.path.clone(),
+    };
     Ok((
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            // Transcoded output has no known length and is not range-seekable;
-            // use `?t=` to seek instead.
-            (header::ACCEPT_RANGES, "none".to_string()),
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        Body::from_stream(stream),
+        response_headers(content_type),
+        Body::from_stream(body.into_stream()),
     )
         .into_response())
+}
+
+fn response_headers(content_type: &'static str) -> [(header::HeaderName, &'static str); 3] {
+    [
+        (header::CONTENT_TYPE, content_type),
+        // Transcoded output has no known length and is not range-seekable;
+        // use `?t=` to seek instead.
+        (header::ACCEPT_RANGES, "none"),
+        (header::CACHE_CONTROL, "no-store"),
+    ]
 }
 
 /// Build the `ffmpeg` argument vector and the response content type.
@@ -150,8 +272,13 @@ fn build_ffmpeg_args(
         }
     }
 
+    // `file:` forces ffmpeg's local-file protocol, so a name that looks like a
+    // URL or protocol spec (`http:…`, `concat:…`) is never interpreted as one.
     args.push("-i".into());
-    args.push(input.to_string_lossy().to_string());
+    args.push(format!("file:{}", input.to_string_lossy()));
+
+    // Clamp like crf/height: an absurd value would only make ffmpeg fail.
+    let abitrate = params.abitrate.unwrap_or(128).clamp(32, 512);
 
     let copy = params.copy.unwrap_or(false);
     let scale_filter = params
@@ -173,7 +300,7 @@ fn build_ffmpeg_args(
                     "-c:a".into(),
                     "aac".into(),
                     "-b:a".into(),
-                    format!("{}k", params.abitrate.unwrap_or(128)),
+                    format!("{abitrate}k"),
                 ]);
                 if let Some(f) = &scale_filter {
                     args.extend(["-vf".into(), f.clone()]);
@@ -206,7 +333,7 @@ fn build_ffmpeg_args(
                     "-c:a".into(),
                     "libopus".into(),
                     "-b:a".into(),
-                    format!("{}k", params.abitrate.unwrap_or(128)),
+                    format!("{abitrate}k"),
                 ]);
                 if let Some(f) = &scale_filter {
                     args.extend(["-vf".into(), f.clone()]);
@@ -227,24 +354,83 @@ fn build_ffmpeg_args(
     Ok((content_type, args))
 }
 
-pin_project! {
-    /// Wraps `ffmpeg`'s stdout and keeps the child process and the semaphore
-    /// permit alive for exactly as long as the response body is being read.
-    /// When the body is dropped (completion or client disconnect), the child is
-    /// dropped too — and with `kill_on_drop` set, killed — and the permit is
-    /// released back to the pool.
-    struct TranscodeStream {
-        #[pin]
-        inner: ReaderStream<tokio::process::ChildStdout>,
-        _child: Child,
-        _permit: OwnedSemaphorePermit,
+/// Response body state: `ffmpeg`'s stdout plus the child process and the
+/// semaphore permit, kept alive for exactly as long as the body is read. When
+/// the body is dropped (completion or client disconnect) the child is dropped
+/// too — and with `kill_on_drop` set, killed — and the permit is released.
+struct TranscodeBody {
+    /// Output read before the headers were sent.
+    prefix: VecDeque<Bytes>,
+    out: ReaderStream<ChildStdout>,
+    child: Child,
+    _permit: OwnedSemaphorePermit,
+    source: String,
+}
+
+impl TranscodeBody {
+    fn into_stream(self) -> impl futures::Stream<Item = std::io::Result<Bytes>> + Send {
+        futures::stream::unfold(Some(self), |state| async move {
+            let mut st = state?;
+            if let Some(chunk) = st.prefix.pop_front() {
+                return Some((Ok(chunk), Some(st)));
+            }
+            match st.out.next().await {
+                Some(Ok(chunk)) => Some((Ok(chunk), Some(st))),
+                Some(Err(e)) => Some((Err(e), None)),
+                // stdout closed: end cleanly only if ffmpeg succeeded, so a
+                // mid-stream failure reaches the client as a broken transfer.
+                None => match st.child.wait().await {
+                    Ok(status) if status.success() => None,
+                    Ok(status) => {
+                        tracing::error!(item = %st.source, %status, "transcode failed mid-stream");
+                        Some((
+                            Err(std::io::Error::other(format!(
+                                "ffmpeg exited with {status}"
+                            ))),
+                            None,
+                        ))
+                    }
+                    Err(e) => Some((Err(e), None)),
+                },
+            }
+        })
     }
 }
 
-impl Stream for TranscodeStream {
-    type Item = std::io::Result<Bytes>;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
+    fn params(query: &str) -> TranscodeParams {
+        serde_json::from_str(query).unwrap()
+    }
+
+    #[test]
+    fn input_is_forced_to_the_file_protocol() {
+        let (_, args) = build_ffmpeg_args(
+            "mp4",
+            std::path::Path::new("/m/concat:x.mp4"),
+            &params("{}"),
+        )
+        .unwrap();
+        let i = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[i + 1], "file:/m/concat:x.mp4");
+    }
+
+    #[test]
+    fn audio_bitrate_is_clamped() {
+        let (_, args) = build_ffmpeg_args(
+            "webm",
+            std::path::Path::new("/m/a.mkv"),
+            &params(r#"{"abitrate": 100000}"#),
+        )
+        .unwrap();
+        assert!(args.contains(&"512k".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn unknown_format_is_a_bad_request() {
+        let r = build_ffmpeg_args("avi", std::path::Path::new("/m/a.mkv"), &params("{}"));
+        assert!(matches!(r, Err(AppError::BadRequest(_))));
     }
 }

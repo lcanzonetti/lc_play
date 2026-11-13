@@ -62,6 +62,9 @@ pub struct MediaItem {
 struct Index {
     /// id -> item
     by_id: HashMap<String, MediaItem>,
+    /// Why the most recent scan could not read the media root, if it failed.
+    /// `by_id` then still holds the last good index.
+    scan_error: Option<String>,
 }
 
 pub struct Library {
@@ -87,6 +90,12 @@ impl Library {
         self.len() == 0
     }
 
+    /// `Some(reason)` when the last scan could not read the media root. The
+    /// index then still serves the previous good scan (possibly empty).
+    pub fn scan_error(&self) -> Option<String> {
+        self.index.read().unwrap().scan_error.clone()
+    }
+
     /// Look up a single item by id.
     pub fn get(&self, id: &str) -> Option<MediaItem> {
         self.index.read().unwrap().by_id.get(id).cloned()
@@ -103,14 +112,50 @@ impl Library {
     /// Walk the media root and rebuild the index, then swap it in atomically.
     /// Blocking filesystem work is done before taking the write lock so readers
     /// are only ever blocked for the duration of a `HashMap` move.
+    ///
+    /// If the root itself cannot be read (unmounted NFS share, renamed or
+    /// missing folder) the previous index is **kept** and the failure is
+    /// recorded, so a storage hiccup does not empty the catalogue; readiness
+    /// (`/readyz`) reports it. Errors below the root (an unreadable
+    /// subfolder, a broken symlink) are logged and skipped: they are usually
+    /// permanent, and refusing to ever update would be worse.
     pub fn rescan(&self) {
-        let mut by_id = HashMap::new();
+        if let Err(e) = std::fs::read_dir(&self.root) {
+            // The path goes to the log only: `scan_error` is shown by the
+            // public health endpoints, which must not leak absolute paths.
+            tracing::error!(
+                root = %self.root.display(),
+                "cannot read media root: {e}; keeping the previous index ({} items)",
+                self.len()
+            );
+            self.index.write().unwrap().scan_error = Some(format!("cannot read media root: {e}"));
+            return;
+        }
 
-        for entry in WalkDir::new(&self.root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        let mut by_id = HashMap::new();
+        let mut skipped = 0usize;
+
+        for entry in WalkDir::new(&self.root).follow_links(true) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    if e.depth() == 0 {
+                        // The root vanished between the check above and now.
+                        tracing::error!("cannot walk media root: {e}; keeping the previous index");
+                        let reason = match e.io_error() {
+                            Some(io) => format!("cannot walk media root: {io}"),
+                            None => "cannot walk media root".to_string(),
+                        };
+                        self.index.write().unwrap().scan_error = Some(reason);
+                        return;
+                    }
+                    if skipped == 0 {
+                        tracing::warn!("skipping unreadable entry during scan: {e}");
+                    }
+                    skipped += 1;
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -150,8 +195,9 @@ impl Library {
         {
             let mut idx = self.index.write().unwrap();
             idx.by_id = by_id;
+            idx.scan_error = None;
         }
-        tracing::info!(items = count, "library rescan complete");
+        tracing::info!(items = count, skipped, "library rescan complete");
     }
 }
 
@@ -223,6 +269,41 @@ mod tests {
             .map(|i| u8::from_str_radix(&id[i..i + 2], 16).unwrap())
             .collect();
         assert_eq!(String::from_utf8(bytes).unwrap(), "shows/ep1.mkv");
+    }
+
+    /// A unique scratch folder under the system temp dir.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lcms-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unreadable_root_keeps_the_previous_index() {
+        let root = temp_dir("root");
+        std::fs::write(root.join("a.mp4"), b"x").unwrap();
+        let lib = Library::new(root.clone());
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+        assert!(lib.scan_error().is_none());
+
+        // Simulate the share disappearing.
+        let moved = root.with_extension("gone");
+        std::fs::rename(&root, &moved).unwrap();
+        lib.rescan();
+        assert_eq!(lib.len(), 1, "index must survive an unreadable root");
+        assert!(lib.scan_error().is_some());
+
+        // Back again: the next scan clears the error.
+        std::fs::rename(&moved, &root).unwrap();
+        lib.rescan();
+        assert_eq!(lib.len(), 1);
+        assert!(lib.scan_error().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

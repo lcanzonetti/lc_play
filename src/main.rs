@@ -52,6 +52,7 @@ async fn main() {
     let mut app = Router::new()
         .route("/", get(|| async { Html(PLAYER_HTML) }))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/library", get(handlers::browse::list_library))
         .route("/api/items/{id}", get(handlers::browse::get_item))
         .route("/stream/{id}", get(handlers::stream::stream_media))
@@ -74,14 +75,42 @@ async fn main() {
         .expect("server error");
 }
 
-/// Liveness/readiness probe. Reports the current item count.
+/// Liveness probe: the process is up and serving. Always 200, so an
+/// orchestrator never restarts a node just because storage is unreachable
+/// (a restart would not fix that, and would lose the last good index).
+/// `status` still says `degraded` when the last scan failed.
 async fn healthz(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "items": state.library.len(),
-    }))
+    let (_, body) = health_body(&state);
+    body
+}
+
+/// Readiness probe for load balancers: 503 while the last library scan could
+/// not read the media root, so traffic goes to nodes that can serve files.
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    health_body(&state)
+}
+
+fn health_body(state: &AppState) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let items = state.library.len();
+    match state.library.scan_error() {
+        None => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "status": "ok", "items": items })),
+        ),
+        Some(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "degraded",
+                "items": items,
+                "error": error,
+            })),
+        ),
+    }
 }
 
 /// Resolve when the process receives Ctrl-C or SIGTERM, for clean shutdown.

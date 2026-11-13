@@ -71,11 +71,12 @@ All configuration is via environment variables; every one has a default.
 | Method & path            | Description                                              |
 | ------------------------ | ------------------------------------------------------- |
 | `GET /`                  | Built-in web player (HTML).                             |
-| `GET /healthz`           | Liveness probe; returns `{ "status": "ok", "items": N }`. |
+| `GET /healthz`           | Liveness probe; always `200`. `{ "status": "ok", "items": N }`, or `"degraded"` plus `"error"` when the last scan couldn't read the media root. |
+| `GET /readyz`            | Readiness probe; same body, but `503` while degraded.   |
 | `GET /api/library`       | List every indexed item.                                |
 | `GET /api/items/{id}`    | Metadata for one item.                                  |
 | `GET /stream/{id}`       | Stream the original file, honouring `Range` (seeking).  |
-| `GET /transcode/{id}`    | Transcode/remux and stream the result.                  |
+| `GET /transcode/{id}`    | Transcode/remux and stream the result. `HEAD` returns headers without starting `ffmpeg`. |
 
 ### Transcode query parameters
 
@@ -87,7 +88,7 @@ All configuration is via environment variables; every one has a default.
 | `height`   | *(source)* | Scale to this output height, preserving aspect (e.g. `720`).     |
 | `t`        | `0`     | Seek to this many seconds before encoding (fast input-side seek).    |
 | `crf`      | `23`/`32` | Quality (lower = better; x264 0–51, VP9 0–63).                     |
-| `abitrate` | `128`   | Audio bitrate in kbps.                                               |
+| `abitrate` | `128`   | Audio bitrate in kbps (clamped to 32–512).                           |
 | `copy`     | `false` | Remux only (`-c copy`) — no re-encode. Fastest when codecs already fit. |
 
 Example — get any file as seekable, 720p MP4 that plays in every browser:
@@ -98,6 +99,17 @@ Example — get any file as seekable, 720p MP4 that plays in every browser:
 
 To seek in a transcoded stream, request it again with a new `t=` offset (the
 transcoded output itself is not byte-range seekable).
+
+Errors and limits:
+
+- A bad query (e.g. unknown `format`) is rejected with `400` immediately.
+- When every slot is busy, a request waits up to 5 s for one, then gets
+  `503` with `Retry-After: 5`.
+- The status line is sent only once `ffmpeg` has produced output and kept
+  running for a short moment (≤ 300 ms). If it fails at startup you get `422`
+  for a `copy=true` remux the container can't hold, else `500`; details go to
+  the server log. If it fails mid-stream the response is cut off rather than
+  ending cleanly, so clients can tell it's incomplete.
 
 ## Running with Docker
 
@@ -131,7 +143,11 @@ more replicas that mount the same media directory:
   responses and stable IDs make those cacheable.
 - Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
   the only CPU-heavy path.
-- `GET /healthz` works as a load-balancer health check.
+- Use `GET /readyz` as the load-balancer health check: it returns `503` while
+  the media root is unreachable. The node keeps its last good index meanwhile,
+  so a storage blip never empties the catalogue. Use `GET /healthz` for
+  liveness (it stays `200`), so an orchestrator doesn't restart nodes over a
+  storage outage a restart can't fix.
 
 ## Development
 

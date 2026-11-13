@@ -1211,7 +1211,6 @@ dependencies = [
  "axum",
  "futures",
  "mime_guess",
- "pin-project-lite",
  "serde",
  "serde_json",
  "tokio",
