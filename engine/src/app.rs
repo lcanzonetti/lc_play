@@ -292,7 +292,10 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Named(NamedKey::Space) => self.clock.toggle(),
+                    // Ignore auto-repeat: a held or sticky Space would
+                    // otherwise toggle play/pause many times a second.
+                    // (Arrow keys keep repeating, so holding one scrubs.)
+                    Key::Named(NamedKey::Space) if !event.repeat => self.clock.toggle(),
                     Key::Named(NamedKey::ArrowRight) => self.clock.seek_by(5.0),
                     Key::Named(NamedKey::ArrowLeft) => self.clock.seek_by(-5.0),
                     Key::Named(NamedKey::ArrowUp) => self.clock.seek_by(30.0),

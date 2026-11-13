@@ -119,7 +119,7 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 ```jsonc
 {
   "canvas": { "width": 1920, "height": 1080, "background": [0.05,0.06,0.09,1.0] },
-  "playback": { "autoplay": true, "loop": true, "duration": 20.0 },
+  "playback": { "autoplay": true, "loop": true, "duration": 20.0 }, // loop needs duration
 
   "outputs": [
     {

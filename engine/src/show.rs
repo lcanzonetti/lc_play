@@ -66,8 +66,9 @@ pub struct WindowPlacement {
     pub size: Option<[u32; 2]>,
 }
 
-/// Corner-pin (keystone) warp. Corners are normalized output coordinates
-/// (0..1, top-left origin) in the order TL, TR, BR, BL. `None` = identity.
+/// Corner-pin (keystone) warp. Corners are normalized *display* coordinates
+/// (0..1, top-left origin, after `rotation_degrees`) in the order TL, TR, BR,
+/// BL. `None` = identity.
 ///
 /// The mapping is a true perspective transform (homography), which is what a
 /// projector hitting a flat surface off-axis produces: straight lines stay
@@ -299,6 +300,41 @@ impl Show {
         if show.outputs.is_empty() {
             anyhow::bail!("show has no outputs");
         }
+        if !(show.canvas.width > 0.0 && show.canvas.height > 0.0) {
+            anyhow::bail!("canvas width and height must be positive");
+        }
+        let p = &show.playback;
+        if let Some(d) = p.duration {
+            if !(d.is_finite() && d > 0.0) {
+                anyhow::bail!("playback.duration must be a positive number of seconds");
+            }
+        }
+        if p.looping && p.duration.is_none() {
+            // Without a length there is nothing to wrap at; silently playing
+            // once would only be discovered at the end of the show.
+            anyhow::bail!("playback.loop is true but playback.duration is missing");
+        }
+        for l in &show.layers {
+            let id = &l.id;
+            let op = l.transform.opacity;
+            if !(0.0..=1.0).contains(&op) {
+                // >1 breaks premultiplied blending (over-bright, wrong mixes).
+                anyhow::bail!("layer '{id}': opacity {op} must be within 0..1");
+            }
+            let t = &l.timing;
+            if !(t.start.is_finite() && t.start >= 0.0) {
+                anyhow::bail!("layer '{id}': timing.start must be >= 0");
+            }
+            if let Some(end) = t.end {
+                if end.is_nan() || end <= t.start {
+                    anyhow::bail!(
+                        "layer '{id}': timing.end ({end}) must be after timing.start ({}), \
+                         otherwise the layer is never visible",
+                        t.start
+                    );
+                }
+            }
+        }
         for o in &show.outputs {
             let id = &o.id;
             if !matches!(o.rotation_degrees, 0 | 90 | 180 | 270) {
@@ -450,6 +486,57 @@ mod tests {
             checked >= 4,
             "expected the bundled templates, found {checked}"
         );
+    }
+
+    /// A one-output show with the given extra top-level JSON and one color
+    /// layer carrying `layer_extra` inside its object.
+    fn show_with(top_extra: &str, layer_extra: &str) -> anyhow::Result<Show> {
+        Show::from_json(&format!(
+            r#"{{ "canvas": {{ "width": 10, "height": 10 }} {top_extra},
+                 "outputs": [ {{ "id": "o", "canvas_rect": {{ "x": 0, "y": 0, "w": 10, "h": 10 }} }} ],
+                 "layers": [ {{ "id": "L", "source": {{ "type": "color", "rgba": [1,1,1,1] }},
+                               "transform": {{ "position": [5,5], "size": [10,10] {layer_extra} }} }} ] }}"#
+        ))
+    }
+
+    fn err(r: anyhow::Result<Show>) -> String {
+        format!("{:#}", r.expect_err("show should be rejected"))
+    }
+
+    #[test]
+    fn rejects_loop_without_duration() {
+        let e = err(show_with(r#", "playback": { "loop": true }"#, ""));
+        assert!(e.contains("duration"), "{e}");
+        assert!(show_with(r#", "playback": { "loop": true, "duration": 5 }"#, "").is_ok());
+        assert!(show_with(r#", "playback": { "duration": 0 }"#, "").is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_opacity() {
+        assert!(err(show_with("", r#", "opacity": 1.5"#)).contains("opacity"));
+        assert!(err(show_with("", r#", "opacity": -0.1"#)).contains("opacity"));
+        assert!(show_with("", r#", "opacity": 0.0"#).is_ok());
+    }
+
+    #[test]
+    fn rejects_timing_that_never_shows_the_layer() {
+        let bad = Show::from_json(
+            r#"{ "canvas": { "width": 10, "height": 10 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 } } ],
+                 "layers": [ { "id": "L", "source": { "type": "color", "rgba": [1,1,1,1] },
+                               "transform": { "position": [5,5], "size": [10,10] },
+                               "timing": { "start": 5, "end": 5 } } ] }"#,
+        );
+        assert!(err(bad).contains("timing.end"));
+    }
+
+    #[test]
+    fn rejects_empty_canvas() {
+        let bad = Show::from_json(
+            r#"{ "canvas": { "width": 0, "height": 10 },
+                 "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 10, "h": 10 } } ] }"#,
+        );
+        assert!(err(bad).contains("canvas"));
     }
 
     #[test]
