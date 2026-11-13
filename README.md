@@ -1,179 +1,263 @@
-# lcmediaserver
+# lcmediaserver (`lcme`)
 
-A **lightweight, well-optimized, scalable** media server written in Rust.
+A **lightweight show-control media server** — the WATCHOUT / Pixera / disguise
+category, not a home-media or streaming server. Arrange displays and
+projectors on a virtual canvas, place and time content across them, let one
+piece of content **span multiple outputs**, and apply per-output **warp +
+edge-blend** for projection mapping. One machine drives all outputs; a single
+master clock keeps them in sync.
 
-It scans a directory of media, exposes a small JSON API to browse it, streams
-files directly with full HTTP Range support (seeking), and transcodes on the
-fly with `ffmpeg` when a client needs a different format or bitrate — all from a
-single self-contained binary (it only needs the standard system libraries:
-libc, libm, libgcc_s) with an
-in-memory index and no database.
+Built in Rust on **wgpu** (Vulkan/Metal/DX12) + **winit**.
 
-A minimal built-in web player is served at `/` for testing.
+## Project goal (read this first)
 
-> **This repository is a Cargo workspace with two components:**
-> - **`lcmediaserver`** (this crate) — the HTTP streaming/transcoding server documented below.
-> - **[`engine/`](engine/README.md)** (`lcmediaserver-engine`) — a **multi-output canvas
->   playback engine** (WATCHOUT-style): arrange displays on a virtual canvas, place
->   content across them, span outputs, with per-output warp + edge-blend. See
->   [`engine/README.md`](engine/README.md).
+"Media server" means two different things. This repository is the **live
+events / installations** meaning: software that plays content out to
+displays, LED walls and projectors during a show, frame-accurately and
+without dropping out.
 
----
+**In scope** — judge every change by these:
 
-## Why it's lightweight, optimized, and scalable
+- Playback on **multiple physical outputs** from one canvas: spanning,
+  orientation, warp, edge-blend, later mesh warp.
+- **Timing**: one master clock, frame-accurate video and audio locked to it,
+  timeline/cue playback, transport control.
+- **Show reliability**: a bad file, missing media or a GPU hiccup must never
+  take the outputs down mid-show; clear load-time validation; predictable
+  behaviour under an operator's hands.
+- **Control and sync** (later): external control (OSC/TCP/MIDI/Art-Net,
+  timecode), multiple render machines locked together, an operator UI with
+  preview.
+- **Lightweight**: one native binary, no database, runs on an ordinary show PC.
 
-- **Single async binary** on `axum` + `tokio`. No database, no runtime, no
-  background job queue. The library lives in memory.
-- **Direct streaming is zero-copy-ish and cache-friendly.** Files are streamed
-  from disk in bounded chunks; `Range` requests return `206 Partial Content`,
-  which is what makes seeking work and lets a CDN or reverse proxy cache byte
-  ranges.
-- **Transcoding streams straight from `ffmpeg`** to the HTTP response — nothing
-  is buffered to disk. Output is a fragmented container that plays while it
-  downloads. A **semaphore caps concurrent transcodes** so a burst of clients
-  can never fork-bomb the CPU.
-- **Client disconnects are cleaned up promptly.** The `ffmpeg` child process is
-  tied to the response body's lifetime and killed on drop — no zombie encoders.
-- **Stateless per request.** Every request is served purely from the media
-  directory + in-memory index, so you can run *N* identical replicas behind a
-  load balancer over shared storage (NFS, object-store gateway, etc.). Item IDs
-  are stable across restarts and replicas, so caching stays valid.
-- **Release binary is small and fast** — LTO, single codegen unit, stripped,
-  `panic = "abort"`.
+**Out of scope** — don't build or optimise for these here:
 
-## Quick start
+- Browser playback, HTTP streaming, web transcoding, CDN caching, media
+  libraries for many users, Plex/Jellyfin-style features.
+- Scaling out as a stateless web service behind a load balancer.
+
+> **History:** until 2026-11-13 this repository also contained an HTTP
+> streaming/transcoding server (the *IT* kind of media server) at its root,
+> with this engine in `engine/`. That server was split into its own
+> repository, **`lcstream`**, with its history. If old commits, issues or
+> sessions mention `/stream`, `/transcode`, `LCMS_*` variables, Docker or a
+> web player, they refer to that server, not to this product.
+
+> **Status: Phase 1 foundation.** This runs today with image and solid-color
+> content, full affine placement, per-output corner-warp + edge-blend +
+> orientation, and synchronized transport. **It does not play video yet** —
+> that is the next milestone (Phase 2). Live sources and audio are scaffolded
+> behind clear boundaries and land in later phases (see [Roadmap](#roadmap)). The compositor is tested by rendering real frames
+> offscreen on a software GPU (blend, compositing, warp). Windowing on
+> physical multi-monitor hardware still needs a first bring-up on your machine.
+
+## Concepts
+
+- **Canvas** — one shared 2D pixel space (origin top-left, y down). Everything
+  lives here.
+- **Output** — a rectangle on the canvas (`canvas_rect`) mapped to one physical
+  display. Each output has its own window placement, display **rotation**
+  (0/90/180/270), **warp** (four movable corners), and **edge-blend** (per-edge
+  soft feather + gamma).
+- **Layer** — a piece of content placed on the canvas with position, size,
+  `scale`, `anchor`, `rotation`, `opacity`, and `z` order, plus optional
+  `timing`.
+
+Because layers live in **canvas** space and each output renders the slice of
+canvas it covers, **content spanning multiple outputs is automatic** — no
+special case.
+
+### Render pipeline
+
+Each frame samples the show clock **once**, encodes **every** output into one
+GPU submission, then presents all outputs together — so every output renders
+the same show time. Each display still refreshes on its own clock: without
+genlocked/synchronized displays (or a sync-capable GPU setup) outputs can be up
+to one refresh apart on screen, which can show as a brief tear on fast motion
+across a seam. Per output:
+
+```
+layers ──▶ [scene pass] ──▶ canvas-slice texture ──▶ [warp + edge-blend] ──▶ display
+           draw each layer                            perspective corner-pin,
+           via output.view_proj                       multiply by blend mask
+```
+
+## Build & run
 
 ```bash
-# point it at your media and run
-LCMS_MEDIA_DIR=/path/to/media cargo run --release
-
-# then open the built-in player
-open http://localhost:8080
+cargo run --release                                       # bundled examples/show.json
+cargo run --release -- examples/preview-3-screens.json
+cargo run --release -- /path/to/my-show.json
 ```
 
-Transcoding requires `ffmpeg` on `PATH` (or set `LCMS_FFMPEG`). Direct streaming
-and browsing work without it.
+On Linux the windowing layer needs `libxkbcommon-x11-0` (present on desktop
+distros) and a Vulkan or GL driver.
 
-## Configuration
+At startup the engine logs every monitor (`monitor 0: … 1920x1080 at (0, 0)`)
+so you can set `"monitor": N`, and every 5 s it logs the frame rate and show
+time. A layer whose source fails to load (missing file, image larger than the
+GPU's texture limit) shows a magenta checkerboard and logs an error; the rest
+of the show keeps running.
 
-All configuration is via environment variables; every one has a default. A
-value that can't be parsed logs a warning and uses the default, except an
-invalid `LCMS_BIND`, which stops the server at startup.
+### Starter shows
 
-| Variable                 | Default        | Description                                                        |
-| ------------------------ | -------------- | ------------------------------------------------------------------ |
-| `LCMS_BIND`              | `0.0.0.0:8080` | Address to bind the HTTP server to.                                |
-| `LCMS_MEDIA_DIR`         | `./media`      | Root directory scanned for media.                                  |
-| `LCMS_FFMPEG`            | `ffmpeg`       | Path to the `ffmpeg` binary used for transcoding.                  |
-| `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans (a degraded node still retries every 30 s until one scan succeeds). |
-| `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
-| `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
-| `LCMS_ROOT_MARKER`       | *(unset)*      | File name that must exist directly in the media root (e.g. `.lcms-root`); a path is refused at startup. If it's missing, the scan is rejected and the node reports degraded. Recommended on network storage: an unmounted share usually leaves an empty, readable mount point. |
-| `LCMS_CACHE_MAX_AGE_SECS`| `0`            | `Cache-Control: max-age` on `/stream`. `0` = caches may store files but revalidate (cheap `304`) before each reuse. Raise it only if files are never replaced in place. |
-| `RUST_LOG`               | `info,tower_http=warn` | Log level (`tracing` env filter syntax).                   |
+| File | Setup | Use it to test |
+|------|-------|----------------|
+| `examples/preview-3-screens.json` | 3-screen wall, previewed as 3 small windows on **one** monitor | layout, content spanning, timing — on a laptop |
+| `examples/two-monitors.json` | 2 monitors side by side, fullscreen | real multi-display output |
+| `examples/two-projectors-blend.json` | 2 projectors with a 240px soft-edge overlap | corner-pin + edge blend alignment |
+| `examples/show.json` | 2 windows at 75% size, colors only | zero-asset smoke test |
 
-## HTTP API
+Window `position` is honoured on Windows, macOS and X11. Wayland compositors
+ignore client-requested positions, so there windows open wherever the
+compositor puts them (use `fullscreen` + `monitor` for real outputs).
 
-| Method & path            | Description                                              |
-| ------------------------ | ------------------------------------------------------- |
-| `GET /`                  | Built-in web player (HTML).                             |
-| `GET /healthz`           | Liveness probe; always `200`. `{ "status": "ok", "items": N }`, or `"degraded"` plus `"error"` when the last scan was rejected (unreadable media root, missing marker, or root turned empty). |
-| `GET /readyz`            | Readiness probe; same body, but `503` while degraded.   |
-| `GET /api/library`       | List every indexed item.                                |
-| `GET /api/items/{id}`    | Metadata for one item.                                  |
-| `GET /stream/{id}`       | Stream the original file, honouring `Range` (seeking).  |
-| `GET /transcode/{id}`    | Transcode/remux and stream the result. `HEAD` returns headers without starting `ffmpeg`. |
+Copy one next to your media and edit it. JSON has no comments, but unknown keys
+are ignored, so the templates document themselves with `"_note"` fields.
 
-### Transcode query parameters
+### Writing your own show
 
-`GET /transcode/{id}?format=mp4&height=720&t=90`
+1. **Canvas** = the whole stage in pixels: usually the outputs' resolutions put
+   together (minus blend overlaps).
+2. **One output per display.** `canvas_rect` is the part of the canvas it shows;
+   keep its aspect equal to the display's, or the image stretches. The window
+   size can be smaller (a scaled preview) as long as the aspect matches.
+3. **Layers** are placed in canvas pixels. `position` is where the layer's
+   anchor (default: its center) lands, so a layer filling `x..x+w` sits at
+   `x + w/2`. A layer crossing an output boundary simply appears on both.
+4. **Media paths** are relative to the show file.
+5. **Projectors:** overlap the `canvas_rect`s by the physical overlap and set
+   the mirrored `blend` to `overlap / output width` (validated as consistent in
+   the bundled examples). Then move `warp.corners` (0..1, TL/TR/BR/BL) in small
+   steps such as `0.01` until grid lines meet.
+6. **Portrait display:** if the OS already rotates it, just use a portrait
+   `canvas_rect` and window size. If the panel is physically rotated but the
+   OS isn't, keep the landscape window, use a portrait `canvas_rect`, and set
+   `rotation_degrees` to 90 or 270. If you omit `window.size`, the window
+   already defaults to the rotated (landscape) size.
 
-| Param      | Default | Description                                                          |
-| ---------- | ------- | -------------------------------------------------------------------- |
-| `format`   | `mp4`   | Output profile: `mp4` (H.264/AAC) or `webm` (VP9/Opus).              |
-| `height`   | *(source)* | Max output height, preserving aspect (e.g. `720`). Clamped to 144–4320 and rounded down to even; never upscales a smaller source. |
-| `t`        | `0`     | Seek to this many seconds before encoding (fast input-side seek).    |
-| `crf`      | `23`/`32` | Quality (lower = better; x264 0–51, VP9 0–63).                     |
-| `abitrate` | `128`   | Audio bitrate in kbps (clamped to 32–512).                           |
-| `copy`     | `false` | Remux only (`-c copy`) — no re-encode. Fastest when codecs already fit. |
+Load errors name the problem (`output 'B': canvas_rect must have positive w
+and h`, `warp corners must form a convex quad…`), and nothing is drawn until
+the show is valid.
 
-Example — get any file as a 720p MP4 that plays in every browser:
-
-```
-/transcode/<id>?format=mp4&height=720
-```
-
-To seek in a transcoded stream, request it again with a new `t=` offset (the
-transcoded output itself is not byte-range seekable).
-
-Errors and limits:
-
-- A bad query (e.g. unknown `format`) is rejected with `400` immediately.
-- When every slot is busy, a request waits up to 5 s for one, then gets
-  `503` with `Retry-After: 5`.
-- The status line is sent only once `ffmpeg` has produced output and kept
-  running for a short moment (≤ 300 ms). If it fails at startup you get `422`
-  for a `copy=true` remux the container can't hold, else `500`; details go to
-  the server log. If it fails mid-stream the response is cut off rather than
-  ending cleanly, so clients can tell it's incomplete.
-
-## Running with Docker
-
-The image bundles `ffmpeg`, so transcoding works out of the box.
+**Test patterns** for your own canvas size (lines must stay straight across
+seams, the circle must stay round, corner blocks show orientation):
 
 ```bash
-docker build -t lcmediaserver .
-docker run --rm -p 8080:8080 -v /path/to/media:/media:ro lcmediaserver
-# with a marker file, so an unmounted share is detected:
-touch /path/to/media/.lcms-root
-docker run --rm -p 8080:8080 -e LCMS_ROOT_MARKER=.lcms-root -v /path/to/media:/media:ro lcmediaserver
+python3 tools/test_pattern.py 3840 1080 my-show/media/grid.png
 ```
 
-## Scaling out
+### Transport controls
 
-Because the server is stateless per request, horizontal scaling is just running
-more replicas that mount the same media directory:
+| Key | Action |
+|-----|--------|
+| `Space` | play / pause |
+| `→` / `←` | seek ±5 s |
+| `↑` / `↓` | seek ±30 s |
+| `Esc` | quit |
 
+## Show file format
+
+```jsonc
+{
+  "canvas": { "width": 1920, "height": 1080, "background": [0.05,0.06,0.09,1.0] },
+  "playback": { "autoplay": true, "loop": true, "duration": 20.0 }, // loop needs duration
+
+  "outputs": [
+    {
+      "id": "left",
+      "canvas_rect": { "x": 0, "y": 0, "w": 1024, "h": 1080 },  // slice of canvas shown
+      "window": { "size": [1024,1080], "position": [0,0],
+                  "fullscreen": false, "monitor": 0 },           // physical window
+      "rotation_degrees": 0,                                     // display orientation
+      "warp": { "corners": [[0,0],[1,0],[1,1],[0,1]] },          // TL,TR,BR,BL (normalized)
+      "blend": { "right": 0.125, "gamma": 2.2 }                  // overlap fraction per edge
+    }
+  ],
+
+  "layers": [
+    {
+      "id": "banner",
+      "source": { "type": "color", "rgba": [0.1,0.65,0.62,1.0] },
+      "transform": {
+        "position": [960,300],   // canvas point the anchor pins to
+        "size": [1400,220],      // canvas pixels before scale
+        "anchor": [0.5,0.5],     // 0..1 within the layer (default center)
+        "scale": [1,1],
+        "rotation": 0,           // degrees, clockwise, about the anchor
+        "opacity": 1.0,
+        "z": 1
+      },
+      "timing": { "start": 0, "end": null }   // show-clock seconds
+    }
+  ]
+}
 ```
-                 ┌──────────────┐
-   clients ──►   │ load balancer│
-                 └──────┬───────┘
-          ┌────────────┼────────────┐
-      ┌───▼───┐    ┌───▼───┐    ┌───▼───┐
-      │ node1 │    │ node2 │    │ node3 │   (identical, stateless)
-      └───┬───┘    └───┬───┘    └───┬───┘
-          └────────────┼────────────┘
-                 ┌──────▼──────┐
-                 │ shared media│  (NFS / object storage)
-                 └─────────────┘
-```
 
-- Put a CDN or caching reverse proxy in front of `/stream/*`. Responses carry
-  `ETag` (size + modification time), `Last-Modified` and `Cache-Control`, and
-  the server answers `If-None-Match`/`If-Modified-Since` with `304`. IDs are
-  path-based, so a file replaced under the same name keeps its URL; the
-  validators are what make caches and resumed downloads (`If-Range`) notice
-  the change. With several replicas, the shared storage must report the same
-  modification time to every node (NFS does), or ETags differ per node.
-- Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
-  the only CPU-heavy path.
-- Use `GET /readyz` as the load-balancer health check: it returns `503` while
-  the media root is unreachable, lacks the marker file (with
-  `LCMS_ROOT_MARKER`), or (without a marker) turns empty after having media.
-  The node keeps its last good index meanwhile. Set the marker on network
-  storage: without it, a node that *starts* while the share is unmounted can't
-  tell and reports ready with 0 items, and a library you empty on purpose
-  stays degraded until the node restarts. With a marker, an empty library is
-  simply empty. Use `GET /healthz` for liveness (it stays `200`), so an
-  orchestrator doesn't restart nodes over a storage outage a restart can't fix.
+### Source types
+
+| `type` | Status | Notes |
+|--------|--------|-------|
+| `color` | ✅ Phase 1 | `{ "rgba": [r,g,b,a] }`, linear 0..1 |
+| `image` | ✅ Phase 1 | `{ "path": "..." }` (PNG/JPEG/BMP/GIF/WebP) |
+| `video` | ⏳ Phase 2 | `{ "path": "..." }`. Not decoded yet: always shows the placeholder. Without `--features video` it logs a warning; with it, an error. The feature only links ffmpeg/libav, so building with it also needs their dev libraries. |
+| `live`  | ⏳ Phase 3 | `{ "kind": "..." }` (capture/NDI). Placeholder otherwise. |
+
+### Projection mapping
+
+- **Warp (corner-pin)**: move an output's four corners (normalized display
+  space, TL/TR/BR/BL) to keystone the image onto an off-axis flat surface. The
+  mapping is a true perspective transform (homography), so straight lines stay
+  straight. Corners must form a convex quad (validated at load). Omit
+  `corners` for identity. Corners always refer to the physical display, after
+  `rotation_degrees` is applied: on a rotated output, TL is still the
+  display's top-left. Freeform mesh warp for curved surfaces is Phase 3.
+- **Edge blend**: projector images must physically overlap, and their
+  `canvas_rect`s must overlap by the same amount. Set each output's blend on
+  the shared edge to that overlap as a fraction of the output (e.g. 128px of a
+  1024px output → `0.125`), mirrored on the neighbor. The ramp is
+  complementary, so the two projectors' light sums to exactly 100% across the
+  overlap. `gamma` is the projector's gamma (default `2.2` = no correction);
+  nudge it if the seam reads slightly bright or dark. Blend edges are in
+  canvas-slice space, *before* `rotation_degrees`: on a 90° output, `left`
+  is the slice's left edge, which lands at the display's top. (Warp corners,
+  by contrast, are in display space.)
 
 ## Development
 
 ```bash
-cargo test --workspace     # server + engine unit tests (plain `cargo test` runs only the server)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test
+cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+Besides unit tests for the math, the suite renders real frames offscreen and
+checks pixels: blend overlaps sum to full light, translucent layers composite
+correctly, the corner-pin confines the image. These need a GPU adapter; on a
+headless Linux box install Mesa's software Vulkan driver
+(`apt install mesa-vulkan-drivers`). Without an adapter they skip on a dev
+machine, but fail when `CI` or `LCME_REQUIRE_GPU` is set (GitHub Actions sets
+`CI`), so they can't pass silently there. CI runs them on pushes to `main` and
+on pull requests.
+
+## Roadmap
+
+In priority order. A media server for shows is only as good as its video
+playback, so Phase 2 comes before any other feature work.
+
+- **Phase 1 (done):** canvas/output/layer model, JSON show, master clock +
+  transport, scene compositor with full affine transforms, image + color
+  content, per-output corner-warp + edge-blend + orientation, multi-output
+  spanning.
+- **Phase 2 (next): video playback.** Decode locked to the master clock
+  (frame-accurate start, seek and loop), a decode path that keeps up with
+  large canvases (choice of playback codec and hardware decode to be decided
+  first), audio out locked to the same clock (`cpal`).
+- **Phase 3:** timeline/cue model and external control (OSC/TCP/MIDI/Art-Net,
+  timecode), operator UI with preview.
+- **Phase 4:** multi-machine shows (network clock, frame lock, media
+  distribution to render nodes), live inputs (NDI/capture), freeform
+  mesh warp for curved surfaces.
 
 ## License
 
