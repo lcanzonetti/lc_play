@@ -64,6 +64,7 @@ All configuration is via environment variables; every one has a default.
 | `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
 | `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
+| `LCMS_CACHE_MAX_AGE_SECS`| `0`            | `Cache-Control: max-age` on `/stream`. `0` = caches may store files but revalidate (cheap `304`) before each reuse. Raise it only if files are never replaced in place. |
 | `RUST_LOG`               | `info`         | Log level (`tracing` env filter syntax).                           |
 
 ## HTTP API
@@ -139,8 +140,13 @@ more replicas that mount the same media directory:
                  └─────────────┘
 ```
 
-- Put a CDN or caching reverse proxy in front of `/stream/*` — the `Range`
-  responses and stable IDs make those cacheable.
+- Put a CDN or caching reverse proxy in front of `/stream/*`. Responses carry
+  `ETag` (size + modification time), `Last-Modified` and `Cache-Control`, and
+  the server answers `If-None-Match`/`If-Modified-Since` with `304`. IDs are
+  path-based, so a file replaced under the same name keeps its URL; the
+  validators are what make caches and resumed downloads (`If-Range`) notice
+  the change. With several replicas, the shared storage must report the same
+  modification time to every node (NFS does), or ETags differ per node.
 - Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
   the only CPU-heavy path.
 - Use `GET /readyz` as the load-balancer health check: it returns `503` while

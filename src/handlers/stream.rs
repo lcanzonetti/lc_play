@@ -2,7 +2,16 @@
 //!
 //! This is the zero-overhead path: the file is streamed straight from disk in
 //! bounded chunks. `Range` requests get a `206 Partial Content` response, which
-//! is what enables seeking in players and makes responses CDN-cacheable.
+//! is what enables seeking in players.
+//!
+//! Caching: item IDs are path-based, so a file replaced under the same name
+//! keeps its URL. Every response therefore carries validators built from the
+//! file's size and modification time (`ETag`, `Last-Modified`) plus an
+//! explicit `Cache-Control`, and the handler honours `If-None-Match` /
+//! `If-Modified-Since` (→ `304`) and `If-Range` (a resumed download of a file
+//! that changed gets the whole new file, never old and new bytes stitched).
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -27,16 +36,30 @@ pub async fn stream_media(
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
 
     let file = tokio::fs::File::open(&item.abs_path).await?;
-    let total = file.metadata().await?.len();
+    let meta = file.metadata().await?;
+    let total = meta.len();
+    let validators = Validators::new(total, meta.modified().ok(), state.config.cache_max_age);
+
+    if validators.not_modified(&headers) {
+        return Ok((StatusCode::NOT_MODIFIED, validators.headers()).into_response());
+    }
 
     let content_type = item.mime.clone();
 
-    match parse_range(headers.get(header::RANGE), total)? {
+    // A Range is only honoured if the client's copy is still current.
+    let range = if validators.if_range_holds(&headers) {
+        headers.get(header::RANGE)
+    } else {
+        None
+    };
+
+    match parse_range(range, total)? {
         // Whole file: 200 OK.
         None => {
             let stream = ReaderStream::with_capacity(file, STREAM_CHUNK);
             let body = Body::from_stream(stream);
             Ok((
+                validators.headers(),
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::ACCEPT_RANGES, "bytes".to_string()),
@@ -56,6 +79,7 @@ pub async fn stream_media(
 
             Ok((
                 StatusCode::PARTIAL_CONTENT,
+                validators.headers(),
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::ACCEPT_RANGES, "bytes".to_string()),
@@ -68,6 +92,84 @@ pub async fn stream_media(
                 body,
             )
                 .into_response())
+        }
+    }
+}
+
+/// Cache validators for one file version.
+struct Validators {
+    /// Strong `ETag`: `"<size hex>-<mtime ns hex>"`. `None` if the filesystem
+    /// reports no modification time (then only `Cache-Control` is sent).
+    etag: Option<String>,
+    /// Modification time, truncated to whole seconds as HTTP dates are.
+    last_modified: Option<SystemTime>,
+    cache_control: String,
+}
+
+impl Validators {
+    fn new(size: u64, modified: Option<SystemTime>, max_age: u64) -> Self {
+        let since_epoch = modified.and_then(|m| m.duration_since(UNIX_EPOCH).ok());
+        Validators {
+            etag: since_epoch.map(|d| format!("\"{size:x}-{:x}\"", d.as_nanos())),
+            last_modified: since_epoch
+                .map(|d| UNIX_EPOCH + std::time::Duration::from_secs(d.as_secs())),
+            cache_control: format!("public, max-age={max_age}, must-revalidate"),
+        }
+    }
+
+    fn headers(&self) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::CACHE_CONTROL, self.cache_control.parse().unwrap());
+        if let Some(etag) = &self.etag {
+            h.insert(header::ETAG, etag.parse().unwrap());
+        }
+        if let Some(lm) = self.last_modified {
+            h.insert(
+                header::LAST_MODIFIED,
+                httpdate::fmt_http_date(lm).parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    /// `true` when the client's cached copy is current (→ `304`).
+    /// `If-None-Match` takes precedence over `If-Modified-Since` (RFC 9110 §13.2.2).
+    fn not_modified(&self, req: &HeaderMap) -> bool {
+        if let Some(inm) = req.get(header::IF_NONE_MATCH) {
+            let Some(etag) = &self.etag else { return false };
+            // Weak comparison: ignore any W/ prefix on either side.
+            let ours = etag.trim_start_matches("W/");
+            return inm.to_str().is_ok_and(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .any(|t| t == "*" || t.trim_start_matches("W/") == ours)
+            });
+        }
+        match (req.get(header::IF_MODIFIED_SINCE), self.last_modified) {
+            (Some(ims), Some(lm)) => ims
+                .to_str()
+                .ok()
+                .and_then(|v| httpdate::parse_http_date(v).ok())
+                .is_some_and(|since| lm <= since),
+            _ => false,
+        }
+    }
+
+    /// `true` if a `Range` may be honoured: there is no `If-Range`, or it
+    /// still matches this version (strong ETag, or exact `Last-Modified`).
+    fn if_range_holds(&self, req: &HeaderMap) -> bool {
+        let Some(v) = req.get(header::IF_RANGE) else {
+            return true;
+        };
+        let Ok(v) = v.to_str() else { return false };
+        let v = v.trim();
+        if v.starts_with('"') || v.starts_with("W/") {
+            // Strong comparison: a weak tag never matches.
+            return self.etag.as_deref() == Some(v);
+        }
+        match (httpdate::parse_http_date(v), self.last_modified) {
+            (Ok(date), Some(lm)) => date == lm,
+            _ => false,
         }
     }
 }
@@ -148,6 +250,54 @@ mod tests {
 
     fn hv(s: &str) -> HeaderValue {
         HeaderValue::from_str(s).unwrap()
+    }
+
+    fn req(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(k.clone(), hv(v));
+        }
+        h
+    }
+
+    fn validators() -> Validators {
+        let mtime = UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        Validators::new(1000, Some(mtime), 0)
+    }
+
+    #[test]
+    fn matching_etag_or_date_is_not_modified() {
+        let v = validators();
+        let etag = v.etag.clone().unwrap();
+        assert!(v.not_modified(&req(&[(header::IF_NONE_MATCH, &etag)])));
+        assert!(v.not_modified(&req(&[(header::IF_NONE_MATCH, &format!("W/{etag}"))])));
+        assert!(!v.not_modified(&req(&[(header::IF_NONE_MATCH, "\"other\"")])));
+        let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
+        assert!(v.not_modified(&req(&[(header::IF_MODIFIED_SINCE, &lm)])));
+        // If-None-Match wins over a matching date.
+        assert!(!v.not_modified(&req(&[
+            (header::IF_NONE_MATCH, "\"other\""),
+            (header::IF_MODIFIED_SINCE, &lm)
+        ])));
+    }
+
+    #[test]
+    fn if_range_only_holds_for_the_same_version() {
+        let v = validators();
+        let etag = v.etag.clone().unwrap();
+        assert!(v.if_range_holds(&HeaderMap::new()));
+        assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &etag)])));
+        assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, "\"stale\"")])));
+        assert!(!v.if_range_holds(&req(&[(header::IF_RANGE, &format!("W/{etag}"))])));
+        let lm = httpdate::fmt_http_date(v.last_modified.unwrap());
+        assert!(v.if_range_holds(&req(&[(header::IF_RANGE, &lm)])));
+    }
+
+    #[test]
+    fn etag_changes_with_mtime() {
+        let a = Validators::new(1000, Some(UNIX_EPOCH + std::time::Duration::new(5, 1)), 0);
+        let b = Validators::new(1000, Some(UNIX_EPOCH + std::time::Duration::new(5, 2)), 0);
+        assert_ne!(a.etag, b.etag);
     }
 
     #[test]

@@ -1210,6 +1210,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "httpdate",
  "mime_guess",
  "serde",
  "serde_json",

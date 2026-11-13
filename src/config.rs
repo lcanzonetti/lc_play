@@ -21,6 +21,9 @@ pub struct Config {
     pub max_transcodes: usize,
     /// Whether to enable permissive CORS (handy for browser front-ends).
     pub cors: bool,
+    /// `max-age` for `/stream` responses. `0` (default) lets caches store
+    /// files but makes them revalidate (cheap `304`s) before every reuse.
+    pub cache_max_age: u64,
 }
 
 impl Config {
@@ -57,7 +60,10 @@ impl Config {
             "1" | "true" | "yes" | "on"
         );
 
+        let cache_max_age = env_or("LCMS_CACHE_MAX_AGE_SECS", "0").parse().unwrap_or(0);
+
         Config {
+            cache_max_age,
             bind,
             media_dir,
             ffmpeg,
