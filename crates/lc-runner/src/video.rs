@@ -35,6 +35,9 @@ use anyhow::Context as _;
 use crate::content::{Content, StaticContent, TextureFactory};
 use crate::show::Timing;
 
+/// Shortest time between two decoder restarts of one layer.
+const MIN_RESTART_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Decoded frames buffered ahead of the renderer. Small on purpose: each is
 /// a full uncompressed frame.
 const QUEUE_FRAMES: usize = 3;
@@ -154,7 +157,10 @@ impl Decoder {
             filter.push_str(",format=rgba,premultiply=inplace=1");
         }
         let mut child = Command::new(ffmpeg_bin())
-            .args(["-v", "error", "-nostdin"])
+            // No auto-rotation: ffprobe reports the stored size, and the
+            // frames must come out at exactly that size (phone footage with
+            // a rotation flag would otherwise be squashed).
+            .args(["-v", "error", "-nostdin", "-noautorotate"])
             // Before `-i`: seek in the input. ffmpeg then decodes from the
             // preceding keyframe and discards up to the exact position.
             .args(["-ss", &format!("{start_s:.6}"), "-i", path])
@@ -238,6 +244,8 @@ pub struct VideoContent {
     standby: Option<Decoder>,
     /// Frame currently in the texture.
     shown: Option<i64>,
+    /// When a decoder was last started; limits how often that happens.
+    last_start: Option<std::time::Instant>,
     failed: bool,
 }
 
@@ -275,6 +283,7 @@ impl VideoContent {
             decoder: None,
             standby: None,
             shown: None,
+            last_start: None,
             failed: false,
         })
     }
@@ -302,6 +311,7 @@ impl VideoContent {
     }
 
     fn start_decoder(&mut self, frame: i64) -> Option<Decoder> {
+        self.last_start = Some(std::time::Instant::now());
         match Decoder::start(&self.path, &self.info, self.size.0, self.size.1, frame) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -339,12 +349,24 @@ impl Content for VideoContent {
                 .standby
                 .as_ref()
                 .is_some_and(|d| want >= d.next_frame && want < d.next_frame + fps as i64);
-            self.decoder = if standby_fits {
-                self.standby.take()
+            // Starting ffmpeg costs on the order of 100 ms. If the wanted
+            // frame keeps landing outside the decoder's reach — reverse
+            // playback, where every frame is "behind", or fast scrubbing —
+            // restarting on every frame would spawn dozens of processes a
+            // second and show nothing. Restarts are therefore rate-limited
+            // and the picture is held in between: reverse video is choppy
+            // (a few frames per second), not smooth.
+            let too_soon = self
+                .last_start
+                .is_some_and(|t| t.elapsed() < MIN_RESTART_INTERVAL);
+            if standby_fits {
+                self.decoder = self.standby.take();
+            } else if self.decoder.is_some() && too_soon {
+                return;
             } else {
                 self.standby = None;
-                self.start_decoder(want)
-            };
+                self.decoder = self.start_decoder(want);
+            }
         }
 
         // Approaching the loop point: get the next pass ready.
@@ -356,37 +378,48 @@ impl Content for VideoContent {
             }
         }
 
-        // Advance to the wanted frame, dropping the ones the clock has
-        // passed. If it is not decoded yet, keep showing what we have and try
-        // again next frame — the render loop never waits for a decoder.
+        // Advance to the wanted frame, skipping the ones the clock has
+        // passed. If it is not decoded yet, try again next frame — the render
+        // loop never waits for a decoder.
+        //
+        // If the decoder has *only* late frames to offer (it was just
+        // started, or it cannot keep up), the newest of them is shown rather
+        // than nothing: a picture that is slightly behind beats a frozen or
+        // black one, and a decoder slower than real time would otherwise
+        // never show anything at all.
         let Some(decoder) = self.decoder.as_mut() else {
             return;
         };
+        let mut chosen: Option<(i64, Vec<u8>)> = None;
         while let Some((index, frame)) = decoder.try_next() {
+            if let Some((_, older)) = chosen.replace((index, frame)) {
+                decoder.give_back(older);
+            }
             if index >= want {
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.target.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &frame,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(self.size.0 * 4),
-                        rows_per_image: Some(self.size.1),
-                    },
-                    wgpu::Extent3d {
-                        width: self.size.0,
-                        height: self.size.1,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                self.shown = Some(index);
-                decoder.give_back(frame);
                 break;
             }
+        }
+        if let Some((index, frame)) = chosen {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.target.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.size.0 * 4),
+                    rows_per_image: Some(self.size.1),
+                },
+                wgpu::Extent3d {
+                    width: self.size.0,
+                    height: self.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.shown = Some(index);
             decoder.give_back(frame);
         }
     }

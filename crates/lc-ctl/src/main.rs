@@ -63,6 +63,8 @@ enum Action {
     },
     /// Set the playback rate (1.0 = normal, 0.5 = half speed, -1 = reverse).
     Rate {
+        // Without this, `rate -1` would be read as an unknown flag.
+        #[arg(allow_negative_numbers = true)]
         rate: f64,
     },
     /// Loop the show at this length in seconds, or `off`.

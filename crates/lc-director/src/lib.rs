@@ -560,11 +560,18 @@ impl Director {
         });
 
         if let Some(addr) = cfg.osc_addr {
-            let socket = UdpSocket::bind(addr)
-                .await
-                .with_context(|| format!("binding OSC socket {addr}"))?;
-            tracing::info!("OSC control on udp://{}", socket.local_addr()?);
-            tasks.push(tokio::spawn(osc::run(socket, core.clone())));
+            // OSC is an extra way in, not a requirement: a busy port (another
+            // OSC application on this machine) must not keep the Director
+            // from starting.
+            match UdpSocket::bind(addr).await {
+                Ok(socket) => {
+                    tracing::info!("OSC control on udp://{}", socket.local_addr()?);
+                    tasks.push(tokio::spawn(osc::run(socket, core.clone())));
+                }
+                Err(e) => tracing::warn!(
+                    "OSC control is off: cannot bind udp://{addr}: {e} (choose another --osc-port)"
+                ),
+            }
         }
 
         let server = tokio::spawn(server::serve(listener, core.clone(), shutdown_rx));

@@ -209,8 +209,9 @@ Known gaps:
 * **Two Directors on one network** are not arbitrated: Runners follow the one
   they were pointed at or heard first.
 * **No authentication or encryption**, and no `Origin` check on the
-  WebSocket: any page open in a browser on the show network could drive the
-  transport. Closed show networks only.
+  Director's WebSocket: any page open in a browser on the show network could
+  drive the transport. (The Asset Manager does restrict browser access to
+  the Producer's origin.) Closed show networks only.
 * **A panic in the Director is fatal in release builds** (`panic = "abort"`).
   Arithmetic on values from the wire is overflow-safe, but there is no
   supervisor: run it under one (systemd, a service manager).
@@ -301,8 +302,13 @@ so dragging a cue in the Producer moves it on the output without a flicker.
 The show names each asset by its URL on the Asset Manager. A Runner downloads
 it once into its cache (`<id>-<size>.<ext>`) and plays from local disk; until
 the file has arrived the cue shows a placeholder. Asset ids are derived from
-the file name, **not** from the content — a file replaced by one of exactly
-the same size would not be refetched. Content hashing is the planned fix.
+the file name, **not** from the content, and the show records each asset's
+size. When a file is replaced under the same name, an open Producer notices
+the changed size, updates the show, and Runners fetch the new file; with no
+Producer open the show keeps the old size — Runners that have the old file
+keep playing it and new Runners refuse the download (reported once, retried
+with back-off). A replacement of exactly the same size is not detected at
+all. Content hashing is the planned fix.
 
 ### Video
 
@@ -318,8 +324,12 @@ decoder is started just before a loop point.
 
 This is a correctness-first implementation: it costs a full-frame memory
 copy per frame and scales with CPU, not GPU. Two Runners given the same show
-time show the same frame, but a Runner that cannot decode fast enough will
-*hold* frames rather than fall out of sync.
+time show the same frame as long as their decoders keep up; one that cannot
+decode in real time shows the newest frame it has (i.e. runs *behind*, and
+jumps forward when it has fallen two seconds back) rather than freezing.
+Because the decoder only runs forward, **reverse playback of video is
+choppy**: the decoder is restarted at most four times a second and the
+picture held in between.
 
 ## 8. Roadmap
 

@@ -148,8 +148,14 @@ curl -X POST http://director:7401/command -H 'content-type: application/json' \
 The `document` of `load_show` / `show`. Source of truth:
 `crates/lc-proto/src/show.rs`. Every field is optional and has a default;
 unknown fields are preserved. The Director refuses a document that fails
-validation (non-positive sizes, a cue referring to an unknown asset, …) with
-an `error` naming the problem.
+validation with an `error` naming the problem: non-finite numbers,
+non-positive sizes, a display or window larger than 16384 pixels per side,
+warp corners that are not a convex quad, a cue referring to an unknown
+asset.
+
+The Producer adds a top-level `_edit: { "by": <client id>, "n": <counter> }`
+to each document it sends, to recognise its own edits when the Director
+broadcasts them back. Other tools may ignore it.
 
 ```json
 {
@@ -215,7 +221,9 @@ Bundles are accepted; their time tags are ignored.
 | `GET /thumb/{id}` | small JPEG |
 | `GET /transcode/{id}` | on-the-fly transcode for browser preview |
 
-`kind` is `video`, `image` or `audio`. CORS is open by default.
+`kind` is `video`, `image` or `audio`. By default browsers may use the
+server only from pages served on port 7404 (the Producer); `POST`/`DELETE`
+carrying any other `Origin` get `403`. Set `LCMS_CORS` to change that.
 
 ## 8. Security
 

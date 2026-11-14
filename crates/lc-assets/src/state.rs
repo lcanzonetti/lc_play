@@ -8,6 +8,9 @@ use tokio::sync::Semaphore;
 use crate::config::Config;
 use crate::library::Library;
 
+/// Item id → (file size when probed, result).
+pub type ProbeCache = HashMap<String, (u64, Option<crate::handlers::manage::Probe>)>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -17,7 +20,9 @@ pub struct AppState {
     pub transcode_slots: Arc<Semaphore>,
     /// Probe results by item id, tagged with the file size they were measured
     /// at so a replaced file is probed again.
-    pub probes: Arc<Mutex<HashMap<String, (u64, crate::handlers::manage::Probe)>>>,
+    /// `None` records a file `ffprobe` could not read, so it is not asked
+    /// again on every listing.
+    pub probes: Arc<Mutex<ProbeCache>>,
     /// Thumbnails (JPEG bytes) by item id, tagged the same way.
     pub thumbs: Arc<Mutex<HashMap<String, (u64, axum::body::Bytes)>>>,
 }

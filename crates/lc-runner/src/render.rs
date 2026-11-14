@@ -343,11 +343,15 @@ impl Gpu {
         output: &Output,
         layer_count: usize,
     ) -> OutputGpu {
+        // A surface larger than the GPU's texture limit is a hard error
+        // (panic) in wgpu. Sizes come from the window system and, through the
+        // show, from the network: clamp rather than trust.
+        let max = self.max_texture_dimension();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
-            width: width.max(1),
-            height: height.max(1),
+            width: width.clamp(1, max),
+            height: height.clamp(1, max),
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
@@ -519,6 +523,8 @@ impl Gpu {
         if width == 0 || height == 0 {
             return;
         }
+        let max = self.max_texture_dimension();
+        let (width, height) = (width.min(max), height.min(max));
         out.config.width = width;
         out.config.height = height;
         out.surface.configure(&self.device, &out.config);

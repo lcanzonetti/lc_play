@@ -24,8 +24,12 @@ use std::time::Duration;
 
 use lc_proto::show::Asset;
 
-/// Wait this long before retrying a failed download.
-const RETRY_AFTER: Duration = Duration::from_secs(5);
+/// Wait before retrying a failed download: this long after the first
+/// failure, doubling up to the maximum. An asset that was deleted or
+/// replaced on the Asset Manager will never succeed, and must not be
+/// hammered (or fill the log) for the rest of the show.
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(120);
 
 pub struct AssetCache {
     dir: PathBuf,
@@ -34,6 +38,8 @@ pub struct AssetCache {
     /// Incremented whenever an asset becomes available (or should be asked
     /// for again), so the renderer knows to look again.
     generation: AtomicU64,
+    /// Consecutive failed downloads per cache file name.
+    failures: Mutex<HashMap<String, u32>>,
 }
 
 enum Entry {
@@ -51,6 +57,7 @@ impl AssetCache {
             dir,
             entries: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            failures: Mutex::new(HashMap::new()),
         })
     }
 
@@ -80,11 +87,15 @@ impl AssetCache {
         }
 
         entries.insert(name.clone(), Entry::Pending);
-        let (cache, asset) = (self.clone(), asset.clone());
-        std::thread::Builder::new()
+        let (cache, asset, thread_name) = (self.clone(), asset.clone(), name.clone());
+        let spawned = std::thread::Builder::new()
             .name("lc-asset".into())
-            .spawn(move || cache.fetch(&asset, &name, &path))
-            .ok();
+            .spawn(move || cache.fetch(&asset, &thread_name, &path));
+        if let Err(e) = spawned {
+            // Not `Pending` forever: the next request tries again.
+            tracing::error!("cannot start a download thread: {e}");
+            entries.remove(&name);
+        }
         None
     }
 
@@ -97,11 +108,33 @@ impl AssetCache {
             Ok(bytes) => {
                 tracing::info!("asset '{}' ready ({bytes} bytes)", asset.name);
                 entries.insert(name.to_string(), Entry::Ready(path.to_path_buf()));
+                self.failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
             }
             Err(e) => {
-                tracing::error!("asset '{}': {e:#}; will retry", asset.name);
                 drop(entries);
-                std::thread::sleep(RETRY_AFTER);
+                let attempt = {
+                    let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = failures.entry(name.to_string()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                let wait = RETRY_FIRST
+                    .saturating_mul(1 << (attempt - 1).min(10))
+                    .min(RETRY_MAX);
+                // Loud once, quiet afterwards.
+                if attempt == 1 {
+                    tracing::error!(
+                        "asset '{}': {e:#}; retrying in {} s",
+                        asset.name,
+                        wait.as_secs()
+                    );
+                } else {
+                    tracing::debug!("asset '{}': {e:#} (attempt {attempt})", asset.name);
+                }
+                std::thread::sleep(wait);
                 // Forget it, so the next request starts a fresh attempt.
                 self.entries
                     .lock()
@@ -140,6 +173,20 @@ fn download(url: &str, path: &Path, expected: u64) -> anyhow::Result<u64> {
         .timeout(Duration::from_secs(3600))
         .call()
         .map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
+    // If the server already says the file has a different size than the show
+    // recorded, it was replaced after the cue was made: say so before
+    // downloading gigabytes only to throw them away.
+    let announced = response
+        .header("content-length")
+        .and_then(|v| v.parse::<u64>().ok());
+    if let (Some(announced), true) = (announced, expected != 0) {
+        if announced != expected {
+            anyhow::bail!(
+                "the file on the Asset Manager is {announced} bytes, the show expects {expected} \
+                 (it was replaced; re-add it in the Producer)"
+            );
+        }
+    }
     let tmp = path.with_extension("part");
     let mut file = std::fs::File::create(&tmp)?;
     let bytes = std::io::copy(&mut response.into_reader().take(u64::MAX), &mut file)?;

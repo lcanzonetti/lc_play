@@ -50,9 +50,24 @@ pub async fn describe(state: &AppState, item: MediaItem) -> ItemDto {
 async fn probe(state: &AppState, item: &MediaItem) -> Option<Probe> {
     if let Some((size, probe)) = state.probes.lock().unwrap().get(&item.id) {
         if *size == item.size {
-            return Some(*probe);
+            return *probe;
         }
     }
+    let probe = run_ffprobe(state, item).await;
+    // Failures are remembered too (until the file changes): the Producer
+    // lists the library every few seconds.
+    state
+        .probes
+        .lock()
+        .unwrap()
+        .insert(item.id.clone(), (item.size, probe));
+    probe
+}
+
+async fn run_ffprobe(state: &AppState, item: &MediaItem) -> Option<Probe> {
+    // Shares the ffmpeg budget: the first listing of a large library must
+    // not start one process per file all at once.
+    let _slot = state.transcode_slots.acquire().await.ok()?;
     let out = Command::new(&state.config.ffprobe)
         .args(["-v", "error", "-select_streams", "v:0"])
         .args(["-show_entries", "stream=width,height:format=duration"])
@@ -78,11 +93,6 @@ async fn probe(state: &AppState, item: &MediaItem) -> Option<Probe> {
                 .unwrap_or(0.0),
         },
     };
-    state
-        .probes
-        .lock()
-        .unwrap()
-        .insert(item.id.clone(), (item.size, probe));
     Some(probe)
 }
 
@@ -126,7 +136,11 @@ pub async fn upload(
     tokio::fs::create_dir_all(&root).await?;
     // Written under a hidden temporary name (the scanner skips dot-files)
     // and renamed when complete, so a half-received file is never served.
-    let tmp = root.join(format!(".{name}.uploading"));
+    // The counter keeps two simultaneous uploads of the same name from
+    // writing into each other; the last one to finish wins the rename.
+    static UPLOAD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = UPLOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = root.join(format!(".{name}.{seq}.uploading"));
     let result = async {
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut stream = body.into_data_stream();

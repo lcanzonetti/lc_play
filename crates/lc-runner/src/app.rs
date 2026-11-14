@@ -343,6 +343,11 @@ impl App {
             return;
         };
         if self.windows.is_empty() {
+            // No outputs (the show lost its displays): nothing may keep
+            // decoding in the background.
+            for c in &mut self.contents {
+                c.idle();
+            }
             return;
         }
         // One sample per frame, shared by every output.
@@ -523,6 +528,10 @@ impl ApplicationHandler for App {
         self.follow_cluster_show(event_loop);
 
         if self.windows.is_empty() {
+            // Nothing may keep decoding with no output to show it on.
+            for c in &mut self.contents {
+                c.idle();
+            }
             // Nothing to draw (no show yet, or no display for this Runner):
             // wake up a few times a second to look for one, instead of
             // spinning.

@@ -142,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "  OSC control:                   udp port 7405  (/lcplay/play, /pause, /stop, /seek)"
     );
+    if args.no_runner {
+        println!("  Runners on other machines: open the Producer by this machine's LAN address,");
+        println!("  not `localhost` — the address in the browser is the one written into the show");
+        println!("  for Runners to download media from.");
+    }
     println!("  Ctrl-C stops everything.");
     println!();
 

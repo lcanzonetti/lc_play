@@ -18,7 +18,7 @@ mod state;
 use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
@@ -45,7 +45,7 @@ async fn main() {
     // Kick off the initial + periodic background scan.
     library::spawn_rescan(library.clone(), config.scan_interval).await;
 
-    let cors_enabled = config.cors;
+    let cors = config.cors.clone();
     let bind = config.bind;
     let state = AppState::new(config, library);
 
@@ -70,8 +70,48 @@ async fn main() {
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    if cors_enabled {
-        app = app.layer(CorsLayer::permissive());
+    // Two lines of defence against pages other than the Producer:
+    //
+    // 1. Requests that change something (upload, delete) are refused outright
+    //    when they carry an `Origin` the policy does not allow. CORS alone
+    //    would not do this: a browser *sends* a "simple" cross-origin POST and
+    //    merely hides the response from the page.
+    // 2. The CORS headers tell browsers which pages may read responses.
+    let policy = cors.clone();
+    app = app.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let policy = policy.clone();
+            async move {
+                let changes_state = !matches!(
+                    *request.method(),
+                    axum::http::Method::GET
+                        | axum::http::Method::HEAD
+                        | axum::http::Method::OPTIONS
+                );
+                let foreign = request
+                    .headers()
+                    .get(axum::http::header::ORIGIN)
+                    .is_some_and(|o| !o.to_str().is_ok_and(|o| policy.allows(o)));
+                if changes_state && foreign {
+                    return axum::response::IntoResponse::into_response((
+                        axum::http::StatusCode::FORBIDDEN,
+                        "this origin may not modify the library (see LCMS_CORS)",
+                    ));
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    if cors != config::CorsPolicy::Off {
+        let policy = cors.clone();
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                    origin.to_str().is_ok_and(|o| policy.allows(o))
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
     }
 
     let listener = tokio::net::TcpListener::bind(bind)

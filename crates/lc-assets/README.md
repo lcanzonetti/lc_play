@@ -61,7 +61,7 @@ All configuration is via environment variables; every one has a default.
 | `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
 | `LCMS_FFPROBE`           | `ffprobe`      | Path to `ffprobe`, used for dimensions and duration.               |
-| `LCMS_CORS`              | `true`         | Permissive CORS, needed by the Producer UI.                        |
+| `LCMS_CORS`              | `producer`     | Which web pages may use the server: `producer` (pages served on port 7404, any host), a port number, a comma-separated list of origins, `*`, or `off`. Uploads and deletes from other origins are refused. |
 | `RUST_LOG`               | `info`         | Log level (`tracing` env filter syntax).                           |
 
 ## HTTP API

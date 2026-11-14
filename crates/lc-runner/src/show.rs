@@ -336,6 +336,11 @@ impl Show {
     }
 }
 
+/// Largest output edge accepted, in pixels: the texture limit of current
+/// GPUs. Anything larger is a typo, and would otherwise reach the GPU as an
+/// impossible surface size.
+pub const MAX_OUTPUT_PIXELS: u32 = 16_384;
+
 impl Output {
     /// Reject geometry the renderer cannot draw, with a message that names
     /// the output and the field.
@@ -347,6 +352,20 @@ impl Output {
                 anyhow::bail!(
                     "output '{id}': rotation_degrees {} must be 0/90/180/270",
                     o.rotation_degrees
+                );
+            }
+            if o.window
+                .size
+                .is_some_and(|s| s.iter().any(|&d| d == 0 || d > MAX_OUTPUT_PIXELS))
+            {
+                anyhow::bail!(
+                    "output '{id}': window size must be 1..{MAX_OUTPUT_PIXELS} pixels per side"
+                );
+            }
+            let r = &o.canvas_rect;
+            if !(r.w <= MAX_OUTPUT_PIXELS as f32 && r.h <= MAX_OUTPUT_PIXELS as f32) {
+                anyhow::bail!(
+                    "output '{id}': canvas_rect must not exceed {MAX_OUTPUT_PIXELS} pixels per side"
                 );
             }
             if !(o.canvas_rect.w > 0.0 && o.canvas_rect.h > 0.0) {

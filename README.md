@@ -36,7 +36,7 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 
 * **Video is decoded by an `ffmpeg` child process into uncompressed frames.**
   Correct and frame-exact, but CPU-bound: fine for a few HD layers, not for
-  4K60 walls. No audio.
+  4K60 walls. No audio. Reverse playback of video is choppy.
 * **No keyframe animation.** A cue has one position, size, rotation and
   opacity, plus fade in/out.
 * **Warp is corner-pin only**, and is set as numbers in the show file — the

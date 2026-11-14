@@ -244,6 +244,25 @@ impl Default for Cue {
     }
 }
 
+/// Largest display edge accepted, in pixels (the texture limit of current
+/// GPUs). A larger value is a typo — and one that would crash a renderer.
+pub const MAX_OUTPUT_PIXELS: u32 = 16_384;
+
+/// True if the four points form a strictly convex quad (either winding).
+/// Anything else has no valid perspective mapping.
+fn is_convex(c: &[[f32; 2]; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let (a, b, d) = (c[i], c[(i + 1) % 4], c[(i + 2) % 4]);
+        let cross = (b[0] - a[0]) * (d[1] - b[1]) - (b[1] - a[1]) * (d[0] - b[0]);
+        if cross.abs() < 1e-9 || (sign != 0.0 && cross.signum() != sign) {
+            return false;
+        }
+        sign = cross.signum();
+    }
+    true
+}
+
 impl ShowDocument {
     pub fn asset(&self, id: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.id == id)
@@ -265,6 +284,7 @@ impl ShowDocument {
 
         let s = &self.stage;
         finite("stage", &[s.width as f64, s.height as f64])?;
+        finite("stage background", &s.background.map(f64::from))?;
         if !(s.width > 0.0 && s.height > 0.0) {
             return Err("stage: width and height must be positive".into());
         }
@@ -284,6 +304,20 @@ impl ShowDocument {
                     "{name}: canvas rect must have positive width and height"
                 ));
             }
+            if r.w > MAX_OUTPUT_PIXELS as f32 || r.h > MAX_OUTPUT_PIXELS as f32 {
+                return Err(format!(
+                    "{name}: canvas rect must not exceed {MAX_OUTPUT_PIXELS} pixels per side"
+                ));
+            }
+            if let Some(corners) = d.warp_corners {
+                let flat: Vec<f64> = corners.iter().flatten().map(|&v| v as f64).collect();
+                finite(&name, &flat)?;
+                if !is_convex(&corners) {
+                    return Err(format!(
+                        "{name}: warp corners must form a convex quad in the order TL, TR, BR, BL"
+                    ));
+                }
+            }
             if !matches!(d.rotation_degrees, 0 | 90 | 180 | 270) {
                 return Err(format!("{name}: rotation must be 0, 90, 180 or 270"));
             }
@@ -301,8 +335,10 @@ impl ShowDocument {
                 return Err(format!("{name}: blend gamma must be positive"));
             }
             if let Some(size) = d.window.size {
-                if size[0] == 0 || size[1] == 0 {
-                    return Err(format!("{name}: window size must not be zero"));
+                if size.iter().any(|&d| d == 0 || d > MAX_OUTPUT_PIXELS) {
+                    return Err(format!(
+                        "{name}: window size must be 1..{MAX_OUTPUT_PIXELS} pixels per side"
+                    ));
                 }
             }
         }
@@ -335,12 +371,15 @@ impl ShowDocument {
                 if !(c.w > 0.0 && c.h > 0.0) {
                     return Err(format!("{name}: width and height must be positive"));
                 }
-                if let CueSource::Asset { asset } = &c.source {
-                    if self.asset(asset).is_none() {
-                        return Err(format!(
-                            "{name}: refers to asset '{asset}', which is not in the show"
-                        ));
+                match &c.source {
+                    CueSource::Asset { asset } => {
+                        if self.asset(asset).is_none() {
+                            return Err(format!(
+                                "{name}: refers to asset '{asset}', which is not in the show"
+                            ));
+                        }
                     }
+                    CueSource::Color { rgba } => finite(&name, &rgba.map(f64::from))?,
                 }
             }
         }
@@ -410,5 +449,31 @@ mod tests {
         let mut doc = ShowDocument::default();
         doc.stage.width = f32::NAN;
         assert!(doc.validate().is_err());
+
+        // A typo'd size (19200 for 1920) must be refused here, not reach a
+        // Runner's GPU; a bow-tie warp has no perspective mapping.
+        let display = |edit: &dyn Fn(&mut Display)| {
+            let mut d = Display {
+                name: "Wall".into(),
+                canvas_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1920.0,
+                    h: 1080.0,
+                },
+                ..Default::default()
+            };
+            edit(&mut d);
+            let mut doc = ShowDocument::default();
+            doc.stage.displays.push(d);
+            doc.validate()
+        };
+        let bow_tie = [[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]];
+        let square = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        assert!(display(&|_| {}).is_ok());
+        assert!(display(&|d| d.canvas_rect.w = 40_000.0).is_err());
+        assert!(display(&|d| d.window.size = Some([19_200, 1080])).is_err());
+        assert!(display(&|d| d.warp_corners = Some(bow_tie)).is_err());
+        assert!(display(&|d| d.warp_corners = Some(square)).is_ok());
     }
 }

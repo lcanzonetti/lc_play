@@ -76,7 +76,11 @@ const S = {
   ws: null,
   connected: false,
   doc: null,            // the show document being edited
-  lastSent: '',         // JSON of the document as last sent/received (echo filter)
+  clientId: 'producer-' + uid(), // identifies this page's edits when they come back
+  editN: 0,             // number of the last document this page sent
+  lastSent: '',         // JSON of the document as last sent/received (change detection)
+  dirty: false,         // there are edits the Director has not received
+  holdForeign: false,   // ignore other senders' shows until ours is confirmed
   sel: null,            // { type: 'cue' | 'display', id }
   transports: [],       // transport states known, oldest first (at most 2)
   frameRate: { num: 60, den: 1 },
@@ -159,7 +163,7 @@ function connect(url, protocol) {
   S.ws = ws;
   ws.onopen = () => {
     S.connected = true;
-    ws.send(JSON.stringify({ type: 'hello', protocol, node_id: 'producer-' + uid(), role: 'producer', name: 'Producer' }));
+    ws.send(JSON.stringify({ type: 'hello', protocol, node_id: S.clientId, role: 'producer', name: 'Producer' }));
   };
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -180,12 +184,26 @@ function onMessage(msg) {
   switch (msg.type) {
     case 'welcome':
       S.frameRate = msg.frame_rate;
+      // A new connection may be to a restarted Director, whose transport
+      // epochs and clock are unrelated to the old ones: start afresh.
+      S.transports = [];
+      S.clockOffsetNs = null;
       pushTransport(msg.transport);
       command({ type: 'status' }); // gives us the cluster clock right away
-      if (msg.show_revision == null) {
-        // A Director with no show yet: start it off with a usable one.
+      if (S.doc) {
+        // Reconnected while holding a show. If we have edits the Director
+        // never received, or it came back with no show at all (restarted
+        // without saved state), ours is the one to keep: send it, and do not
+        // let the Director's older copy overwrite it in the meantime.
+        if (S.dirty || msg.show_revision == null) {
+          S.holdForeign = true;
+          sendDoc(true);
+        }
+      } else if (msg.show_revision == null) {
+        // First contact with a Director that has no show: start it off with
+        // a usable one.
         S.doc = defaultDoc();
-        sendDoc();
+        sendDoc(true);
         refreshAll();
       }
       break;
@@ -193,11 +211,25 @@ function onMessage(msg) {
       pushTransport(msg.state);
       break;
     case 'show': {
-      const json = JSON.stringify(msg.document);
-      if (json === S.lastSent) break; // our own edit coming back
-      S.lastSent = json;
+      // Every document this page sends carries a tag ({by, n}); the Director
+      // stores and re-broadcasts documents verbatim, so the tag tells our own
+      // edits coming back from somebody else's. (Comparing the JSON text
+      // would not: the Director does not preserve key order.)
+      const tag = msg.document._edit;
+      if (tag?.by === S.clientId) {
+        if (tag.n >= S.editN) S.holdForeign = false; // our latest has arrived
+        break; // we already have this, or something newer
+      }
+      if (S.holdForeign || S.dirty) break; // ours is on its way, and wins
+      // Somebody else's show (another Producer, lc-ctl, or the one stored on
+      // the Director when this page was opened): adopt it. Anything being
+      // dragged refers to the old document.
+      drag = tlDrag = null;
+      delete msg.document._edit;
       S.doc = normalize(msg.document);
+      S.lastSent = JSON.stringify(S.doc);
       refreshAll();
+      reconcileAssets();
       break;
     }
     case 'cluster':
@@ -209,6 +241,8 @@ function onMessage(msg) {
       renderCluster();
       break;
     case 'error':
+      // If it was our document that was refused, no echo will come.
+      S.holdForeign = false;
       toast(msg.message);
       break;
   }
@@ -272,13 +306,22 @@ let sendTimer = 0;
 function scheduleSend() {
   if (!sendTimer) sendTimer = setTimeout(sendDoc, 150);
 }
-function sendDoc() {
+function sendDoc(force = false) {
   clearTimeout(sendTimer);
   sendTimer = 0;
+  delete S.doc._edit; // e.g. from an opened file; the tag is added per send
   const json = JSON.stringify(S.doc);
-  if (json === S.lastSent) return;
+  if (!force && !S.dirty && json === S.lastSent) return;
+  if (S.ws?.readyState !== WebSocket.OPEN) {
+    // Not lost: kept here and sent as soon as the Director is back (see the
+    // 'welcome' handler). Say so once.
+    if (!S.dirty) toast('Director offline — edits are kept here and sent when it is back.', true);
+    S.dirty = true;
+    return;
+  }
   S.lastSent = json;
-  command({ type: 'load_show', document: S.doc });
+  S.dirty = false;
+  command({ type: 'load_show', document: { ...S.doc, _edit: { by: S.clientId, n: ++S.editN } } });
 }
 
 function stepHistory(from, to) {
@@ -329,6 +372,7 @@ function addCue(cue, ti, t) {
     normalize(S.doc);
     S.sel = { type: 'cue', id: cue.id };
   });
+  syncLoop(); // the timeline may have grown
 }
 
 /** Largest rectangle with the media's aspect that fits the stage, centred. */
@@ -371,10 +415,31 @@ async function loadLibrary() {
       S.library = usable;
       renderAssets();
     }
+    reconcileAssets();
   } catch {
     if (S.library !== null) renderAssets('Asset Manager not reachable at ' + S.assetsUrl);
     S.library = null;
   }
+}
+
+/** A file replaced on the Asset Manager keeps its id (ids come from the
+ *  name) but not its size, dimensions or duration. The show records those —
+ *  the size is part of every Runner's cache key — so bring the show's copy up
+ *  to date; Runners then fetch the new file. */
+function reconcileAssets() {
+  if (!S.doc || !S.library) return;
+  const facts = (x) => [x.size, x.width || 0, x.height || 0, x.duration_s || 0].join();
+  const stale = S.doc.assets
+    .map((a) => [a, S.library.find((i) => i.id === a.id)])
+    .filter(([a, item]) => item && facts(item) !== facts(a));
+  if (!stale.length) return;
+  edit(() => {
+    for (const [a, item] of stale) {
+      Object.assign(a, { size: item.size, width: item.width || 0, height: item.height || 0, duration_s: item.duration_s || 0 });
+      S.thumbs.delete(a.id);
+    }
+  });
+  toast(`${stale.map(([a]) => a.name).join(', ')}: file changed on the Asset Manager — show updated.`, true);
 }
 
 function renderAssets(problem) {
@@ -390,7 +455,8 @@ function renderAssets(problem) {
       ondragstart: (e) => e.dataTransfer.setData('text/lcplay-asset', item.id),
       ondblclick: () => addAssetCue(item, 0, showSeconds()),
     },
-      el('img', { src: `${S.assetsUrl}/thumb/${item.id}`, loading: 'lazy', draggable: 'false' }),
+      // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
+      el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
       el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta)),
       el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕'),
     ));
@@ -400,7 +466,12 @@ function renderAssets(problem) {
 async function deleteAsset(item) {
   const used = S.doc.tracks.some((t) => t.cues.some((c) => c.source.asset === item.id));
   if (!confirm(`Delete "${item.name}" from the Asset Manager?` + (used ? '\n\nIt is used in this show; those cues will show a placeholder.' : ''))) return;
-  await fetch(`${S.assetsUrl}/api/items/${item.id}`, { method: 'DELETE' });
+  try {
+    const res = await fetch(`${S.assetsUrl}/api/items/${item.id}`, { method: 'DELETE' });
+    if (!res.ok) toast(`Could not delete ${item.name}: ${await res.text()}`);
+  } catch {
+    toast(`Could not delete ${item.name}: Asset Manager not reachable`);
+  }
   loadLibrary();
 }
 
@@ -429,7 +500,7 @@ function thumbFor(asset) {
   let img = S.thumbs.get(asset.id);
   if (!img) {
     img = new Image();
-    img.src = asset.url.replace('/stream/', '/thumb/');
+    img.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
     S.thumbs.set(asset.id, img);
   }
   return img.complete && img.naturalWidth ? img : null;
@@ -700,7 +771,8 @@ function timelineDragMove(e) {
     c.duration_s = round2(o.duration_s - d);
     if (assetOf(c)?.kind === 'video') c.in_s = round2(Math.max(0, o.in_s + d));
   }
-  S.doc.duration_s = Math.max(S.doc.duration_s, Math.ceil(c.start_s + c.duration_s));
+  const grown = Math.max(S.doc.duration_s, Math.ceil(c.start_s + c.duration_s));
+  if (grown !== S.doc.duration_s) { S.doc.duration_s = grown; syncLoop(); }
   renderTimeline();
   renderInspector();
   scheduleSend();
@@ -735,13 +807,18 @@ window.addEventListener('mouseup', (e) => {
 /** A labelled input bound to obj[key]. Changes are committed on Enter/blur
  *  (not per keystroke), each as one undo step. */
 function field(label, obj, key, opts = {}) {
-  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, after } = opts;
+  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, after, optional = false } = opts;
   const input = el('input', { type, step, min });
   if (type === 'checkbox') input.checked = !!obj[key];
   else input.value = get(obj[key]) ?? '';
   input.addEventListener('change', () => {
     let v = type === 'checkbox' ? input.checked : type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value;
-    if (type === 'number' && v != null && (Number.isNaN(v) || (min != null && v < min))) { input.value = get(obj[key]) ?? ''; return; }
+    // A number field that is emptied, or holds something unusable, goes back
+    // to its value: writing "no value" into the show would make the Director
+    // refuse every edit from then on. Only fields that are genuinely
+    // optional (the monitor number) may be cleared.
+    const unusable = v == null ? !optional : Number.isNaN(v) || (min != null && v < min);
+    if (type === 'number' && unusable) { input.value = get(obj[key]) ?? ''; return; }
     edit(() => { obj[key] = set(v); after?.(); }, { inspector: false });
   });
   return el('div', { class: 'row' }, el('label', {}, label), input);
@@ -827,7 +904,7 @@ function renderInspector() {
       pair('W / H', d.canvas_rect, 'w', 'h', { min: 1 }),
       el('h4', {}, "Window on the Runner"),
       field('Fullscreen', d.window, 'fullscreen', { type: 'checkbox' }),
-      field('Monitor #', d.window, 'monitor', { min: 0 }),
+      field('Monitor #', d.window, 'monitor', { min: 0, optional: true }),
       optionalPair('Position', d.window, 'position'),
       optionalPair('Size', d.window, 'size', 1),
       el('div', { class: 'dim' }, 'Windowed: position and size in desktop pixels. Fullscreen: uses the monitor number the Runner logs at start-up.'),
@@ -911,7 +988,7 @@ $('#btn-new').onclick = () => { if (confirm('Start a new, empty show? The curren
 $('#btn-save').onclick = () => {
   const a = el('a', { href: URL.createObjectURL(new Blob([JSON.stringify(S.doc, null, 2)], { type: 'application/json' })), download: `${S.doc.name || 'show'}.lcplay.json` });
   a.click();
-  URL.revokeObjectURL(a.href);
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000); // after the download has started
 };
 $('#btn-open').onclick = () => $('#file-open').click();
 $('#file-open').onchange = async (e) => {
@@ -920,6 +997,7 @@ $('#file-open').onchange = async (e) => {
   if (!file) return;
   try {
     const doc = normalize(JSON.parse(await file.text()));
+    delete doc._edit;
     edit(() => { S.doc = doc; S.sel = null; });
   } catch (err) { toast(`Cannot open ${file.name}: ${err.message}`); }
 };
@@ -954,7 +1032,12 @@ function tick() {
   // Loop and rate reflect the cluster's state (another controller — OSC,
   // lc-ctl — may have changed them), unless the operator is on the control.
   if (tr && document.activeElement !== $('#chk-loop')) $('#chk-loop').checked = tr.loop_ns > 0;
-  if (tr && document.activeElement !== $('#sel-rate')) $('#sel-rate').value = String(tr.rate_permille);
+  if (tr && document.activeElement !== $('#sel-rate')) {
+    const sel = $('#sel-rate'), value = String(tr.rate_permille);
+    // A rate set elsewhere (OSC, lc-ctl) may not be one of the presets.
+    if (![...sel.options].some((o) => o.value === value)) sel.append(el('option', { value }, `${tr.rate_permille / 1000}×`));
+    sel.value = value;
+  }
   $('#playhead').style.left = HEAD_W + t * S.pxPerSec + 'px';
   drawStage(t);
   requestAnimationFrame(tick);
