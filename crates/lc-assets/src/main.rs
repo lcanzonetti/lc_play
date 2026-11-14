@@ -38,7 +38,7 @@ async fn main() {
         .init();
 
     let config = Config::from_env();
-    tracing::info!(?config, "starting lcmediaserver");
+    tracing::info!(?config, "starting lc-assets");
 
     let library = library::from_config(&config);
 

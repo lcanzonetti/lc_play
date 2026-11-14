@@ -1,145 +1,94 @@
-# lcmediaserver
+# LC Play
 
-A **lightweight, well-optimized, scalable** media server written in Rust.
+A distributed media server: one **Producer** designs and cues a show on a
+single large canvas, a **Director** keeps the cluster's time and state, and
+any number of **Runners** render their slice of the canvas to the displays
+they are wired to — frame-synchronised, and able to keep playing if the
+Director disappears. An **Asset Manager** stores and serves the media.
 
-It scans a directory of media, exposes a small JSON API to browse it, streams
-files directly with full HTTP Range support (seeking), and transcodes on the
-fly with `ffmpeg` when a client needs a different format or bitrate — all from a
-single static binary with an in-memory index and no database.
+```
+ Producer ──WS──▶ Director ◀──WS + UDP time sync──▶ Runner ─▶ displays
+    │                │                              Runner ─▶ displays
+    └──HTTP──▶ Asset Manager ◀────────HTTP──────────Runner ─▶ displays
+```
 
-A minimal built-in web player is served at `/` for testing.
+| Document | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | components, communication flows, the synchronisation design and its limits, data model, roadmap |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | the wire format: discovery beacon, control messages, sync packet |
+| [crates/lc-runner/README.md](crates/lc-runner/README.md) | the renderer and the show file format |
+| [crates/lc-assets/README.md](crates/lc-assets/README.md) | the media HTTP server |
 
-> **This repository is a Cargo workspace with two components:**
-> - **`lcmediaserver`** (this crate) — the HTTP streaming/transcoding server documented below.
-> - **[`engine/`](engine/README.md)** (`lcmediaserver-engine`) — a **multi-output canvas
->   playback engine** (WATCHOUT-style): arrange displays on a virtual canvas, place
->   content across them, span outputs, with per-output warp + edge-blend. See
->   [`engine/README.md`](engine/README.md).
+## Status
 
----
+| Part | State |
+|---|---|
+| Communication & synchronisation (discovery, control channel, cluster clock, transport, holdover, Director restart) | **implemented and tested** |
+| Runner renderer (canvas, multi-output, warp, edge blend; images and colours) | implemented; timed by the cluster clock |
+| Asset Manager | stand-alone media server; cluster integration is next (M2) |
+| Video playback, show distribution to the renderer, Producer UI, OSC/MIDI/Art-Net/LTC | not yet — see the [roadmap](docs/ARCHITECTURE.md#8-roadmap) |
 
-## Why it's lightweight, optimized, and scalable
+Tested on one machine over loopback with simulated clock offset and drift.
+**Not yet verified on real multi-machine hardware**: switch behaviour, GPU
+vblank timing and multi-monitor output need a bring-up on a rig.
 
-- **Single async binary** on `axum` + `tokio`. No database, no runtime, no
-  background job queue. The library lives in memory.
-- **Direct streaming is zero-copy-ish and cache-friendly.** Files are streamed
-  from disk in bounded chunks; `Range` requests return `206 Partial Content`,
-  which is what makes seeking work and lets a CDN or reverse proxy cache byte
-  ranges.
-- **Transcoding streams straight from `ffmpeg`** to the HTTP response — nothing
-  is buffered to disk. Output is a fragmented container that plays while it
-  downloads. A **semaphore caps concurrent transcodes** so a burst of clients
-  can never fork-bomb the CPU.
-- **Client disconnects are cleaned up promptly.** The `ffmpeg` child process is
-  tied to the response body's lifetime and killed on drop — no zombie encoders.
-- **Stateless per request.** Every request is served purely from the media
-  directory + in-memory index, so you can run *N* identical replicas behind a
-  load balancer over shared storage (NFS, object-store gateway, etc.). Item IDs
-  are stable across restarts and replicas, so caching stays valid.
-- **Release binary is small and fast** — LTO, single codegen unit, stripped,
-  `panic = "abort"`.
-
-## Quick start
+## Try it (one machine)
 
 ```bash
-# point it at your media and run
-LCMS_MEDIA_DIR=/path/to/media cargo run --release
+cargo build --workspace
 
-# then open the built-in player
-open http://localhost:8080
+# 1. the Director
+target/debug/lc-director --state-dir /tmp/lcplay/director
+
+# 2. two Runners (headless: no window, they report the frame they would show)
+target/debug/lc-runner --headless --discover --name left  --cache-dir /tmp/lcplay/left
+target/debug/lc-runner --headless --discover --name right --cache-dir /tmp/lcplay/right
+
+# 3. drive it
+target/debug/lc-ctl discover
+target/debug/lc-ctl play
+target/debug/lc-ctl seek 42.5
+target/debug/lc-ctl status      # per Runner: on frame? sync error, RTT, drift
 ```
 
-Transcoding requires `ffmpeg` on `PATH` (or set `LCMS_FFMPEG`). Direct streaming
-and browsing work without it.
+Then kill the Director: both Runners log `HOLDOVER` and keep counting the same
+frames. Start it again: it adopts the running timebase and nothing jumps.
 
-## Configuration
-
-All configuration is via environment variables; every one has a default.
-
-| Variable                 | Default        | Description                                                        |
-| ------------------------ | -------------- | ------------------------------------------------------------------ |
-| `LCMS_BIND`              | `0.0.0.0:8080` | Address to bind the HTTP server to.                                |
-| `LCMS_MEDIA_DIR`         | `./media`      | Root directory scanned for media.                                  |
-| `LCMS_FFMPEG`            | `ffmpeg`       | Path to the `ffmpeg` binary used for transcoding.                  |
-| `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
-| `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
-| `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
-| `RUST_LOG`               | `info`         | Log level (`tracing` env filter syntax).                           |
-
-## HTTP API
-
-| Method & path            | Description                                              |
-| ------------------------ | ------------------------------------------------------- |
-| `GET /`                  | Built-in web player (HTML).                             |
-| `GET /healthz`           | Liveness probe; returns `{ "status": "ok", "items": N }`. |
-| `GET /api/library`       | List every indexed item.                                |
-| `GET /api/items/{id}`    | Metadata for one item.                                  |
-| `GET /stream/{id}`       | Stream the original file, honouring `Range` (seeking).  |
-| `GET /transcode/{id}`    | Transcode/remux and stream the result.                  |
-
-### Transcode query parameters
-
-`GET /transcode/{id}?format=mp4&height=720&t=90`
-
-| Param      | Default | Description                                                          |
-| ---------- | ------- | -------------------------------------------------------------------- |
-| `format`   | `mp4`   | Output profile: `mp4` (H.264/AAC) or `webm` (VP9/Opus).              |
-| `height`   | *(source)* | Scale to this output height, preserving aspect (e.g. `720`).     |
-| `t`        | `0`     | Seek to this many seconds before encoding (fast input-side seek).    |
-| `crf`      | `23`/`32` | Quality (lower = better; x264 0–51, VP9 0–63).                     |
-| `abitrate` | `128`   | Audio bitrate in kbps.                                               |
-| `copy`     | `false` | Remux only (`-c copy`) — no re-encode. Fastest when codecs already fit. |
-
-Example — get any file as seekable, 720p MP4 that plays in every browser:
-
-```
-/transcode/<id>?format=mp4&height=720
-```
-
-To seek in a transcoded stream, request it again with a new `t=` offset (the
-transcoded output itself is not byte-range seekable).
-
-## Running with Docker
-
-The image bundles `ffmpeg`, so transcoding works out of the box.
+With a display attached, drop `--headless` and pass a show file:
 
 ```bash
-docker build -t lcmediaserver .
-docker run --rm -p 8080:8080 -v /path/to/media:/media:ro lcmediaserver
+target/debug/lc-runner crates/lc-runner/examples/preview-3-screens.json --discover
 ```
 
-## Scaling out
+If discovery finds nothing (multicast is often filtered on managed switches),
+give the address explicitly: `--director 10.0.0.1:7401`.
 
-Because the server is stateless per request, horizontal scaling is just running
-more replicas that mount the same media directory:
+Default ports: discovery UDP 7400 (multicast 239.255.76.67), control TCP 7401,
+clock sync UDP 7402.
 
-```
-                 ┌──────────────┐
-   clients ──►   │ load balancer│
-                 └──────┬───────┘
-          ┌────────────┼────────────┐
-      ┌───▼───┐    ┌───▼───┐    ┌───▼───┐
-      │ node1 │    │ node2 │    │ node3 │   (identical, stateless)
-      └───┬───┘    └───┬───┘    └───┬───┘
-          └────────────┼────────────┘
-                 ┌──────▼──────┐
-                 │ shared media│  (NFS / object storage)
-                 └─────────────┘
-```
+## Workspace
 
-- Put a CDN or caching reverse proxy in front of `/stream/*` — the `Range`
-  responses and stable IDs make those cacheable.
-- Tune `LCMS_MAX_TRANSCODES` per node to match its CPU budget; transcoding is
-  the only CPU-heavy path.
-- `GET /healthz` works as a load-balancer health check.
+| Crate | Role |
+|---|---|
+| `lc-proto` | wire messages and shared types; no I/O |
+| `lc-time` | cluster clock estimator, UDP sync, transport timeline |
+| `lc-discovery` | multicast node discovery |
+| `lc-net` | control-channel client (WebSocket) |
+| `lc-director` | Director service |
+| `lc-runner` | Runner service: cluster agent + wgpu renderer |
+| `lc-assets` | Asset Manager service |
+| `lc-ctl` | command-line controller |
 
 ## Development
 
 ```bash
-cargo test           # unit tests (range parsing, id encoding, classification)
-cargo clippy --all-targets -- -D warnings
-cargo fmt
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+The Runner's GPU tests need a Vulkan adapter (on a headless Linux box:
+`apt install mesa-vulkan-drivers`); without one they skip.
 
 ## License
 

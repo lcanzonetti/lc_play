@@ -1,0 +1,21 @@
+[package]
+name = "lc-ctl"
+description = "LC Play command-line controller: discover nodes, inspect the cluster, drive the transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lc-ctl"
+path = "src/main.rs"
+
+[dependencies]
+lc-proto.workspace = true
+lc-discovery.workspace = true
+lc-net.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

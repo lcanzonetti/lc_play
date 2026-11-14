@@ -1,34 +1,57 @@
+# LC Play — distributed media server.
+#
+# Every service is its own crate/binary so a show can run them on one machine
+# or spread them across the network (see docs/ARCHITECTURE.md):
+#
+#   lc-proto      wire messages + shared data types (no I/O)
+#   lc-time       cluster clock estimator, sync protocol, transport maths
+#   lc-discovery  UDP multicast node discovery
+#   lc-net        WebSocket control-channel client
+#   lc-director   coordinator: authoritative state + master clock
+#   lc-runner     display server: sync agent + wgpu renderer
+#   lc-assets     asset manager: HTTP media store / transcoder
+#   lc-ctl        command-line controller
 [workspace]
-members = ["engine"]
+members = [
+    "crates/lc-proto",
+    "crates/lc-time",
+    "crates/lc-discovery",
+    "crates/lc-net",
+    "crates/lc-director",
+    "crates/lc-runner",
+    "crates/lc-assets",
+    "crates/lc-ctl",
+]
 resolver = "2"
 
-[package]
-name = "lcmediaserver"
-version = "0.1.0"
+[workspace.package]
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
-description = "A lightweight, scalable media server with on-the-fly transcoding"
+rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/lcanzonetti/lcmediaserver"
+repository = "https://github.com/lcanzonetti/lc_play"
 
-[[bin]]
-name = "lcmediaserver"
-path = "src/main.rs"
+# One place to pin versions shared by several crates.
+[workspace.dependencies]
+lc-proto = { path = "crates/lc-proto" }
+lc-time = { path = "crates/lc-time" }
+lc-discovery = { path = "crates/lc-discovery" }
+lc-net = { path = "crates/lc-net" }
+lc-director = { path = "crates/lc-director" }
 
-[dependencies]
+anyhow = "1"
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "signal", "sync", "time", "io-util"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
-tokio-util = { version = "0.7", features = ["io"] }
+clap = { version = "4", features = ["derive"] }
 futures = "0.3"
-pin-project-lite = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = "0.5"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util", "process"] }
+tokio-tungstenite = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-walkdir = "2"
-mime_guess = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

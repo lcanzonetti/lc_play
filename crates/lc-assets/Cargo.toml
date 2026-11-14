@@ -1,0 +1,27 @@
+[package]
+name = "lc-assets"
+description = "LC Play asset manager: scans, streams (HTTP Range) and transcodes media for the cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lc-assets"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tokio-util = { version = "0.7", features = ["io"] }
+pin-project-lite = "0.2"
+walkdir = "2"
+mime_guess = "2"

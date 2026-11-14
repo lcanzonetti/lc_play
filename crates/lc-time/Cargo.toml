@@ -1,0 +1,13 @@
+[package]
+name = "lc-time"
+description = "LC Play cluster time: clock-offset estimator, UDP sync protocol, transport timeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lc-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true

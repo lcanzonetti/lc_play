@@ -159,7 +159,7 @@ impl Gpu {
         // 3×4K panorama needs the full size the GPU supports.
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
-                label: Some("lcme-device"),
+                label: Some("lc-runner-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,

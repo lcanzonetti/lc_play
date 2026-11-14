@@ -1,0 +1,17 @@
+[package]
+name = "lc-net"
+description = "LC Play control channel: WebSocket client used by Runners, Producers and controllers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lc-proto.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

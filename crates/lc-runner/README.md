@@ -1,4 +1,4 @@
-# lcmediaserver-engine (`lcme`)
+# lc-runner — display server
 
 A **multi-output canvas playback engine** — the WATCHOUT / disguise / Pixera
 category. Arrange displays on a virtual canvas, place content across them
@@ -9,9 +9,27 @@ synchronized.
 
 Built in Rust on **wgpu** (Vulkan/Metal/DX12) + **winit**.
 
+> Part of **LC Play** (see the [repository README](../../README.md)). A Runner
+> is this renderer plus a cluster **agent** (clock sync, Director link, cache).
+> This document covers the renderer and the show file; the cluster side is in
+> [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
+
+## Running modes
+
+```bash
+lc-runner show.json                            # stand-alone: local clock, keyboard transport
+lc-runner show.json --director 10.0.0.1:7401   # renders show.json, timed by the Director
+lc-runner show.json --discover                 # same, Director found by multicast
+lc-runner --headless --discover                # no window/GPU: sync agent only
+```
+
+Add `--cache-dir <dir>` so the Runner keeps its identity, show and transport
+across restarts, and `--name <name>` to label it for the operator. Under a
+Director the transport keys are disabled (one node must not move alone).
+
 > **Status: Phase 1 foundation.** This runs today with image and solid-color
 > content, full affine placement, per-output corner-warp + edge-blend +
-> orientation, and synchronized transport. Video, live sources, and audio are
+> orientation, and synchronized transport (cluster-wide when a Director is present). Video, live sources, and audio are
 > scaffolded behind clear boundaries and land in later phases (see
 > [Roadmap](#roadmap)). The compositor is tested by rendering real frames
 > offscreen on a software GPU (blend, compositing, warp). Windowing on
@@ -48,9 +66,9 @@ layers ──▶ [scene pass] ──▶ canvas-slice texture ──▶ [warp + e
 ## Build & run
 
 ```bash
-cargo run -p lcmediaserver-engine --release                                       # bundled examples/show.json
-cargo run -p lcmediaserver-engine --release -- engine/examples/preview-3-screens.json
-cargo run -p lcmediaserver-engine --release -- /path/to/my-show.json
+cargo run -p lc-runner --release                                       # bundled examples/show.json
+cargo run -p lc-runner --release -- crates/lc-runner/examples/preview-3-screens.json
+cargo run -p lc-runner --release -- /path/to/my-show.json
 ```
 
 On Linux the windowing layer needs `libxkbcommon-x11-0` (present on desktop
@@ -102,7 +120,7 @@ the show is valid.
 seams, the circle must stay round, corner blocks show orientation):
 
 ```bash
-python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
+python3 crates/lc-runner/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 ```
 
 ### Transport controls
@@ -179,7 +197,7 @@ python3 engine/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 ## Development
 
 ```bash
-cargo test -p lcmediaserver-engine
+cargo test -p lc-runner
 ```
 
 Besides unit tests for the math, the suite renders real frames offscreen and
@@ -191,13 +209,11 @@ on every push.
 
 ## Roadmap
 
-- **Phase 1 (now):** canvas/output/layer model, JSON show, master clock + transport,
-  scene compositor with full affine transforms, image + color content,
-  per-output corner-warp + edge-blend + orientation, multi-output spanning.
-- **Phase 2:** video decode via `ffmpeg-next` (`--features video`) with
-  clock-synced frames; audio out via `cpal` (`--features audio`).
-- **Phase 3:** live inputs (NDI/capture), freeform mesh-warp editor, a timeline/
-  cue editor and operator UI, and a network time source for multi-machine shows.
+See [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-roadmap). Renderer
+items still open: video decode via `ffmpeg-next` (`--features video`), audio
+via `cpal` (`--features audio`), rendering the show distributed by the
+Director (today the Runner renders the show file given on its command line),
+live inputs, freeform mesh warp.
 
 ## License
 

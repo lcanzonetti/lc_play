@@ -1,21 +1,16 @@
+# Image for the Asset Manager (lc-assets). The other services (Director,
+# Runner) are meant to run natively on show hardware.
+
 # ---- build stage ----
 FROM rust:1-slim AS build
 WORKDIR /app
 
-# Pre-cache dependencies: copy manifests, build a stub, then the real sources.
-# The repo is a Cargo workspace, so the engine's manifest (plus a stub source)
-# must exist for cargo to load it; `-p lcmediaserver` builds only the server.
+# The repo is a Cargo workspace: cargo needs every member's manifest to load
+# it, so the whole tree is copied. `-p lc-assets` then compiles only the asset
+# manager and its dependencies (none of the GPU stack).
 COPY Cargo.toml Cargo.lock ./
-COPY engine/Cargo.toml engine/Cargo.toml
-RUN mkdir -p src engine/src \
-    && echo "fn main() {}" > src/main.rs \
-    && echo "fn main() {}" > engine/src/main.rs \
-    && cargo build --release --locked -p lcmediaserver \
-    && rm -rf src
-
-COPY src ./src
-# Touch main so cargo rebuilds it against the cached deps.
-RUN touch src/main.rs && cargo build --release --locked -p lcmediaserver
+COPY crates ./crates
+RUN cargo build --release --locked -p lc-assets
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim AS runtime
@@ -25,7 +20,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app/target/release/lcmediaserver /usr/local/bin/lcmediaserver
+COPY --from=build /app/target/release/lc-assets /usr/local/bin/lc-assets
 
 # Sensible container defaults; override at runtime as needed.
 ENV LCMS_BIND=0.0.0.0:8080 \
@@ -39,4 +34,4 @@ EXPOSE 8080
 RUN useradd --system --uid 10001 lcms
 USER lcms
 
-ENTRYPOINT ["lcmediaserver"]
+ENTRYPOINT ["lc-assets"]

@@ -2,12 +2,16 @@
 //!
 //! On start it creates one borderless window per output, brings up the GPU,
 //! loads each layer's content once, then drives a continuous frame loop. Each
-//! frame samples the [`Clock`] **once** and renders every output from that
+//! frame samples the [`Playhead`] **once** and renders every output from that
 //! single timestamp in one GPU submission, so outputs never disagree about
 //! show time. Pacing comes from vsync (FIFO present).
 //!
-//! Keyboard transport: Space = play/pause, ←/→ = seek ±5s, ↓/↑ = seek ±30s,
-//! Esc = quit.
+//! The playhead is the only link to the rest of the cluster: stand-alone it
+//! runs on the local clock, under a Director it follows cluster time — the
+//! renderer cannot tell the difference and never waits for the network.
+//!
+//! Keyboard transport (stand-alone only): Space = play/pause, ←/→ = seek ±5s,
+//! ↓/↑ = seek ±30s. Esc = quit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,8 +24,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::clock::Clock;
+use lc_proto::NANOS_PER_SEC;
+use lc_time::TransportChange;
+
 use crate::content::{self, Content, TextureFactory};
+use crate::playhead::Playhead;
 use crate::render::{Gpu, OutputGpu};
 use crate::show::Show;
 
@@ -34,7 +41,7 @@ struct RenderWindow {
 
 pub struct App {
     show: Show,
-    clock: Clock,
+    playhead: Arc<Playhead>,
     gpu: Option<Gpu>,
     contents: Vec<Box<dyn Content>>,
     windows: Vec<RenderWindow>,
@@ -53,27 +60,22 @@ struct FrameStats {
 impl FrameStats {
     const PERIOD: Duration = Duration::from_secs(5);
 
-    fn tick(&mut self, show_time: f64) {
+    /// Count a frame; every `PERIOD` return the measured frame rate.
+    fn tick(&mut self) -> Option<f64> {
         self.frames += 1;
         let elapsed = self.since.elapsed();
-        if elapsed >= Self::PERIOD {
-            let fps = self.frames as f64 / elapsed.as_secs_f64();
-            tracing::info!("{fps:.1} fps (show time {show_time:.1}s)");
-            self.frames = 0;
-            self.since = Instant::now();
+        if elapsed < Self::PERIOD {
+            return None;
         }
+        let fps = self.frames as f64 / elapsed.as_secs_f64();
+        self.frames = 0;
+        self.since = Instant::now();
+        Some(fps)
     }
 }
 
 impl App {
-    pub fn new(show: Show) -> Self {
-        // Only wrap the clock when looping is explicitly requested.
-        let loop_len = show
-            .playback
-            .looping
-            .then_some(show.playback.duration)
-            .flatten();
-        let clock = Clock::new(show.playback.autoplay, loop_len);
+    pub fn new(show: Show, playhead: Arc<Playhead>) -> Self {
         let mut draw_order: Vec<usize> = (0..show.layers.len()).collect();
         draw_order.sort_by(|&a, &b| {
             show.layers[a]
@@ -84,7 +86,7 @@ impl App {
         });
         App {
             show,
-            clock,
+            playhead,
             gpu: None,
             contents: Vec::new(),
             windows: Vec::new(),
@@ -186,12 +188,29 @@ impl App {
             .collect();
     }
 
+    /// A transport key was pressed. Honoured only on a stand-alone Runner:
+    /// under a Director, one node moving its own playhead would put it out
+    /// of sync with every other Runner.
+    fn local_transport(&mut self, change: TransportChange) {
+        if self.playhead.is_clustered() {
+            tracing::warn!("transport keys are disabled: this runner follows a Director");
+        } else {
+            self.playhead.apply_local(change);
+        }
+    }
+
+    fn seek_by(&mut self, seconds: i64) {
+        self.local_transport(TransportChange::SeekBy(seconds * NANOS_PER_SEC));
+    }
+
     /// Render all outputs for one show-clock sample, then present them together.
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
-        let now = self.clock.now();
+        // One sample per frame, shared by every output.
+        let position = self.playhead.position();
+        let now = position.show_seconds();
         for c in &mut self.contents {
             c.update(now, &gpu.queue);
         }
@@ -206,7 +225,14 @@ impl App {
             rw.window.pre_present_notify();
         }
         let errors = frame.present();
-        self.stats.tick(now);
+        if let Some(fps) = self.stats.tick() {
+            // Reported to the Director with the next health message.
+            self.playhead.report_fps(fps as f32);
+            tracing::info!(
+                "{fps:.1} fps (show time {now:.1}s, frame {})",
+                position.frame
+            );
+        }
 
         for (idx, err) in errors {
             let rw = &mut self.windows[idx];
@@ -239,7 +265,7 @@ fn window_attributes(
         output.canvas_rect.h.max(1.0) as u32,
     ]);
     let mut attrs = Window::default_attributes()
-        .with_title(format!("lcme · {}", output.id))
+        .with_title(format!("lc-runner · {}", output.id))
         .with_inner_size(PhysicalSize::new(size[0], size[1]));
 
     if let Some([x, y]) = output.window.position {
@@ -292,11 +318,18 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Named(NamedKey::Space) => self.clock.toggle(),
-                    Key::Named(NamedKey::ArrowRight) => self.clock.seek_by(5.0),
-                    Key::Named(NamedKey::ArrowLeft) => self.clock.seek_by(-5.0),
-                    Key::Named(NamedKey::ArrowUp) => self.clock.seek_by(30.0),
-                    Key::Named(NamedKey::ArrowDown) => self.clock.seek_by(-30.0),
+                    Key::Named(NamedKey::Space) => {
+                        let playing = self.playhead.position().transport.playing;
+                        self.local_transport(if playing {
+                            TransportChange::Pause
+                        } else {
+                            TransportChange::Play
+                        });
+                    }
+                    Key::Named(NamedKey::ArrowRight) => self.seek_by(5),
+                    Key::Named(NamedKey::ArrowLeft) => self.seek_by(-5),
+                    Key::Named(NamedKey::ArrowUp) => self.seek_by(30),
+                    Key::Named(NamedKey::ArrowDown) => self.seek_by(-30),
                     _ => {}
                 }
             }

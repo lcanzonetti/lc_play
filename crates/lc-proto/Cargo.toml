@@ -1,0 +1,13 @@
+[package]
+name = "lc-proto"
+description = "LC Play wire protocol: control messages, transport state, discovery beacon. Pure data, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
