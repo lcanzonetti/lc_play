@@ -188,25 +188,32 @@ PTP-disciplined system clock without changing anything above it.
 | Event | What happens | Verified by |
 |---|---|---|
 | Director crashes / is unplugged | Runners log `HOLDOVER`, keep rendering the right frames from their last transport state and drift estimate, retry the connection with back-off (0.5–5 s). | integration test, manual |
-| Director returns (new process, new clock) | It starts *unanchored*. The first Runner's `hello` carries the timebase it kept alive; the Director **adopts** it (clock id, current cluster time, transport) rather than imposing a new one. Runners re-lock by slewing — no step. | integration test (zero clock steps asserted), manual |
+| Director returns (new process, new clock) | It starts *unanchored*. The first Runner's `hello` carries the timebase it kept alive; the Director **adopts** it (clock id, current cluster time, transport) rather than imposing a new one. Runners re-lock by slewing, without a step as long as their clocks stayed within 20 ms of each other during the outage. If a later Runner holds a newer transport state than the one adopted, the Director takes that and re-broadcasts it. | integration test (zero clock steps asserted), manual |
 | Director returns but no Runner kept running | It restores show and position from disk, **paused**: nothing can tell it how much time passed. | test |
 | A Runner dies | The others are unaffected; the Director drops it after ≤ 6 s of silence. | integration test |
 | A Runner restarts with no Director around | It restores show and transport from its cache and resumes from the last transport change. | integration test |
 | Control link dead but TCP not yet aware (cable pull) | Both sides use application keepalives: Director drops after 6 s silence, Runner reconnects after 5 s without an answer. | by construction; not tested with a real cable |
-| Message loss / duplication / reordering | Epochs make transport delivery idempotent; a client that falls behind is sent the current state. | unit tests |
+| Message loss / duplication / reordering | Epochs make transport delivery idempotent; a client that falls behind the Director's broadcast queue is re-sent the current transport and show. | unit tests (epochs); lag path by construction |
+| Director started and stopped without any Runner reaching it | Its saved timebase and transport are left untouched, so a later start can still adopt. | test |
+| Runner connected but clock-sync UDP blocked | The picture is held (the new timebase is unmeasured) and the Runner logs an error naming the port after 3 s. | by construction; not tested |
 
 Known gaps:
 
 * **The Director is a single point of failure for *control*** (not for
   playback): while it is down nobody can pause or cue. A hot standby is M6;
   `epoch` and `clock_id` are designed to arbitrate between two Directors.
-* **Adoption trusts the first Runner.** If Runners drifted apart during a long
-  holdover, the others are slewed (or, beyond 20 ms, stepped) to the first
-  one's time. With a state directory the Director only adopts the timebase it
+* **Adoption trusts the first Runner's clock.** If Runners drifted apart
+  during a long holdover, the others are slewed (or, beyond 20 ms, stepped —
+  a visible jump on those Runners) to the first one's time. With a state directory the Director only adopts the timebase it
   served before; without one it adopts whatever it is offered.
 * **Two Directors on one network** are not arbitrated: Runners follow the one
   they were pointed at or heard first.
-* **No authentication or encryption.** Closed show networks only.
+* **No authentication or encryption**, and no `Origin` check on the
+  WebSocket: any page open in a browser on the show network could drive the
+  transport. Closed show networks only.
+* **A panic in the Director is fatal in release builds** (`panic = "abort"`).
+  Arithmetic on values from the wire is overflow-safe, but there is no
+  supervisor: run it under one (systemd, a service manager).
 
 ## 5. Runner internals
 

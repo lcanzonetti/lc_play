@@ -25,6 +25,9 @@ use lc_time::{next_state, ClusterClock, TransportChange, TransportTimeline};
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShowDoc {
     pub revision: u64,
+    /// Unique per load on the Director; identifies this exact document.
+    #[serde(default)]
+    pub id: String,
     pub document: serde_json::Value,
 }
 

@@ -123,8 +123,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Action::Rate { rate } => {
-            if !rate.is_finite() {
-                bail!("rate: not a number");
+            if !(rate.is_finite() && rate.abs() <= 16.0) {
+                bail!("rate: must be between -16 and 16");
             }
             Command::SetRate {
                 rate_permille: (rate * 1000.0).round() as i32,
@@ -280,7 +280,10 @@ fn print_status(s: &ClusterStatus) {
                 match n.frame_error {
                     Some(0) => "on frame".to_string(),
                     Some(e) => format!("{e:+} FRAMES"),
-                    None => "frame n/a".to_string(),
+                    // The Runner is executing a different transport state
+                    // than the Director: normal for an instant around a
+                    // change, a problem if it persists.
+                    None => format!("EPOCH {} (director {})", h.transport_epoch, t.epoch),
                 },
                 if h.sync.locked { "locked" } else { "UNLOCKED" },
                 h.sync.error_ns / 1000,

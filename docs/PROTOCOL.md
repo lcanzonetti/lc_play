@@ -34,7 +34,7 @@ least every 6 s (`ping` or `health`), or it is dropped.
 
 ```json
 { "type": "hello", "protocol": 1, "node_id": "…", "role": "runner", "name": "left",
-  "runner": { "show_revision": 3, "clock_id": 1234,
+  "runner": { "show_revision": 3, "show_id": "…uuid…", "clock_id": 1234,
               "cluster_now_ns": 98765432100, "transport": { … } } }
 { "type": "command", "command": { "type": "play" } }
 { "type": "health", "cluster_ns": 0, "show_ns": 0, "frame": 0, "transport_epoch": 2,
@@ -44,9 +44,12 @@ least every 6 s (`ping` or `health`), or it is dropped.
 { "type": "ping" }
 ```
 
-`runner` is only sent by Runners. `clock_id`, `cluster_now_ns` and `transport`
-are present only when the Runner is still following a timebase (holdover);
-they allow a restarted Director to adopt it.
+`runner` is only sent by Runners. `show_id` identifies the cached show; the
+Director sends the show unless it matches (revisions are for humans — they
+restart if a Director loses its state, ids are unique per load). `clock_id`,
+`cluster_now_ns` and `transport` are present only when the Runner is still
+following a timebase (holdover); they allow a restarted Director to adopt it,
+and a Director to pick up a transport state newer than its own.
 
 Commands:
 
@@ -69,7 +72,7 @@ receives them, simultaneously on all Runners.
   "clock_id": 1234, "sync_port": 7402, "lead_ns": 100000000,
   "frame_rate": { "num": 60, "den": 1 }, "transport": { … }, "show_revision": 3 }
 { "type": "transport", "clock_id": 1234, "state": { … } }
-{ "type": "show", "revision": 3, "document": { … } }
+{ "type": "show", "revision": 3, "id": "…uuid…", "document": { … } }
 { "type": "cluster", "clock_id": 1234, "cluster_ns": 0, "frame_rate": { … },
   "transport": { … }, "show_ns": 0, "frame": 0, "show_revision": 3,
   "nodes": [ { "node_id": "…", "role": "runner", "name": "left", "addr": "10.0.0.11:51000",
@@ -125,8 +128,10 @@ offset = ((t2 − t1) + (t3 − t4)) / 2
 delay  =  (t4 − t1) − (t3 − t2)
 ```
 
-Responses carrying a `clock_id` other than the one announced in `welcome` are
-ignored: which Director to follow is decided on the control channel only.
+Responses are matched to requests by `seq` and the echoed `t1`, not by source
+address (a multi-homed Director may answer from another address). Responses
+carrying a `clock_id` other than the one announced in `welcome` are ignored:
+which Director to follow is decided on the control channel only.
 
 ## 4. HTTP helpers
 

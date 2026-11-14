@@ -1,7 +1,8 @@
 //! Persistence of the Director's state across restarts.
 //!
-//! One small JSON file, replaced atomically (write a temp file, then rename)
-//! so a power cut can never leave a half-written state behind.
+//! One small JSON file, replaced atomically: write a temp file, flush it to
+//! disk, then rename it over the old one. A power cut leaves either the old
+//! state or the new one, not half a file.
 
 use std::path::Path;
 
@@ -14,6 +15,9 @@ const FILE: &str = "director.json";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShowDoc {
     pub revision: u64,
+    /// Unique per load; what Runners compare their cache against.
+    #[serde(default)]
+    pub id: String,
     pub document: serde_json::Value,
 }
 
@@ -52,9 +56,17 @@ pub async fn save(dir: &Path, state: &Persisted) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
     let (tmp, path) = (dir.join(format!("{FILE}.tmp")), dir.join(FILE));
-    tokio::fs::write(&tmp, serde_json::to_vec_pretty(state)?)
-        .await
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    let bytes = serde_json::to_vec_pretty(state)?;
+    async {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(&bytes).await?;
+        // Without this the rename can reach the disk before the data does,
+        // and a power cut would leave an empty file under the final name.
+        file.sync_all().await
+    }
+    .await
+    .with_context(|| format!("writing {}", tmp.display()))?;
     tokio::fs::rename(&tmp, &path)
         .await
         .with_context(|| format!("replacing {}", path.display()))?;

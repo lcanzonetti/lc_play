@@ -59,7 +59,7 @@ use tokio::task::JoinHandle;
 pub use store::{Persisted, ShowDoc};
 
 /// Fastest/slowest playback rate accepted (±16×).
-const MAX_RATE_PERMILLE: i32 = 16_000;
+const MAX_RATE_PERMILLE: u32 = 16_000;
 
 pub struct DirectorConfig {
     pub name: String,
@@ -122,6 +122,9 @@ struct State {
     /// Timebase this Director served before its last shutdown, if known. Only
     /// that one may be adopted (when nothing is known, any may).
     previous_clock: Option<ClockId>,
+    /// The transport exactly as it was saved, anchors and all. Meaningless
+    /// in a new timebase, but valid again if `previous_clock` is adopted.
+    saved_transport: Option<TransportState>,
 }
 
 impl Core {
@@ -130,6 +133,7 @@ impl Core {
         let clock_id = (uuid::Uuid::new_v4().as_u128() as u64).max(1);
         let clock = Arc::new(MasterClock::new(cfg.local_clock.clone(), clock_id));
 
+        let saved_transport = persisted.as_ref().map(|p| p.transport);
         let (id, transport, show, previous_clock) = match persisted {
             Some(p) => {
                 // The saved anchors refer to a clock that no longer exists.
@@ -161,6 +165,7 @@ impl Core {
                 next_conn: 0,
                 anchored: false,
                 previous_clock,
+                saved_transport,
             }),
             events: broadcast::channel(64).0,
             dirty: Notify::new(),
@@ -196,6 +201,29 @@ impl Core {
             // From the first Runner on there is a cluster to keep consistent:
             // the timebase is fixed for the lifetime of this process.
             st.anchored = true;
+
+            // A Runner on our timebase may hold a transport state newer than
+            // ours: the Director crashed before saving it, or adopted from a
+            // Runner that had missed the last change. Take it and tell
+            // everyone — otherwise that Runner would stay on its own state
+            // and silently ignore our next commands as "older".
+            if let Some(runner) = &hello.runner {
+                let same_timebase = runner.clock_id == Some(self.clock.clock_id());
+                if let Some(state) = runner.transport.filter(|_| same_timebase) {
+                    if st.timeline.push(state) {
+                        tracing::info!(
+                            "runner '{}' holds a newer transport (epoch {}); taking it over",
+                            hello.name,
+                            state.epoch
+                        );
+                        self.publish(ServerMessage::Transport {
+                            clock_id: self.clock.clock_id(),
+                            state,
+                        });
+                        self.dirty.notify_one();
+                    }
+                }
+            }
         }
 
         let conn = st.next_conn;
@@ -229,11 +257,13 @@ impl Core {
         };
         st.timeline.prune(now);
 
-        let cached = hello.runner.as_ref().and_then(|r| r.show_revision);
+        // Compared by id, not revision: revisions restart when a Director
+        // loses its state, ids never repeat.
+        let cached = hello.runner.as_ref().and_then(|r| r.show_id.as_deref());
         let show = st
             .show
             .as_ref()
-            .filter(|s| hello.role == Role::Runner && cached != Some(s.revision))
+            .filter(|s| hello.role == Role::Runner && cached != Some(s.id.as_str()))
             .cloned();
         (conn, welcome, show)
     }
@@ -255,11 +285,19 @@ impl Core {
         // Every Runner then slews onto this clock, so that error is shared
         // and invisible.
         self.clock.adopt(clock_id, cluster_now);
-        match runner.transport {
-            Some(transport) if transport.epoch >= st.timeline.latest().epoch => {
-                st.timeline.replace(transport);
-            }
-            _ => {
+        // Which transport continues? The Runner's, or — if this is the very
+        // timebase we served before — the one we saved, whose anchors are
+        // valid again now. The newer of the two wins.
+        let own_saved = st
+            .saved_transport
+            .filter(|_| st.previous_clock == Some(clock_id));
+        let newest = [runner.transport, own_saved]
+            .into_iter()
+            .flatten()
+            .max_by_key(|t| t.epoch);
+        match newest {
+            Some(transport) => st.timeline.replace(transport),
+            None => {
                 // Keep our own state, but its anchor was written against the
                 // pre-adoption clock: re-anchor it "now" in the adopted one.
                 let mut own = st.timeline.latest();
@@ -286,16 +324,17 @@ impl Core {
     /// Record a Runner's health report, and judge it: is its clock where
     /// ours is, and is it on the frame the transport prescribes?
     pub fn health(&self, conn: u64, health: Health) {
-        let skew = health.cluster_ns - self.clock.now_ns();
+        // Values from the wire: never let arithmetic on them overflow.
+        let skew = health.cluster_ns.saturating_sub(self.clock.now_ns());
         let mut st = self.state();
         // Only comparable while the Runner executes the state we would pick
         // for that instant (around a transport change it may be one behind).
         let expected = st.timeline.state_at(health.cluster_ns);
         let frame_error = (expected.epoch == health.transport_epoch).then(|| {
-            health.frame
-                - self
-                    .frame_rate
-                    .frame_at(expected.show_time_at(health.cluster_ns))
+            health.frame.saturating_sub(
+                self.frame_rate
+                    .frame_at(expected.show_time_at(health.cluster_ns)),
+            )
         });
         if let Some(node) = st.nodes.get_mut(&conn) {
             node.clock_skew_ns = Some(skew);
@@ -312,7 +351,9 @@ impl Core {
             Command::Pause => TransportChange::Pause,
             Command::Seek { show_ns } if show_ns >= 0 => TransportChange::Seek(show_ns),
             Command::Seek { .. } => return Err("seek: show time must not be negative".into()),
-            Command::SetRate { rate_permille } if rate_permille.abs() <= MAX_RATE_PERMILLE => {
+            Command::SetRate { rate_permille }
+                if rate_permille.unsigned_abs() <= MAX_RATE_PERMILLE =>
+            {
                 TransportChange::SetRate(rate_permille)
             }
             Command::SetRate { .. } => {
@@ -355,12 +396,21 @@ impl Core {
         }
         let mut st = self.state();
         let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
+        // A fresh id per load: unlike the revision counter it can never
+        // collide with a show some Runner cached from an earlier life of
+        // this Director.
+        let id = uuid::Uuid::new_v4().to_string();
         st.show = Some(ShowDoc {
             revision,
+            id: id.clone(),
             document: document.clone(),
         });
         drop(st);
-        self.publish(ServerMessage::Show { revision, document });
+        self.publish(ServerMessage::Show {
+            revision,
+            id,
+            document,
+        });
         self.dirty.notify_one();
         Ok(())
     }
@@ -387,12 +437,31 @@ impl Core {
         self.state().timeline.latest()
     }
 
+    /// The current show, if any.
+    pub fn show(&self) -> Option<ShowDoc> {
+        self.state().show.clone()
+    }
+
     fn snapshot(&self) -> Persisted {
         let st = self.state();
+        // Until this Director has committed to a timebase, what is on disk
+        // (the timebase and transport of its previous life) is still the
+        // best record there is, and the only thing that lets it adopt a
+        // cluster that kept running. Do not overwrite it with the
+        // provisional clock id and paused transport of a start that no
+        // Runner ever reached.
+        let (clock_id, transport) = if st.anchored {
+            (self.clock.clock_id(), st.timeline.latest())
+        } else {
+            (
+                st.previous_clock.unwrap_or_else(|| self.clock.clock_id()),
+                st.saved_transport.unwrap_or_else(|| st.timeline.latest()),
+            )
+        };
         Persisted {
             node_id: self.id.clone(),
-            clock_id: self.clock.clock_id(),
-            transport: st.timeline.latest(),
+            clock_id,
+            transport,
             show: st.show.clone(),
         }
     }

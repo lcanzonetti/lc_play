@@ -123,7 +123,13 @@ pub async fn run_sync_client(
                     timeout_at(deadline, socket.recv_from(&mut buf)).await
                 {
                     let t4 = clock.local_now_ns();
-                    if from != addr || len != PACKET_LEN {
+                    // Matched by content (seq + our own t1, a nanosecond
+                    // timestamp nobody else knows), not by source address: a
+                    // multi-homed Director may answer from another of its
+                    // addresses, and dropping those would leave the Runner
+                    // unsynced with no visible cause.
+                    let _ = from;
+                    if len != PACKET_LEN {
                         continue;
                     }
                     match SyncPacket::decode(&buf[..len]) {

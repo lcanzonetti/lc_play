@@ -101,17 +101,34 @@ async fn send(socket: &mut WebSocket, msg: &ServerMessage) -> Result<(), String>
         .map_err(|e| format!("send failed: {e}"))
 }
 
+/// Why reading a client message failed.
+enum ReadError {
+    /// The frame arrived but is not a valid message: the sender's bug. The
+    /// link itself is fine.
+    Malformed(String),
+    /// The connection is broken.
+    Link(String),
+}
+
+impl ReadError {
+    fn into_message(self) -> String {
+        match self {
+            ReadError::Malformed(m) | ReadError::Link(m) => m,
+        }
+    }
+}
+
 /// Read frames until the next text frame and parse it. `Ok(None)` means the
 /// peer closed the connection.
-async fn next_message(socket: &mut WebSocket) -> Result<Option<ClientMessage>, String> {
+async fn next_message(socket: &mut WebSocket) -> Result<Option<ClientMessage>, ReadError> {
     loop {
         match socket.recv().await {
             None | Some(Ok(Message::Close(_))) => return Ok(None),
-            Some(Err(e)) => return Err(format!("receive failed: {e}")),
+            Some(Err(e)) => return Err(ReadError::Link(format!("receive failed: {e}"))),
             Some(Ok(Message::Text(text))) => {
                 return serde_json::from_str(text.as_str())
                     .map(Some)
-                    .map_err(|e| format!("malformed message: {e}"));
+                    .map_err(|e| ReadError::Malformed(format!("malformed message: {e}")));
             }
             // Ping/pong are handled by axum; binary frames are not part of
             // the protocol.
@@ -133,6 +150,7 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
         }
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(e)) => {
+            let e = e.into_message();
             let _ = send(&mut socket, &error(&e)).await;
             return Err(e);
         }
@@ -157,11 +175,7 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
     let result = async {
         send(&mut socket, &ServerMessage::Welcome(welcome)).await?;
         if let Some(show) = show {
-            let msg = ServerMessage::Show {
-                revision: show.revision,
-                document: show.document,
-            };
-            send(&mut socket, &msg).await?;
+            send(&mut socket, &show_message(show)).await?;
         }
 
         // Runners do not need the cluster overview; everyone else gets it.
@@ -193,6 +207,12 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                             state: core.transport(),
                         };
                         send(&mut socket, &msg).await?;
+                        // The same goes for the show: one of the dropped
+                        // messages may have been a new revision. Re-sending
+                        // is rare (only after a lag) and idempotent.
+                        if let Some(show) = core.show() {
+                            send(&mut socket, &show_message(show)).await?;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
@@ -211,8 +231,8 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                         Ok(None) => return Ok(()),
                         // A message we cannot parse is the sender's bug, not
                         // a reason to drop a Runner mid-show: report it.
-                        Err(e) if e.starts_with("malformed") => send(&mut socket, &error(&e)).await?,
-                        Err(e) => return Err(e),
+                        Err(ReadError::Malformed(e)) => send(&mut socket, &error(&e)).await?,
+                        Err(ReadError::Link(e)) => return Err(e),
                         Ok(Some(ClientMessage::Ping)) => send(&mut socket, &ServerMessage::Pong).await?,
                         Ok(Some(ClientMessage::Health(health))) => core.health(conn, health),
                         Ok(Some(ClientMessage::Hello(_))) => {
@@ -238,6 +258,14 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
     core.unregister(conn);
     tracing::info!("{:?} '{}' disconnected", hello.role, hello.name);
     result
+}
+
+fn show_message(show: crate::ShowDoc) -> ServerMessage {
+    ServerMessage::Show {
+        revision: show.revision,
+        id: show.id,
+        document: show.document,
+    }
 }
 
 fn error(message: &str) -> ServerMessage {

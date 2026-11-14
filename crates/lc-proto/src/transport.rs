@@ -52,12 +52,14 @@ impl TransportState {
     /// never ask: the timeline keeps using the previous state until the anchor
     /// is reached). 128-bit intermediate so `elapsed * rate` cannot overflow.
     pub fn show_time_at(&self, cluster_ns: i64) -> i64 {
+        // All in i128: these values can come off the wire, and no input may
+        // overflow.
         let elapsed = if self.playing {
-            (cluster_ns - self.anchor_cluster_ns).max(0)
+            (cluster_ns as i128 - self.anchor_cluster_ns as i128).max(0)
         } else {
             0
         };
-        let advanced = (elapsed as i128 * self.rate_permille as i128).div_euclid(1000);
+        let advanced = (elapsed * self.rate_permille as i128).div_euclid(1000);
         let raw = self.anchor_show_ns as i128 + advanced;
         let wrapped = match self.loop_ns {
             Some(len) if len > 0 => raw.rem_euclid(len as i128),

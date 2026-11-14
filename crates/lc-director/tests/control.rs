@@ -7,7 +7,8 @@ use std::time::Duration;
 use lc_director::{Director, DirectorConfig};
 use lc_net::{Connection, NetError};
 use lc_proto::{
-    ClientMessage, Command, Hello, NodeId, Role, ServerMessage, NANOS_PER_SEC, PROTOCOL_VERSION,
+    ClientMessage, Command, Hello, NodeId, Role, RunnerHello, ServerMessage, TransportState,
+    NANOS_PER_SEC, PROTOCOL_VERSION,
 };
 
 async fn start() -> Director {
@@ -104,6 +105,10 @@ async fn invalid_commands_are_refused_without_dropping_the_link() {
         Command::SetRate {
             rate_permille: 1_000_000,
         },
+        // |i32::MIN| does not fit in an i32; the limit check must not wrap.
+        Command::SetRate {
+            rate_permille: i32::MIN,
+        },
         Command::LoadShow {
             document: serde_json::json!("not an object"),
         },
@@ -189,4 +194,151 @@ async fn state_survives_a_restart_but_comes_back_paused() {
 
     second.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Runner that kept playing while the Director was away, as it introduces
+/// itself: following `clock_id`, executing `transport`.
+fn holdover_runner(name: &str, clock_id: u64, epoch: u64) -> Hello {
+    Hello {
+        role: Role::Runner,
+        name: name.into(),
+        runner: Some(RunnerHello {
+            clock_id: Some(clock_id),
+            cluster_now_ns: Some(500 * NANOS_PER_SEC),
+            transport: Some(TransportState {
+                epoch,
+                playing: true,
+                anchor_cluster_ns: 100 * NANOS_PER_SEC,
+                ..TransportState::STOPPED
+            }),
+            ..Default::default()
+        }),
+        ..hello(PROTOCOL_VERSION)
+    }
+}
+
+/// Wait for a transport message with exactly this epoch.
+async fn expect_transport(conn: &mut Connection, epoch: u64) -> TransportState {
+    loop {
+        match conn.recv_timeout(Duration::from_secs(3)).await.unwrap() {
+            ServerMessage::Transport { state, .. } if state.epoch == epoch => return state,
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_runner_holding_a_newer_transport_brings_the_cluster_up_to_date() {
+    // Runner A missed the last change (it is on epoch 4), Runner B has it
+    // (epoch 5). A restarted Director hears A first.
+    let director = start().await;
+    let url = lc_net::control_url(director.control_addr());
+
+    let (mut a, welcome_a) = Connection::connect(&url, || holdover_runner("a", 77, 4))
+        .await
+        .unwrap();
+    assert_eq!(welcome_a.clock_id, 77, "adopted A's timebase");
+    assert_eq!(welcome_a.transport.epoch, 4);
+
+    let (_b, welcome_b) = Connection::connect(&url, || holdover_runner("b", 77, 5))
+        .await
+        .unwrap();
+    // The Director must not hand B an older state (B would ignore it and
+    // the two Runners would stay apart) — it takes B's…
+    assert_eq!(welcome_b.transport.epoch, 5);
+    // …and brings A up to date.
+    assert_eq!(expect_transport(&mut a, 5).await.epoch, 5);
+
+    // The next operator command outranks both.
+    director.core().command(Command::Pause).unwrap();
+    assert!(!expect_transport(&mut a, 6).await.playing);
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_start_that_no_runner_reaches_does_not_spoil_adoption() {
+    let dir = std::env::temp_dir().join(format!("lcplay-test-unanchored-{}", NodeId::random()));
+    let cfg = || DirectorConfig {
+        control_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        sync_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        discovery: None,
+        state_dir: Some(dir.clone()),
+        ..Default::default()
+    };
+
+    // First life: a show is playing.
+    let first = Director::start(cfg()).await.unwrap();
+    let clock_id = first.core().clock.clock_id();
+    first.core().command(Command::Play).unwrap();
+    let playing = first.core().transport();
+    first.shutdown().await;
+
+    // Second life: started and stopped without anyone connecting (wrong
+    // flags, network not up yet, a supervisor restart).
+    Director::start(cfg()).await.unwrap().shutdown().await;
+
+    // Third life: the Runner that kept the show going finally reaches it.
+    let third = Director::start(cfg()).await.unwrap();
+    let url = lc_net::control_url(third.control_addr());
+    let (_runner, welcome) = Connection::connect(&url, || {
+        holdover_runner("survivor", clock_id, playing.epoch)
+    })
+    .await
+    .unwrap();
+    assert_eq!(welcome.clock_id, clock_id, "still adopts its old timebase");
+    assert!(welcome.transport.playing, "and the show keeps playing");
+    assert_eq!(welcome.transport, playing, "on the transport it saved");
+
+    third.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn shows_are_matched_by_id_not_by_revision() {
+    let director = start().await;
+    let url = lc_net::control_url(director.control_addr());
+    let document = serde_json::json!({ "name": "new show" });
+    director
+        .core()
+        .command(Command::LoadShow {
+            document: document.clone(),
+        })
+        .unwrap();
+    let current_id = director.core().show().unwrap().id;
+
+    let runner_with = |show_id: Option<String>| Hello {
+        role: Role::Runner,
+        runner: Some(RunnerHello {
+            // Same revision number as the Director's show in both cases.
+            show_revision: Some(1),
+            show_id,
+            ..Default::default()
+        }),
+        ..hello(PROTOCOL_VERSION)
+    };
+
+    // A Runner caching "revision 1" of some *other* show must get the show.
+    let (mut stale, _) = Connection::connect(&url, || runner_with(Some("old-show".into())))
+        .await
+        .unwrap();
+    match stale.recv_timeout(Duration::from_secs(3)).await.unwrap() {
+        ServerMessage::Show {
+            id, document: d, ..
+        } => {
+            assert_eq!((id, d), (current_id.clone(), document));
+        }
+        other => panic!("expected the show, got {other:?}"),
+    }
+
+    // A Runner that has exactly this show is not sent it again.
+    let (mut current, _) = Connection::connect(&url, || runner_with(Some(current_id)))
+        .await
+        .unwrap();
+    current.send(&ClientMessage::Ping).await.unwrap();
+    assert_eq!(
+        current.recv_timeout(Duration::from_secs(3)).await.unwrap(),
+        ServerMessage::Pong,
+        "nothing but the pong arrives"
+    );
+    director.shutdown().await;
 }

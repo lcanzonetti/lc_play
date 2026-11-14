@@ -198,8 +198,9 @@ impl ClusterClock {
     /// Returns whether the timebase changed.
     ///
     /// Only the control channel calls this (on `Welcome`): the decision which
-    /// Director to follow belongs to the authenticated, reliable channel, not
-    /// to whatever answers on the sync port.
+    /// Director to follow belongs to the reliable, ordered control channel
+    /// the Runner deliberately connected to, not to whatever answers on the
+    /// sync port.
     pub fn follow(&self, clock_id: ClockId) -> bool {
         let now = self.local.now_ns();
         let mut inner = self.lock();

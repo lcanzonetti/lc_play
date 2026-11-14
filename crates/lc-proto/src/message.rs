@@ -48,6 +48,11 @@ pub struct RunnerHello {
     /// re-sends the show when this differs from its own.
     #[serde(default)]
     pub show_revision: Option<u64>,
+    /// Id of that cached show. This, not the revision, decides whether the
+    /// cache is current: revision numbers restart if a Director loses its
+    /// state, ids are unique per load.
+    #[serde(default)]
+    pub show_id: Option<String>,
     /// Timebase the Runner is following (still, in holdover), if any.
     #[serde(default)]
     pub clock_id: Option<ClockId>,
@@ -140,7 +145,10 @@ pub enum ServerMessage {
     /// The show document. Sent to a Runner whose cached revision differs, and
     /// to everyone when a new show is loaded.
     Show {
+        /// Counts loads; for humans.
         revision: u64,
+        /// Unique per load; for cache comparison.
+        id: String,
         document: serde_json::Value,
     },
     /// Cluster overview (Producers / controllers; 1 Hz and on request).

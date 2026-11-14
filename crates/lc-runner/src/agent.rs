@@ -47,6 +47,13 @@ const DIRECTOR_SILENCE: Duration = Duration::from_secs(5);
 /// Reconnect back-off bounds.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// A session shorter than this counts as a failed attempt for back-off: a
+/// Director that accepts and immediately drops us must not be hammered.
+const SHORT_SESSION: Duration = Duration::from_secs(2);
+/// Connected this long without a single sync sample: say so. (The picture is
+/// held until the new timebase has been measured, so this is the one state
+/// in which a connected Runner shows a frozen frame.)
+const SYNC_WARN_AFTER: Duration = Duration::from_secs(3);
 /// How long one discovery attempt listens for a Director beacon.
 const DISCOVERY_WAIT: Duration = Duration::from_secs(5);
 
@@ -194,13 +201,19 @@ impl Link {
             match Connection::connect(&lc_net::control_url(addr), || self.hello()).await {
                 Ok((conn, welcome)) => {
                     tracing::info!("connected to director '{}' at {addr}", welcome.name);
-                    backoff = BACKOFF_MIN;
                     announced_failure = false;
+                    let started = Instant::now();
                     let reason = self.session(conn, welcome, addr).await;
                     self.playhead.set_connected(false);
                     tracing::warn!(
                         "lost director ({reason}); holding over on the last known state"
                     );
+                    if started.elapsed() < SHORT_SESSION {
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                    } else {
+                        backoff = BACKOFF_MIN;
+                    }
                 }
                 Err(e) => {
                     // Say it once, then stay quiet: a Runner may wait for its
@@ -252,6 +265,7 @@ impl Link {
             name: self.name.clone(),
             runner: Some(RunnerHello {
                 show_revision: self.playhead.show().map(|s| s.revision),
+                show_id: self.playhead.show().map(|s| s.id.clone()),
                 clock_id: reading.clock_id.filter(|_| holding),
                 cluster_now_ns: holding.then_some(reading.cluster_ns),
                 transport: holding.then(|| self.playhead.transport()),
@@ -279,6 +293,8 @@ impl Link {
         let mut report = interval(REPORT_PERIOD);
         report.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_heard = Instant::now();
+        let connected_at = Instant::now();
+        let mut warned_no_sync = false;
 
         loop {
             tokio::select! {
@@ -300,9 +316,12 @@ impl Link {
                                 self.save_transport();
                             }
                         }
-                        ServerMessage::Show { revision, document } => {
+                        ServerMessage::Show { revision, id, document } => {
+                            if playhead.show().is_some_and(|s| s.id == id) {
+                                continue; // a re-send of what we already have
+                            }
                             tracing::info!("received show revision {revision}");
-                            let show = ShowDoc { revision, document };
+                            let show = ShowDoc { revision, id, document };
                             if let Some(cache) = &self.cache {
                                 cache.save_show(&show);
                             }
@@ -317,6 +336,19 @@ impl Link {
 
                 _ = report.tick() => {
                     playhead.prune();
+                    if !warned_no_sync
+                        && connected_at.elapsed() > SYNC_WARN_AFTER
+                        && !playhead.clock.read(playhead.clock.local_now_ns()).synced
+                    {
+                        warned_no_sync = true;
+                        tracing::error!(
+                            "connected to the director but no clock-sync replies from {}:{} (UDP). \
+                             Playback is held until the clock is measured — check that this UDP \
+                             port is not blocked by a firewall",
+                            addr.ip(),
+                            welcome.sync_port
+                        );
+                    }
                     let health = ClientMessage::Health(self.health());
                     // Ping makes the Director answer, which is how *we*
                     // notice a dead link (see DIRECTOR_SILENCE).
@@ -357,8 +389,9 @@ impl Link {
 /// The Runner's on-disk cache: identity, last show, last transport.
 ///
 /// Files are small and written rarely (on operator actions), so plain
-/// synchronous I/O is used; each is replaced atomically via rename so a power
-/// cut leaves either the old or the new file, never half of one. Failures are
+/// synchronous I/O is used; each is written to a temp file, flushed to disk
+/// and renamed into place, so a power cut leaves either the old or the new
+/// file, not half of one. Failures are
 /// logged, never fatal: a Runner with a read-only disk must still play.
 struct Cache {
     dir: PathBuf,
@@ -383,7 +416,10 @@ impl Cache {
     fn write<T: serde::Serialize>(&self, file: &str, value: &T) {
         let result = (|| -> anyhow::Result<()> {
             let tmp = self.dir.join(format!("{file}.tmp"));
-            std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(value)?)?;
+            // Data must be on disk before the rename makes it the real file.
+            f.sync_all()?;
             std::fs::rename(&tmp, self.dir.join(file))?;
             Ok(())
         })();
