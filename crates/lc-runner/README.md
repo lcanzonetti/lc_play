@@ -17,23 +17,26 @@ Built in Rust on **wgpu** (Vulkan/Metal/DX12) + **winit**.
 ## Running modes
 
 ```bash
-lc-runner show.json                            # stand-alone: local clock, keyboard transport
-lc-runner show.json --director 10.0.0.1:7401   # renders show.json, timed by the Director
-lc-runner show.json --discover                 # same, Director found by multicast
-lc-runner --headless --discover                # no window/GPU: sync agent only
+lc-runner --director 10.0.0.1:7401     # cluster: show, media and timing from the Director
+lc-runner --discover                   # same, Director found by multicast
+lc-runner show.json                    # stand-alone: local show file, keyboard transport
+lc-runner show.json --director …       # local show file, timed by the Director
+lc-runner --headless --discover        # no window/GPU: sync agent only
 ```
 
-Add `--cache-dir <dir>` so the Runner keeps its identity, show and transport
-across restarts, and `--name <name>` to label it for the operator. Under a
-Director the transport keys are disabled (one node must not move alone).
+Add `--cache-dir <dir>` so the Runner keeps its identity, show, transport and
+downloaded media across restarts, and `--name <name>`: displays in the show
+are assigned to Runners by that name. Under a Director the transport keys
+are disabled (one node must not move alone).
 
-> **Status: Phase 1 foundation.** This runs today with image and solid-color
-> content, full affine placement, per-output corner-warp + edge-blend +
-> orientation, and synchronized transport (cluster-wide when a Director is present). Video, live sources, and audio are
-> scaffolded behind clear boundaries and land in later phases (see
-> [Roadmap](#roadmap)). The compositor is tested by rendering real frames
-> offscreen on a software GPU (blend, compositing, warp). Windowing on
-> physical multi-monitor hardware still needs a first bring-up on your machine.
+In cluster mode the Runner renders the Director's show document
+([format](../../docs/PROTOCOL.md#5-show-document)) and follows edits live.
+The rest of this document describes the renderer and the **local show file**
+format used in stand-alone mode; the two formats describe the same things
+(canvas, outputs/displays, layers/cues) and share the renderer.
+
+Video needs `ffmpeg` and `ffprobe` on the `PATH` (or `LCPLAY_FFMPEG` /
+`LCPLAY_FFPROBE`).
 
 ## Concepts
 
@@ -176,7 +179,7 @@ python3 crates/lc-runner/tools/test_pattern.py 3840 1080 my-show/media/grid.png
 |--------|--------|-------|
 | `color` | ✅ Phase 1 | `{ "rgba": [r,g,b,a] }`, linear 0..1 |
 | `image` | ✅ Phase 1 | `{ "path": "..." }` (PNG/JPEG/BMP/GIF/WebP) |
-| `video` | ⏳ Phase 2 | `{ "path": "..." }`; needs `--features video` (ffmpeg/libav). Placeholder otherwise. |
+| `video` | ✅ | `{ "path": "..." }`; decoded by an `ffmpeg` child process. Layer `timing` takes `media_in` (seconds) and `media_loop`. No audio. |
 | `live`  | ⏳ Phase 3 | `{ "kind": "..." }` (capture/NDI). Placeholder otherwise. |
 
 ### Projection mapping
@@ -209,11 +212,7 @@ on every push.
 
 ## Roadmap
 
-See [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-roadmap). Renderer
-items still open: video decode via `ffmpeg-next` (`--features video`), audio
-via `cpal` (`--features audio`), rendering the show distributed by the
-Director (today the Runner renders the show file given on its command line),
-live inputs, freeform mesh warp.
+See [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-roadmap).
 
 ## License
 

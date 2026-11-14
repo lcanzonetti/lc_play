@@ -1,0 +1,17 @@
+[package]
+name = "lc-play"
+description = "LC Play all-in-one launcher: runs Asset Manager, Director, Producer and a Runner on one machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lc-play"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

@@ -1,0 +1,414 @@
+//! The **show document**: everything an operator authors, in one JSON value.
+//!
+//! ```text
+//! ShowDocument
+//!  ├─ stage      the canvas (one big pixel space) and the displays cut from it
+//!  ├─ assets[]   media known to the show, with where to fetch each
+//!  └─ tracks[]   the timeline: each track holds cues placed in time and space
+//! ```
+//!
+//! The Producer edits it, the Director stores and distributes it, each Runner
+//! renders the part that concerns it. It is deliberately one self-contained
+//! document rather than a set of deltas: small enough to send whole on every
+//! edit, and a Runner holding it needs nothing else to play the show.
+//!
+//! Conventions:
+//!
+//! * **Space** is canvas pixels, origin top-left, y down. A cue's `x, y, w,
+//!   h` is its rectangle on the canvas; a display's `canvas_rect` is the part
+//!   of the canvas that display shows. Content that crosses a display
+//!   boundary simply appears on both — spanning needs no special case.
+//! * **Time** is seconds on the show timeline (`f64`). The *transport* that
+//!   says which show time it is now is exact integer nanoseconds (see
+//!   [`crate::transport`]); authored positions do not need that.
+//! * **Stacking**: the first track is in front, like the top layer of a
+//!   timeline editor.
+//! * Every field has a default, so a document can be written by hand with
+//!   only what matters, and older documents stay loadable as fields are added.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShowDocument {
+    pub name: String,
+    pub stage: Stage,
+    pub assets: Vec<Asset>,
+    /// Length of the timeline in seconds (what the Producer shows and what
+    /// "loop the show" wraps at).
+    pub duration_s: f64,
+    pub tracks: Vec<Track>,
+}
+
+impl Default for ShowDocument {
+    fn default() -> Self {
+        ShowDocument {
+            name: "Untitled".into(),
+            stage: Stage::default(),
+            assets: Vec::new(),
+            duration_s: 60.0,
+            tracks: Vec::new(),
+        }
+    }
+}
+
+/// The canvas and the displays that show parts of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stage {
+    pub width: f32,
+    pub height: f32,
+    /// Colour behind all cues, linear RGBA 0..1.
+    pub background: [f32; 4],
+    pub displays: Vec<Display>,
+}
+
+impl Default for Stage {
+    fn default() -> Self {
+        Stage {
+            width: 1920.0,
+            height: 1080.0,
+            background: [0.0, 0.0, 0.0, 1.0],
+            displays: Vec::new(),
+        }
+    }
+}
+
+/// One physical output: a rectangle of the canvas, driven by one Runner.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Display {
+    pub id: String,
+    pub name: String,
+    /// Name of the Runner that drives this display (its `--name`). Empty
+    /// means "any Runner" — convenient on a single machine.
+    pub runner: String,
+    pub canvas_rect: Rect,
+    pub window: WindowSpec,
+    /// Physical rotation of the display: 0, 90, 180 or 270.
+    pub rotation_degrees: u16,
+    /// Corner-pin warp: TL, TR, BR, BL in normalised output space (0..1).
+    /// `None` = no warp.
+    pub warp_corners: Option<[[f32; 2]; 4]>,
+    pub blend: EdgeBlend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Where a display's window goes on the Runner's desktop.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowSpec {
+    /// Borderless fullscreen on `monitor` — the setting for a real output.
+    pub fullscreen: bool,
+    /// Index into the Runner's monitor list (logged at Runner start-up).
+    pub monitor: Option<usize>,
+    /// Windowed mode: top-left corner in desktop pixels.
+    pub position: Option<[i32; 2]>,
+    /// Windowed mode: size in pixels. `None` = the canvas rect's size.
+    pub size: Option<[u32; 2]>,
+}
+
+/// Soft-edge blend widths as a fraction of the output (0..1) per edge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EdgeBlend {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+    /// Projector gamma; 2.2 means no correction.
+    pub gamma: f32,
+}
+
+impl Default for EdgeBlend {
+    fn default() -> Self {
+        EdgeBlend {
+            left: 0.0,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+            gamma: 2.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetKind {
+    #[default]
+    Image,
+    Video,
+}
+
+/// A media file the show uses, and where a Runner can fetch it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Asset {
+    /// The Asset Manager's id for the file.
+    pub id: String,
+    /// File name, for people (and for the file extension).
+    pub name: String,
+    pub kind: AssetKind,
+    /// HTTP URL of the original file on the Asset Manager.
+    pub url: String,
+    /// Size in bytes. Part of a Runner's cache key, so a file replaced under
+    /// the same name is fetched again.
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Zero for stills.
+    pub duration_s: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Track {
+    pub id: String,
+    pub name: String,
+    pub cues: Vec<Cue>,
+}
+
+/// What a cue shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CueSource {
+    /// An entry of [`ShowDocument::assets`], by id.
+    Asset { asset: String },
+    /// A solid colour, linear RGBA 0..1. Useful with no media at all.
+    Color { rgba: [f32; 4] },
+}
+
+impl Default for CueSource {
+    fn default() -> Self {
+        CueSource::Color {
+            rgba: [0.5, 0.5, 0.5, 1.0],
+        }
+    }
+}
+
+/// One piece of content, placed in time (`start_s`, `duration_s`) and on the
+/// canvas (`x, y, w, h`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Cue {
+    pub id: String,
+    pub name: String,
+    pub source: CueSource,
+    /// Show time at which the cue appears.
+    pub start_s: f64,
+    pub duration_s: f64,
+    /// Video: where in the file playback starts.
+    pub in_s: f64,
+    /// Video: restart from `in_s` when the file ends (otherwise the last
+    /// frame is held).
+    #[serde(rename = "loop")]
+    pub looping: bool,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Degrees clockwise about the cue's centre.
+    pub rotation: f32,
+    pub opacity: f32,
+    pub fade_in_s: f64,
+    pub fade_out_s: f64,
+}
+
+impl Default for Cue {
+    fn default() -> Self {
+        Cue {
+            id: String::new(),
+            name: String::new(),
+            source: CueSource::default(),
+            start_s: 0.0,
+            duration_s: 10.0,
+            in_s: 0.0,
+            looping: false,
+            x: 0.0,
+            y: 0.0,
+            w: 640.0,
+            h: 360.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+        }
+    }
+}
+
+impl ShowDocument {
+    pub fn asset(&self, id: &str) -> Option<&Asset> {
+        self.assets.iter().find(|a| a.id == id)
+    }
+
+    /// Check the document for values that cannot be rendered. Returns the
+    /// first problem as a message an operator can act on.
+    ///
+    /// The Director runs this before accepting a document, so a malformed
+    /// one is refused at the door instead of reaching every Runner.
+    pub fn validate(&self) -> Result<(), String> {
+        let finite = |what: &str, values: &[f64]| {
+            if values.iter().all(|v| v.is_finite()) {
+                Ok(())
+            } else {
+                Err(format!("{what}: contains a value that is not a number"))
+            }
+        };
+
+        let s = &self.stage;
+        finite("stage", &[s.width as f64, s.height as f64])?;
+        if !(s.width > 0.0 && s.height > 0.0) {
+            return Err("stage: width and height must be positive".into());
+        }
+        if !(self.duration_s.is_finite() && self.duration_s > 0.0) {
+            return Err("show: duration must be positive".into());
+        }
+
+        for d in &s.displays {
+            let name = format!(
+                "display '{}'",
+                if d.name.is_empty() { &d.id } else { &d.name }
+            );
+            let r = &d.canvas_rect;
+            finite(&name, &[r.x as f64, r.y as f64, r.w as f64, r.h as f64])?;
+            if !(r.w > 0.0 && r.h > 0.0) {
+                return Err(format!(
+                    "{name}: canvas rect must have positive width and height"
+                ));
+            }
+            if !matches!(d.rotation_degrees, 0 | 90 | 180 | 270) {
+                return Err(format!("{name}: rotation must be 0, 90, 180 or 270"));
+            }
+            let b = &d.blend;
+            let edges = [b.left, b.right, b.top, b.bottom];
+            if edges.iter().any(|e| !(0.0..=1.0).contains(e))
+                || b.left + b.right > 1.0
+                || b.top + b.bottom > 1.0
+            {
+                return Err(format!(
+                    "{name}: blend edges must be 0..1 and opposite edges must not exceed 1 together"
+                ));
+            }
+            if !(b.gamma.is_finite() && b.gamma > 0.0) {
+                return Err(format!("{name}: blend gamma must be positive"));
+            }
+            if let Some(size) = d.window.size {
+                if size[0] == 0 || size[1] == 0 {
+                    return Err(format!("{name}: window size must not be zero"));
+                }
+            }
+        }
+
+        for track in &self.tracks {
+            for c in &track.cues {
+                let name = format!("cue '{}'", if c.name.is_empty() { &c.id } else { &c.name });
+                finite(
+                    &name,
+                    &[
+                        c.start_s,
+                        c.duration_s,
+                        c.in_s,
+                        c.fade_in_s,
+                        c.fade_out_s,
+                        c.x as f64,
+                        c.y as f64,
+                        c.w as f64,
+                        c.h as f64,
+                        c.rotation as f64,
+                        c.opacity as f64,
+                    ],
+                )?;
+                if c.duration_s <= 0.0 {
+                    return Err(format!("{name}: duration must be positive"));
+                }
+                if c.start_s < 0.0 || c.in_s < 0.0 || c.fade_in_s < 0.0 || c.fade_out_s < 0.0 {
+                    return Err(format!("{name}: times must not be negative"));
+                }
+                if !(c.w > 0.0 && c.h > 0.0) {
+                    return Err(format!("{name}: width and height must be positive"));
+                }
+                if let CueSource::Asset { asset } = &c.source {
+                    if self.asset(asset).is_none() {
+                        return Err(format!(
+                            "{name}: refers to asset '{asset}', which is not in the show"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_object_is_a_valid_default_show() {
+        let doc: ShowDocument = serde_json::from_str("{}").unwrap();
+        assert_eq!(doc, ShowDocument::default());
+        doc.validate().unwrap();
+    }
+
+    #[test]
+    fn hand_written_documents_need_only_what_matters() {
+        let doc: ShowDocument = serde_json::from_str(
+            r#"{
+              "stage": { "width": 3840, "height": 1080,
+                         "displays": [ { "id": "l", "canvas_rect": { "w": 1920, "h": 1080 } } ] },
+              "tracks": [ { "cues": [
+                 { "source": { "type": "color", "rgba": [1, 0, 0, 1] }, "w": 100, "h": 100, "loop": true }
+              ] } ]
+            }"#,
+        )
+        .unwrap();
+        doc.validate().unwrap();
+        let cue = &doc.tracks[0].cues[0];
+        assert!(cue.looping);
+        assert_eq!(cue.opacity, 1.0, "defaults fill the rest");
+        // And it survives a round trip unchanged.
+        let again: ShowDocument =
+            serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        assert_eq!(again, doc);
+    }
+
+    #[test]
+    fn validation_names_the_problem() {
+        let mut doc = ShowDocument::default();
+        doc.stage.displays.push(Display {
+            name: "Left".into(),
+            ..Default::default() // zero-sized canvas rect
+        });
+        assert!(doc.validate().unwrap_err().contains("display 'Left'"));
+
+        let mut doc = ShowDocument::default();
+        doc.tracks.push(Track {
+            cues: vec![Cue {
+                name: "logo".into(),
+                source: CueSource::Asset {
+                    asset: "missing".into(),
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let err = doc.validate().unwrap_err();
+        assert!(
+            err.contains("cue 'logo'") && err.contains("missing"),
+            "{err}"
+        );
+
+        let mut doc = ShowDocument::default();
+        doc.stage.width = f32::NAN;
+        assert!(doc.validate().is_err());
+    }
+}

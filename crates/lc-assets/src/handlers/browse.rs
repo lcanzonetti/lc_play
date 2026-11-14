@@ -27,6 +27,11 @@ pub struct ItemDto {
     pub stream_url: String,
     /// On-the-fly transcode URL (defaults to fragmented MP4).
     pub transcode_url: String,
+    /// Small JPEG preview.
+    pub thumb_url: String,
+    /// Pixel size and duration, when `ffprobe` could read the file.
+    #[serde(flatten)]
+    pub probe: Option<crate::handlers::manage::Probe>,
 }
 
 impl From<MediaItem> for ItemDto {
@@ -34,6 +39,8 @@ impl From<MediaItem> for ItemDto {
         ItemDto {
             stream_url: format!("/stream/{}", m.id),
             transcode_url: format!("/transcode/{}", m.id),
+            thumb_url: format!("/thumb/{}", m.id),
+            probe: None,
             id: m.id,
             name: m.name,
             path: m.path,
@@ -46,12 +53,15 @@ impl From<MediaItem> for ItemDto {
 
 /// `GET /api/library` — list every indexed item.
 pub async fn list_library(State(state): State<AppState>) -> Json<LibraryResponse> {
-    let items: Vec<ItemDto> = state
-        .library
-        .list()
-        .into_iter()
-        .map(ItemDto::from)
-        .collect();
+    // Probe results are cached, so only new files cost an `ffprobe` run.
+    let items = futures::future::join_all(
+        state
+            .library
+            .list()
+            .into_iter()
+            .map(|item| crate::handlers::manage::describe(&state, item)),
+    )
+    .await;
     Json(LibraryResponse {
         count: items.len(),
         items,
@@ -63,9 +73,6 @@ pub async fn get_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ItemDto>, AppError> {
-    state
-        .library
-        .get(&id)
-        .map(|m| Json(ItemDto::from(m)))
-        .ok_or(AppError::NotFound)
+    let item = state.library.get(&id).ok_or(AppError::NotFound)?;
+    Ok(Json(crate::handlers::manage::describe(&state, item).await))
 }

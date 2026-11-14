@@ -1,15 +1,15 @@
 # LC Play — architecture
 
-Status of this document: sections 1–6 describe what is **implemented**
-(milestones M0–M1). Section 7 (show data model) is the **target** design;
-section 8 is the roadmap. Anything not measured or not verified is labelled.
+Status of this document: it describes what is **implemented** — a basic
+version of every component — and section 8 lists what is still missing.
+Anything not measured or not verified is labelled.
 
 ## 1. Components
 
 ```
                          OPERATOR LAPTOP
         ┌────────────────────────────────────────────────┐
-        │  PRODUCER  (planned, M4)                       │
+        │  PRODUCER  (lc-producer, in the browser)       │
         │  Web UI: Stage · Timeline · Assets · Health    │
         │  owns the editable project + undo history      │
         └───────┬───────────────────────────┬────────────┘
@@ -20,9 +20,9 @@ section 8 is the roadmap. Anything not measured or not verified is labelled.
    │ DIRECTOR (lc-director)   │    │ ASSET MANAGER (lc-assets)│
    │ authoritative show state │◄──►│ media store, HTTP Range  │
    │ transport state machine  │HTTP│ transcode (ffmpeg)       │
-   │ CLUSTER CLOCK (master)   │    │ (cluster integration M2) │
+   │ CLUSTER CLOCK (master)   │    │ upload, thumbnails       │
    │ external control gateway │    └────────────┬─────────────┘
-   │ (OSC/MIDI/Art-Net/LTC M5)│                 │
+   │ (OSC; MIDI/Art-Net/LTC—) │                 │
    └───┬──────────┬───────────┘                 │ HTTP GET (Range)
        │ WS       │ UDP time sync               │ separate from control
        │ control  │ (4-timestamp)               │
@@ -153,7 +153,7 @@ exists so the sample can be taken for the *predicted time of the next vertical
 blank* instead of "now". **Not yet used**: the renderer currently samples at
 render time, so it shows content up to one refresh period late — equally on
 all Runners, hence invisible as a sync error, but it is latency. Using vblank
-prediction is part of M3.
+prediction is still to do.
 
 ### 3.4 Measured, and not measured
 
@@ -238,9 +238,12 @@ crates/
   lc-discovery  multicast announce / scan / find
   lc-net        control-channel client (WebSocket)
   lc-director   Core (state + command logic) · server (WS/HTTP) · store (persistence)
-  lc-runner     agent · playhead · renderer (app, render, content, show)
-  lc-assets     media HTTP server (library scan, Range streaming, transcode)
+  lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
+                renderer (app, render, content, video, show)
+  lc-assets     media HTTP server (library, Range streaming, upload, thumbnails)
+  lc-producer   serves the web interface (ui/: index.html, app.js, style.css)
   lc-ctl        command-line controller, reference protocol client
+  lc-play       launcher: all of the above on one machine
 docs/           this file, PROTOCOL.md
 ```
 
@@ -249,7 +252,7 @@ Dependency direction: `proto ← time ← {director, runner}`; `discovery` and
 timeline) have no sockets and no real clock, which is why they can be tested
 against simulated networks.
 
-## 7. Show data model (target)
+## 7. Show data model
 
 ```
 Show { id, name, revision, frame_rate }
@@ -269,14 +272,54 @@ Runners therefore needs no special handling. Every Runner receives the whole
 show (it is small) and renders the Displays assigned to it — simpler than
 per-Runner subsets, and any Runner can take over any Display.
 
-**Today:** the Director distributes the show as an opaque, revisioned JSON
-document; Runners cache it. The renderer still uses its own show file format
-(`crates/lc-runner/src/show.rs`: canvas, outputs, layers) given on the command
-line, and does not yet render the distributed document. Unifying the two is
-part of M3, together with timeline evaluation.
+The document is defined in `lc-proto/src/show.rs` (wire form in
+[PROTOCOL.md](PROTOCOL.md) §5). `Timeline[]` and `ControlMap[]` above are the
+target shape; today a show has **one** timeline (`tracks` at the top level),
+cues have a static placement plus fades (no keyframes), there are no control
+cues, and external control is the fixed OSC address list rather than a
+per-show map.
 
-Assets will be content-addressed (hash in the show, HTTP URL derived from
-it), so a Runner can verify what it downloaded and never plays a stale file.
+### From document to pixels
+
+```
+Producer ──load_show──▶ Director ──show──▶ Runner agent ──▶ Playhead
+                         validates,                           │ (document + id)
+                         stores, persists                     ▼
+                                              stage::build(document, runner name, asset cache)
+                                                              │
+                              displays of this Runner ─▶ outputs (windows)
+                              all cues ─▶ layers ─▶ content (image / colour / video)
+```
+
+The renderer looks at the playhead's document every frame; when its id (or
+the set of downloaded assets) changes it rebuilds its layers. Windows are
+rebuilt only if the displays changed, and loaded media is kept across edits,
+so dragging a cue in the Producer moves it on the output without a flicker.
+
+### Assets
+
+The show names each asset by its URL on the Asset Manager. A Runner downloads
+it once into its cache (`<id>-<size>.<ext>`) and plays from local disk; until
+the file has arrived the cue shows a placeholder. Asset ids are derived from
+the file name, **not** from the content — a file replaced by one of exactly
+the same size would not be refetched. Content hashing is the planned fix.
+
+### Video
+
+`lc-runner/src/video.rs`. An `ffmpeg` child process per playing video cue
+writes raw RGBA frames to a pipe. Each rendered frame the renderer computes
+the file frame that belongs to the current show time
+(`floor(media_time × fps)`) and advances the decoder's output to it, dropping
+frames the clock has passed and holding the previous one if the decoder is
+behind. A jump restarts `ffmpeg` at the new position (frame-exact: verified
+against a clip with burned-in frame numbers). A cue is pre-rolled one second
+before it starts so its first frame is already in the texture, and a second
+decoder is started just before a loop point.
+
+This is a correctness-first implementation: it costs a full-frame memory
+copy per frame and scales with CPU, not GPU. Two Runners given the same show
+time show the same frame, but a Runner that cannot decode fast enough will
+*hold* frames rather than fall out of sync.
 
 ## 8. Roadmap
 
@@ -284,18 +327,35 @@ it), so a Runner can verify what it downloaded and never plays a stale file.
 |---|---|---|
 | ✅ | M0 | Workspace restructure: existing server → `lc-assets`, existing engine → `lc-runner`. |
 | ✅ | M1 | Communication and synchronisation: protocol, cluster clock, discovery, control channel, Director, Runner agent, `lc-ctl`, failure handling. |
-| | M2 | Asset Manager in the cluster: content hashing, ingest, optimisation to a playback codec, Runner prefetch and verification. Codec to be decided there; HAP (GPU-decoded, cheap on CPU, large files) is the leading candidate against H.264/HEVC with hardware decode. |
-| | M3 | Runner playback: unified show model, timeline evaluation, video decode, vblank-predicted sampling, GPU health metrics (load, temperature). |
-| | M4 | Producer: Stage, Timeline, Assets, cluster health — web UI served by its own service. |
-| | M5 | External control gateway in the Director: OSC first, then MIDI/MTC, Art-Net, LTC chase. All map onto the existing `Command` set. |
-| | M6 | Mesh warp; SDI (e.g. DeckLink) and NDI outputs; standby Director; framelock integration. NDI requires the proprietary NDI SDK and its licence. |
+| ✅ | M2–M5, basic | Asset upload/serving and Runner cache; unified show document rendered live; video via `ffmpeg`; Producer UI; OSC; one-machine launcher. |
+
+Still to do, roughly in order of how much they limit real use:
+
+| Area | Missing |
+|---|---|
+| Playback performance | GPU-friendly decode (HAP, or hardware H.264/HEVC) instead of raw frames over a pipe; vblank-predicted sampling; audio. |
+| Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
+| Authoring | Keyframes/tweens; control cues (pause, jump); multiple timelines; a warp editor; live video preview in the Producer; snapping. |
+| External control | MIDI/MTC, Art-Net, LTC chase; per-show control mapping. |
+| Outputs | Freeform mesh warp; SDI and NDI outputs (NDI needs the proprietary NDI SDK and its licence); framelock integration. |
+| Resilience | Standby Director; arbitration between two Directors. |
+| Health | GPU load and temperature (the Runner reports fps and sync quality only). |
+| Security | Authentication, encryption, WebSocket origin check. |
+| Platforms | Only Linux has been run. Windows and macOS type-check but are untested. |
 
 ### Deviations from the approved plan
 
 * The plan had the renderer's `Canvas/Output/Warp/…` types move into
-  `lc-proto` in M1. They stayed in `lc-runner`: moving them would pull the
-  maths library into the protocol crate before the unified show model (M3)
-  decides their final shape. The show travels as an opaque document meanwhile.
+  `lc-proto`. Instead `lc-proto` got its own, renderer-independent show
+  document, and `lc-runner/src/stage.rs` translates it into the renderer's
+  model. That keeps the maths library out of the protocol crate and lets the
+  two evolve separately.
+* The plan named HAP as the likely playback codec, to be decided with the
+  Asset Manager work. That decision is still open: the current decoder
+  plays whatever `ffmpeg` reads, unoptimised.
+* The Producer has no back end of its own beyond serving the page: the
+  project lives in the Director (and in files saved from the browser), not
+  in a Producer-side project store.
 * The control server lives in `lc-director` rather than `lc-net`, since the
   Director is the only server; `lc-net` is the client.
 

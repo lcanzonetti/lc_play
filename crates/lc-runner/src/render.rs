@@ -376,26 +376,7 @@ impl Gpu {
         let rotated = matches!(output.rotation_degrees, 90 | 270);
         let (scene_tex, scene_view, scene_bg) = self.make_scene_target(width, height, rotated);
 
-        // Per-layer uniform buffers + bind groups (values rewritten each frame).
-        let (layer_uniforms, layer_uniform_bgs) = (0..layer_count)
-            .map(|_| {
-                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("scene-uniform"),
-                    size: std::mem::size_of::<SceneUniform>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("scene-uniform-bg"),
-                    layout: &self.uniform_bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: buf.as_entire_binding(),
-                    }],
-                });
-                (buf, bg)
-            })
-            .unzip();
+        let (layer_uniforms, layer_uniform_bgs) = self.make_layer_uniforms(layer_count);
 
         // Warp mesh + blend uniform for this output.
         let (warp_vbo, warp_ibo, warp_index_count) = self.make_warp_mesh(output);
@@ -435,6 +416,40 @@ impl Gpu {
             warp_index_count,
             _blend_buf: blend_buf,
             blend_bg,
+        }
+    }
+
+    /// Per-layer uniform buffers + bind groups (values rewritten each frame).
+    fn make_layer_uniforms(&self, layer_count: usize) -> (Vec<wgpu::Buffer>, Vec<wgpu::BindGroup>) {
+        (0..layer_count)
+            .map(|_| {
+                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("scene-uniform"),
+                    size: std::mem::size_of::<SceneUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene-uniform-bg"),
+                    layout: &self.uniform_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    }],
+                });
+                (buf, bg)
+            })
+            .unzip()
+    }
+
+    /// Resize an output's per-layer resources after the show's layer list
+    /// changed (live editing): the output itself — surface, warp, blend —
+    /// stays as it is.
+    pub fn set_layer_count(&self, out: &mut OutputGpu, layer_count: usize) {
+        if out.res.layer_uniforms.len() != layer_count {
+            let (bufs, bgs) = self.make_layer_uniforms(layer_count);
+            out.res.layer_uniforms = bufs;
+            out.res.layer_uniform_bgs = bgs;
         }
     }
 
@@ -584,7 +599,8 @@ impl Gpu {
             let t = &show.layers[i].transform;
             let u = SceneUniform {
                 mvp: (view_proj * t.model_matrix()).to_cols_array_2d(),
-                opacity: t.opacity,
+                // The cue's own opacity times its fade in/out at this instant.
+                opacity: t.opacity * show.layers[i].timing.fade_at(now),
                 _pad: [0.0; 3],
             };
             self.queue
@@ -819,7 +835,7 @@ mod tests {
         let contents: Vec<_> = show
             .layers
             .iter()
-            .map(|l| content::build(&l.source, &factory).unwrap())
+            .map(|l| content::build(l, &factory).unwrap())
             .collect();
         let order: Vec<usize> = (0..show.layers.len()).collect();
         let output = &show.outputs[idx];

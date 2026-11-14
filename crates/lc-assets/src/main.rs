@@ -56,6 +56,17 @@ async fn main() {
         .route("/api/items/{id}", get(handlers::browse::get_item))
         .route("/stream/{id}", get(handlers::stream::stream_media))
         .route("/transcode/{id}", get(handlers::transcode::transcode_media))
+        .route("/thumb/{id}", get(handlers::manage::thumbnail))
+        .route(
+            "/api/items/{id}",
+            axum::routing::delete(handlers::manage::delete_item),
+        )
+        .route(
+            "/api/upload",
+            // Media files are large; the default 2 MB body limit is for forms.
+            axum::routing::post(handlers::manage::upload)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 

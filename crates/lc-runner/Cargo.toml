@@ -35,16 +35,9 @@ lc-net.workspace = true
 tokio.workspace = true
 clap.workspace = true
 
-# Phase 2+ (feature-gated so the core builds without native codec/audio libs):
-ffmpeg-next = { version = "7", optional = true }
-cpal = { version = "0.15", optional = true }
-
-[features]
-default = []
-# Enables real video decode via system ffmpeg/libav (requires libav* dev libs + pkg-config).
-video = ["dep:ffmpeg-next"]
-# Enables audio output via cpal.
-audio = ["dep:cpal"]
+# Asset download (blocking, in a background thread). Plain HTTP only: the
+# Asset Manager lives on the show network.
+ureq = { version = "2", default-features = false }
 
 [dev-dependencies]
 # Integration tests run a real Director in-process next to several agents.

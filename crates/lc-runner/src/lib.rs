@@ -10,15 +10,21 @@
 //!   transport cache, health reports. Async (tokio), no GPU.
 //! * [`playhead`] — "what show time / frame is it now?", valid with or
 //!   without a Director.
-//! * [`app`], [`render`], [`content`], [`show`] — the renderer: canvas →
-//!   outputs with warp and edge blend (wgpu + winit).
+//! * [`stage`], [`assets`] — turn the cluster's show document into what this
+//!   Runner draws, fetching media into a local cache.
+//! * [`app`], [`render`], [`content`], [`video`], [`show`] — the renderer:
+//!   canvas → outputs with warp and edge blend (wgpu + winit); video frames
+//!   from an `ffmpeg` child process.
 //!
 //! The split is what makes playback resilient: the renderer depends only on
 //! the playhead, never on the network.
 
 pub mod agent;
 pub mod app;
+pub mod assets;
 pub mod content;
 pub mod playhead;
 pub mod render;
 pub mod show;
+pub mod stage;
+pub mod video;

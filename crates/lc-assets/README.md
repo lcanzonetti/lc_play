@@ -9,10 +9,9 @@ single static binary with an in-memory index and no database.
 
 A minimal built-in web player is served at `/` for testing.
 
-> Part of **LC Play** (see the [repository README](../../README.md)). Today this
-> is the stand-alone media server it started as; its role in the cluster — a
-> content-addressed store that optimises media and serves it to Runners — is
-> milestone M2 of the [architecture](../../docs/ARCHITECTURE.md).
+> Part of **LC Play** (see the [repository README](../../README.md)): the
+> store the Producer uploads media to and Runners download it from. Images,
+> video and audio files are indexed; items report pixel size and duration.
 
 ---
 
@@ -61,7 +60,8 @@ All configuration is via environment variables; every one has a default.
 | `LCMS_FFMPEG`            | `ffmpeg`       | Path to the `ffmpeg` binary used for transcoding.                  |
 | `LCMS_SCAN_INTERVAL_SECS`| `300`          | Background rescan interval in seconds. `0` disables periodic rescans. |
 | `LCMS_MAX_TRANSCODES`    | *(CPU count)*  | Max concurrent transcode jobs.                                     |
-| `LCMS_CORS`              | `false`        | Enable permissive CORS (for a separate front-end).                 |
+| `LCMS_FFPROBE`           | `ffprobe`      | Path to `ffprobe`, used for dimensions and duration.               |
+| `LCMS_CORS`              | `true`         | Permissive CORS, needed by the Producer UI.                        |
 | `RUST_LOG`               | `info`         | Log level (`tracing` env filter syntax).                           |
 
 ## HTTP API
@@ -74,6 +74,9 @@ All configuration is via environment variables; every one has a default.
 | `GET /api/items/{id}`    | Metadata for one item.                                  |
 | `GET /stream/{id}`       | Stream the original file, honouring `Range` (seeking).  |
 | `GET /transcode/{id}`    | Transcode/remux and stream the result.                  |
+| `GET /thumb/{id}`        | Small JPEG preview (image, or a video's first frame).   |
+| `POST /api/upload?name=` | Store the request body (the raw file) as a media file.  |
+| `DELETE /api/items/{id}` | Remove a media file.                                    |
 
 ### Transcode query parameters
 

@@ -1,14 +1,14 @@
 //! Layer content: turns a [`Source`] into something the compositor can draw —
 //! a GPU texture plus a bind group for the scene shader.
 //!
-//! Phase 1 implements `Image` and `Color`. `Video` and `Live` resolve to a
-//! clearly-labeled placeholder texture so a layout still composes and runs;
-//! their real implementations arrive behind the `video` / `live` features.
+//! `Image` and `Color` are static textures; `Video` ([`crate::video`]) uploads
+//! a new frame whenever the show clock has moved on to one. `Live` and
+//! `Missing` resolve to a placeholder texture so the layout still composes.
 
 use anyhow::Context as _;
 use wgpu::util::DeviceExt as _;
 
-use crate::show::Source;
+use crate::show::{Layer, Source, Timing};
 
 /// Anything that can supply a texture to the scene pipeline for a given time.
 pub trait Content {
@@ -16,14 +16,23 @@ pub trait Content {
     /// Static content ignores this.
     fn update(&mut self, _t: f64, _queue: &wgpu::Queue) {}
 
+    /// The layer's timing changed (it was moved on the timeline) while its
+    /// source stayed the same. Dynamic content adopts the new timing instead
+    /// of being rebuilt — which for video would mean a new decoder.
+    fn retime(&mut self, _timing: &Timing) {}
+
+    /// The layer is off screen and not about to appear: release whatever is
+    /// only needed while playing (for video, the decoder process).
+    fn idle(&mut self) {}
+
     /// Bind group for scene-shader group(1): `{ texture, sampler }`.
     fn bind_group(&self) -> &wgpu::BindGroup;
 }
 
 /// A single immutable texture (images, solid colors, placeholders).
 pub struct StaticContent {
-    _texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) bind_group: wgpu::BindGroup,
 }
 
 impl Content for StaticContent {
@@ -45,7 +54,13 @@ pub struct TextureFactory<'a> {
 
 impl TextureFactory<'_> {
     /// Upload sRGB-encoded, **premultiplied** RGBA8 pixels.
-    fn upload_rgba8(&self, label: &str, width: u32, height: u32, rgba: &[u8]) -> StaticContent {
+    pub(crate) fn upload_rgba8(
+        &self,
+        label: &str,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> StaticContent {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -82,15 +97,28 @@ impl TextureFactory<'_> {
             ],
         });
         StaticContent {
-            _texture: texture,
+            texture,
             bind_group,
         }
     }
 }
 
-/// Build the content for a layer source.
-pub fn build(source: &Source, factory: &TextureFactory) -> anyhow::Result<Box<dyn Content>> {
-    match source {
+/// Identity of a layer's content for reuse across show edits: two layers
+/// with the same key can share (or keep) the same loaded content. Video is
+/// keyed per layer, since each layer needs its own decoder position.
+pub fn cache_key(layer: &Layer) -> String {
+    match &layer.source {
+        Source::Image { path } => format!("image:{path}"),
+        Source::Color { rgba } => format!("color:{rgba:?}"),
+        Source::Video { path } => format!("video:{}:{path}", layer.id),
+        Source::Live { kind } => format!("live:{kind}"),
+        Source::Missing { reason } => format!("missing:{reason}"),
+    }
+}
+
+/// Build the content for a layer.
+pub fn build(layer: &Layer, factory: &TextureFactory) -> anyhow::Result<Box<dyn Content>> {
+    match &layer.source {
         Source::Image { path } => {
             let mut img = image::open(path)
                 .with_context(|| format!("loading image '{path}'"))?
@@ -113,7 +141,15 @@ pub fn build(source: &Source, factory: &TextureFactory) -> anyhow::Result<Box<dy
             ];
             Ok(Box::new(factory.upload_rgba8("color", 1, 1, &px)))
         }
-        Source::Video { path } => build_video(path, factory),
+        Source::Video { path } => Ok(Box::new(crate::video::VideoContent::open(
+            path,
+            &layer.timing,
+            factory,
+        )?)),
+        Source::Missing { reason } => {
+            tracing::debug!(layer = %layer.id, "{reason}; showing placeholder");
+            Ok(placeholder(factory))
+        }
         Source::Live { kind } => {
             tracing::warn!("live source '{kind}' not yet implemented; showing placeholder");
             Ok(placeholder(factory))
@@ -129,22 +165,6 @@ pub fn placeholder(factory: &TextureFactory) -> Box<dyn Content> {
         PLACEHOLDER_SIZE,
         &placeholder_pixels(),
     ))
-}
-
-#[cfg(not(feature = "video"))]
-fn build_video(path: &str, factory: &TextureFactory) -> anyhow::Result<Box<dyn Content>> {
-    tracing::warn!(
-        "video '{path}' needs the `video` feature (cargo run --features video); showing placeholder"
-    );
-    Ok(placeholder(factory))
-}
-
-#[cfg(feature = "video")]
-fn build_video(path: &str, factory: &TextureFactory) -> anyhow::Result<Box<dyn Content>> {
-    // Phase 2: decode with ffmpeg-next, upload frames in Content::update.
-    // Until that lands, fail loudly so the feature build doesn't silently no-op.
-    let _ = (path, factory);
-    anyhow::bail!("video decoding (Phase 2) is not implemented yet")
 }
 
 const PLACEHOLDER_SIZE: u32 = 64;

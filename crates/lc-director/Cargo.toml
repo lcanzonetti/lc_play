@@ -19,6 +19,7 @@ path = "src/main.rs"
 lc-proto.workspace = true
 lc-time.workspace = true
 lc-discovery.workspace = true
+rosc.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 clap.workspace = true

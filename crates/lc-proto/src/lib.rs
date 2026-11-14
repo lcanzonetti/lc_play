@@ -29,6 +29,7 @@
 
 pub mod beacon;
 pub mod message;
+pub mod show;
 pub mod transport;
 
 pub use beacon::{Beacon, DISCOVERY_GROUP, DISCOVERY_PORT};
@@ -36,6 +37,7 @@ pub use message::{
     ClientMessage, ClusterStatus, Command, Health, Hello, NodeStatus, RunnerHello, ServerMessage,
     SyncQuality, Welcome,
 };
+pub use show::ShowDocument;
 pub use transport::{FrameRate, TransportState};
 
 use serde::{Deserialize, Serialize};

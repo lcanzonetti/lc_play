@@ -10,6 +10,8 @@ Source of truth: `crates/lc-proto` (messages) and `crates/lc-time/src/wire.rs`
 | Control | WebSocket `ws://director:7401/ws` | TCP 7401 | JSON text frames |
 | Clock sync | UDP unicast | port 7402 | fixed 44-byte binary |
 | HTTP helpers | `GET /status`, `POST /command` | TCP 7401 | JSON |
+| OSC | UDP unicast | port 7405 | OSC 1.0 |
+| Assets | HTTP | TCP 7403 | files, JSON |
 
 ## 1. Discovery beacon
 
@@ -141,7 +143,81 @@ curl -X POST http://director:7401/command -H 'content-type: application/json' \
      -d '{"type":"seek","show_ns":42000000000}'
 ```
 
-## 5. Security
+## 5. Show document
+
+The `document` of `load_show` / `show`. Source of truth:
+`crates/lc-proto/src/show.rs`. Every field is optional and has a default;
+unknown fields are preserved. The Director refuses a document that fails
+validation (non-positive sizes, a cue referring to an unknown asset, …) with
+an `error` naming the problem.
+
+```json
+{
+  "name": "Demo", "duration_s": 60,
+  "stage": {
+    "width": 3840, "height": 1080, "background": [0, 0, 0, 1],
+    "displays": [
+      { "id": "d1", "name": "Left", "runner": "left",
+        "canvas_rect": { "x": 0, "y": 0, "w": 1920, "h": 1080 },
+        "window": { "fullscreen": true, "monitor": 1, "position": null, "size": null },
+        "rotation_degrees": 0,
+        "warp_corners": [[0,0],[1,0],[1,1],[0,1]],
+        "blend": { "left": 0, "right": 0.125, "top": 0, "bottom": 0, "gamma": 2.2 } }
+    ]
+  },
+  "assets": [
+    { "id": "636c6970", "name": "clip.mp4", "kind": "video",
+      "url": "http://10.0.0.1:7403/stream/636c6970",
+      "size": 594087, "width": 1920, "height": 1080, "duration_s": 12.0 }
+  ],
+  "tracks": [
+    { "id": "t1", "name": "Track 1", "cues": [
+      { "id": "c1", "name": "clip.mp4",
+        "source": { "type": "asset", "asset": "636c6970" },
+        "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false,
+        "x": 0, "y": 0, "w": 1920, "h": 1080,
+        "rotation": 0, "opacity": 1, "fade_in_s": 1, "fade_out_s": 1 }
+    ] }
+  ]
+}
+```
+
+* Space: canvas pixels, origin top-left, y down. `x, y, w, h` is the cue's
+  rectangle; `rotation` is degrees clockwise about its centre.
+* `source` is `{ "type": "asset", "asset": <id> }` or
+  `{ "type": "color", "rgba": [r, g, b, a] }` (linear 0..1).
+* The first track is in front.
+* `runner` is a Runner's `--name`; empty means any Runner.
+* A Runner downloads `url` once and caches it under `id` + `size`.
+
+## 6. OSC (Director, UDP 7405)
+
+| Address | Argument | Effect |
+|---|---|---|
+| `/lcplay/play`, `/lcplay/pause` | — | |
+| `/lcplay/stop` | — | pause and return to 0 |
+| `/lcplay/seek` | seconds | jump |
+| `/lcplay/rate` | speed (1.0 = normal) | |
+| `/lcplay/loop` | seconds, 0 = off | |
+
+Numeric arguments may be float, double, int or long. For play/pause/stop a
+single argument of `0` is ignored (a control surface's button release).
+Bundles are accepted; their time tags are ignored.
+
+## 7. Asset Manager (HTTP 7403)
+
+| Method & path | |
+|---|---|
+| `GET /api/library` | `{ count, items: [{ id, name, kind, size, mime, width, height, duration_s, stream_url, thumb_url }] }` |
+| `POST /api/upload?name=<file name>` | body = the raw file; returns the item |
+| `DELETE /api/items/{id}` | removes the file |
+| `GET /stream/{id}` | the file, with `Range` support |
+| `GET /thumb/{id}` | small JPEG |
+| `GET /transcode/{id}` | on-the-fly transcode for browser preview |
+
+`kind` is `video`, `image` or `audio`. CORS is open by default.
+
+## 8. Security
 
 None in version 1: no authentication, no encryption. The protocol assumes a
 closed show network. Do not expose these ports to an untrusted network.

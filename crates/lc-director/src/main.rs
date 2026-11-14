@@ -35,6 +35,10 @@ struct Args {
     /// Show frame rate: an integer ("60") or a fraction ("60000/1001").
     #[arg(long, default_value = "60", value_parser = parse_frame_rate)]
     fps: FrameRate,
+    /// UDP port for OSC show control (0 = off). See the README for the
+    /// address list.
+    #[arg(long, default_value_t = 7405)]
+    osc_port: u16,
     /// Directory for persistent state. Without it nothing survives a restart.
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         lead: Duration::from_millis(args.lead_ms),
         frame_rate: args.fps,
         state_dir: args.state_dir,
+        osc_addr: (args.osc_port != 0).then(|| SocketAddr::new(args.bind, args.osc_port)),
         discovery: (!args.no_discovery).then(|| DiscoveryConfig {
             interface: args.interface,
             ..Default::default()

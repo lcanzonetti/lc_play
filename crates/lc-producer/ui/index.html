@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LC Play — Producer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  Layout (CSS grid, see style.css):
+
+    ┌──────────────── top bar: transport · time · cluster ────────────────┐
+    │ assets │              stage                         │   inspector   │
+    ├────────┴────────────────────────────────────────────┴───────────────┤
+    │                            timeline                                 │
+    └─────────────────────────────────────────────────────────────────────┘
+
+  All behaviour is in app.js; this file is only the skeleton it fills.
+-->
+<header id="topbar">
+  <div class="brand">LC&nbsp;Play</div>
+  <div class="group">
+    <button id="btn-stop" title="Stop: pause and return to the start">⏮</button>
+    <button id="btn-play" class="primary" title="Play / pause (Space)">▶</button>
+    <div id="time" title="Show time">00:00:00.00</div>
+    <div id="frame" class="dim"></div>
+  </div>
+  <div class="group">
+    <label title="Loop the whole timeline"><input type="checkbox" id="chk-loop"> loop</label>
+    <label>rate
+      <select id="sel-rate">
+        <option value="250">0.25×</option><option value="500">0.5×</option>
+        <option value="1000" selected>1×</option><option value="2000">2×</option>
+      </select>
+    </label>
+  </div>
+  <div id="cluster" class="group grow"></div>
+  <div class="group">
+    <button id="btn-undo" title="Undo (Ctrl+Z)">↶</button>
+    <button id="btn-redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+    <button id="btn-new">New</button>
+    <button id="btn-open">Open…</button>
+    <button id="btn-save">Save…</button>
+    <input type="file" id="file-open" accept=".json,application/json" hidden>
+  </div>
+</header>
+
+<aside id="assets">
+  <div class="panel-head">
+    <span>Assets</span>
+    <button id="btn-upload">Upload…</button>
+    <input type="file" id="file-upload" multiple hidden>
+  </div>
+  <div id="asset-list" class="scroll"></div>
+  <div class="panel-foot">
+    <button id="btn-color">+ Colour cue</button>
+    <span class="dim">Drag onto a track, or double-click to add at the playhead.</span>
+  </div>
+</aside>
+
+<main id="stage-wrap">
+  <canvas id="stage"></canvas>
+</main>
+
+<aside id="inspector" class="scroll"></aside>
+
+<section id="timeline">
+  <div class="panel-head">
+    <span>Timeline</span>
+    <button id="btn-track">+ Track</button>
+    <label class="dim">zoom <input type="range" id="zoom" min="4" max="200" value="40"></label>
+  </div>
+  <div id="tl-scroll" class="scroll">
+    <div id="tl-body">
+      <div id="ruler"></div>
+      <div id="tracks"></div>
+      <div id="playhead"></div>
+    </div>
+  </div>
+</section>
+
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

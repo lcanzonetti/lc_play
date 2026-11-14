@@ -57,6 +57,7 @@ async fn start_director(
         lead: LEAD,
         frame_rate: FPS,
         state_dir,
+        osc_addr: None,
         discovery: None, // tests address the Director explicitly
         local_clock: clock,
     })

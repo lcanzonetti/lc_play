@@ -11,6 +11,8 @@
 #   lc-runner     display server: sync agent + wgpu renderer
 #   lc-assets     asset manager: HTTP media store / transcoder
 #   lc-ctl        command-line controller
+#   lc-producer   operator's web interface
+#   lc-play       all-in-one launcher for a single machine
 [workspace]
 members = [
     "crates/lc-proto",
@@ -21,6 +23,8 @@ members = [
     "crates/lc-runner",
     "crates/lc-assets",
     "crates/lc-ctl",
+    "crates/lc-producer",
+    "crates/lc-play",
 ]
 resolver = "2"
 
@@ -45,6 +49,7 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rosc = "0.11"
 socket2 = "0.5"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util", "process"] }

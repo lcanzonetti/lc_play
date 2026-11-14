@@ -33,7 +33,7 @@ pub struct Canvas {
 
 /// A physical display, defined by the slice of canvas it shows plus its own
 /// geometry correction (warp + edge-blend + orientation).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Output {
     pub id: String,
     /// The region of the canvas this output renders.
@@ -50,7 +50,7 @@ pub struct Output {
     pub blend: Blend,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct WindowPlacement {
     /// Make the window borderless-fullscreen on its monitor.
     #[serde(default)]
@@ -72,7 +72,7 @@ pub struct WindowPlacement {
 /// The mapping is a true perspective transform (homography), which is what a
 /// projector hitting a flat surface off-axis produces: straight lines stay
 /// straight and content is distributed with correct foreshortening.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Warp {
     #[serde(default)]
     pub corners: Option<[[f32; 2]; 4]>,
@@ -122,7 +122,7 @@ impl Warp {
 /// `canvas_rect`s overlap by exactly that width sum to full brightness.
 /// `gamma` is the *projector's* gamma: output is already sRGB-encoded, so the
 /// default 2.2 needs no extra correction; tune it if the seam reads light/dark.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Blend {
     #[serde(default)]
     pub left: f32,
@@ -148,7 +148,7 @@ impl Default for Blend {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Deserialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -173,10 +173,14 @@ pub enum Source {
     Image { path: String },
     /// Solid color (linear RGBA 0..1) — handy for testing a layout with no assets.
     Color { rgba: [f32; 4] },
-    /// Pre-recorded video (Phase 2; requires the `video` feature).
+    /// Pre-recorded video, decoded by an `ffmpeg` child process.
     Video { path: String },
-    /// Live input such as a capture card or NDI stream (Phase 3).
+    /// Live input such as a capture card or NDI stream (not implemented).
     Live { kind: String },
+    /// Content that cannot be shown right now — an asset still downloading,
+    /// or one the show refers to but does not define. Drawn as a placeholder
+    /// so the layout stays readable and the gap is visible.
+    Missing { reason: String },
 }
 
 /// Placement of a layer on the canvas.
@@ -227,11 +231,37 @@ pub struct Timing {
     /// Show-clock time at which it disappears. `None` = until the end.
     #[serde(default)]
     pub end: Option<f64>,
+    /// Seconds over which opacity ramps up from zero after `start`.
+    #[serde(default)]
+    pub fade_in: f64,
+    /// Seconds over which opacity ramps down to zero before `end`.
+    #[serde(default)]
+    pub fade_out: f64,
+    /// Video: position in the file at `start`.
+    #[serde(default)]
+    pub media_in: f64,
+    /// Video: start over from `media_in` when the file ends.
+    #[serde(default)]
+    pub media_loop: bool,
 }
 
 impl Timing {
     pub fn visible_at(&self, t: f64) -> bool {
         t >= self.start && self.end.map(|e| t < e).unwrap_or(true)
+    }
+
+    /// Fade factor (0..1) at show time `t`: the product of the fade-in ramp
+    /// and the fade-out ramp, so a cue shorter than its two fades still
+    /// starts and ends at zero.
+    pub fn fade_at(&self, t: f64) -> f32 {
+        let mut k = 1.0f64;
+        if self.fade_in > 0.0 {
+            k *= ((t - self.start) / self.fade_in).clamp(0.0, 1.0);
+        }
+        if let (Some(end), true) = (self.end, self.fade_out > 0.0) {
+            k *= ((end - t) / self.fade_out).clamp(0.0, 1.0);
+        }
+        k as f32
     }
 }
 
@@ -300,6 +330,18 @@ impl Show {
             anyhow::bail!("show has no outputs");
         }
         for o in &show.outputs {
+            o.validate()?;
+        }
+        Ok(show)
+    }
+}
+
+impl Output {
+    /// Reject geometry the renderer cannot draw, with a message that names
+    /// the output and the field.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        {
+            let o = self;
             let id = &o.id;
             if !matches!(o.rotation_degrees, 0 | 90 | 180 | 270) {
                 anyhow::bail!(
@@ -331,7 +373,7 @@ impl Show {
                 }
             }
         }
-        Ok(show)
+        Ok(())
     }
 }
 
@@ -387,10 +429,29 @@ mod tests {
     }
 
     #[test]
+    fn fades_ramp_from_and_to_zero() {
+        let t = Timing {
+            start: 10.0,
+            end: Some(20.0),
+            fade_in: 2.0,
+            fade_out: 4.0,
+            ..Default::default()
+        };
+        assert_eq!(t.fade_at(10.0), 0.0);
+        assert_eq!(t.fade_at(11.0), 0.5);
+        assert_eq!(t.fade_at(15.0), 1.0);
+        assert_eq!(t.fade_at(18.0), 0.5);
+        assert_eq!(t.fade_at(20.0), 0.0);
+        // No fades configured: always fully on.
+        assert_eq!(Timing::default().fade_at(123.0), 1.0);
+    }
+
+    #[test]
     fn timing_visibility_window() {
         let t = Timing {
             start: 2.0,
             end: Some(5.0),
+            ..Default::default()
         };
         assert!(!t.visible_at(1.9));
         assert!(t.visible_at(2.0));

@@ -27,6 +27,7 @@ use crate::config::Config;
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "webm", "avi", "mov", "m4v", "flv", "wmv", "mpeg", "mpg", "ts", "m2ts", "3gp",
 ];
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "aac", "ogg", "oga", "opus", "wav", "m4a", "wma", "aiff", "alac",
 ];
@@ -35,6 +36,7 @@ const AUDIO_EXTS: &[&str] = &[
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Video,
+    Image,
     Audio,
 }
 
@@ -77,6 +79,16 @@ impl Library {
         }
     }
 
+    /// The directory being indexed.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Find an item by its path relative to the media root.
+    pub fn get_by_path(&self, rel: &str) -> Option<MediaItem> {
+        self.get(&encode_id(rel))
+    }
+
     /// Number of items currently indexed.
     pub fn len(&self) -> usize {
         self.index.read().unwrap().by_id.len()
@@ -115,6 +127,10 @@ impl Library {
                 continue;
             }
             let abs_path = entry.path().to_path_buf();
+            // Dot-files are uploads still being written.
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let Some(kind) = classify(&abs_path) else {
                 continue;
             };
@@ -156,10 +172,12 @@ impl Library {
 }
 
 /// Classify a path by extension, or `None` if it is not a known media type.
-fn classify(path: &Path) -> Option<MediaKind> {
+pub fn classify(path: &Path) -> Option<MediaKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if VIDEO_EXTS.contains(&ext.as_str()) {
         Some(MediaKind::Video)
+    } else if IMAGE_EXTS.contains(&ext.as_str()) {
+        Some(MediaKind::Image)
     } else if AUDIO_EXTS.contains(&ext.as_str()) {
         Some(MediaKind::Audio)
     } else {
@@ -238,6 +256,7 @@ mod tests {
             classify(&PathBuf::from("song.FLAC")),
             Some(MediaKind::Audio)
         );
+        assert_eq!(classify(&PathBuf::from("logo.PNG")), Some(MediaKind::Image));
         assert_eq!(classify(&PathBuf::from("readme.txt")), None);
         assert_eq!(classify(&PathBuf::from("noext")), None);
     }

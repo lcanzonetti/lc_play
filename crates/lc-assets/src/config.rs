@@ -15,11 +15,14 @@ pub struct Config {
     pub media_dir: PathBuf,
     /// Path to the `ffmpeg` binary used for transcoding.
     pub ffmpeg: String,
+    /// Path to the `ffprobe` binary used to read media dimensions/duration.
+    pub ffprobe: String,
     /// How often the library is rescanned in the background. `0` disables it.
     pub scan_interval: Duration,
     /// Maximum number of concurrent transcode jobs. Protects CPU under load.
     pub max_transcodes: usize,
-    /// Whether to enable permissive CORS (handy for browser front-ends).
+    /// Whether to enable permissive CORS. On by default: the Producer UI is
+    /// served from another origin and must be able to list and upload.
     pub cors: bool,
 }
 
@@ -34,6 +37,7 @@ impl Config {
         let media_dir = PathBuf::from(env_or("LCMS_MEDIA_DIR", "./media"));
 
         let ffmpeg = env_or("LCMS_FFMPEG", "ffmpeg");
+        let ffprobe = env_or("LCMS_FFPROBE", "ffprobe");
 
         let scan_interval = Duration::from_secs(
             env_or("LCMS_SCAN_INTERVAL_SECS", "300")
@@ -53,7 +57,7 @@ impl Config {
             .unwrap_or(default_transcodes);
 
         let cors = matches!(
-            env_or("LCMS_CORS", "false").to_ascii_lowercase().as_str(),
+            env_or("LCMS_CORS", "true").to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         );
 
@@ -61,6 +65,7 @@ impl Config {
             bind,
             media_dir,
             ffmpeg,
+            ffprobe,
             scan_interval,
             max_transcodes,
             cors,

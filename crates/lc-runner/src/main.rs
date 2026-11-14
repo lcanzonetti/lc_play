@@ -3,8 +3,10 @@
 //! Three ways to run it:
 //!
 //! ```text
-//! lc-runner show.json                              stand-alone: local clock, keyboard transport
-//! lc-runner show.json --director 10.0.0.1:7401     renders show.json, timed by the Director
+//! lc-runner --director 10.0.0.1:7401               cluster: show, media and timing from the Director
+//! lc-runner --discover                             same, Director found by multicast
+//! lc-runner show.json                              stand-alone: local show file, keyboard transport
+//! lc-runner show.json --director 10.0.0.1:7401     local show file, timed by the Director
 //! lc-runner --headless --discover                  no GPU: sync agent only (bring-up, testing)
 //! ```
 //!
@@ -21,7 +23,8 @@ use clap::Parser;
 use lc_discovery::DiscoveryConfig;
 use lc_proto::{FrameRate, TransportState, NANOS_PER_SEC};
 use lc_runner::agent::{Agent, AgentConfig, DirectorAddr};
-use lc_runner::app::App;
+use lc_runner::app::{App, ShowSource};
+use lc_runner::assets::AssetCache;
 use lc_runner::playhead::Playhead;
 use lc_runner::show::Show;
 use lc_time::{ClusterClock, LocalClock, MonotonicClock};
@@ -33,7 +36,8 @@ use winit::event_loop::EventLoop;
     about = "LC Play Runner: synchronised multi-output playback node"
 )]
 struct Args {
-    /// Show file to render (defaults to the bundled example).
+    /// Show file to render instead of the Director's show. Without a
+    /// Director and without a file, the bundled example is used.
     show: Option<PathBuf>,
     /// Director control address, `host:port`. The robust choice for a fixed
     /// installation.
@@ -85,39 +89,44 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- windowed ----------------------------------------------------------
-    // Default to the bundled example wherever `cargo run` is invoked from.
-    let path = args
-        .show
-        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/examples/show.json").into());
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading show file '{}'", path.display()))?;
-    let mut show = Show::from_json(&text)
-        .with_context(|| format!("parsing show file '{}'", path.display()))?;
-    // Media paths in a show are relative to the show file, not the shell.
-    show.resolve_paths(path.parent().unwrap_or(".".as_ref()));
-    tracing::info!(
-        canvas = format!("{}x{}", show.canvas.width, show.canvas.height),
-        outputs = show.outputs.len(),
-        layers = show.layers.len(),
-        "loaded show '{}'",
-        path.display()
-    );
-
     let local_clock: Arc<dyn LocalClock> = Arc::new(MonotonicClock::new());
-    // What the show file asks for until (unless) a Director says otherwise.
-    let initial = TransportState {
-        playing: show.playback.autoplay,
-        anchor_cluster_ns: local_clock.now_ns(),
-        // Only wrap when looping is explicitly requested.
-        loop_ns: show
-            .playback
-            .looping
-            .then_some(show.playback.duration)
-            .flatten()
-            .map(|seconds| (seconds * NANOS_PER_SEC as f64) as i64)
-            .filter(|&ns| ns > 0),
-        ..TransportState::STOPPED
+
+    // Which show? An explicit file wins; otherwise the Director's; with
+    // neither, the bundled example (so `cargo run` shows something).
+    let local_show = match (&args.show, &director) {
+        (Some(path), _) => Some(load_show(path)?),
+        (None, Some(_)) => None,
+        (None, None) => Some(load_show(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/show.json").as_ref(),
+        )?),
     };
+
+    // What a local show file asks for until (unless) a Director says otherwise.
+    let initial = match &local_show {
+        Some(show) => TransportState {
+            playing: show.playback.autoplay,
+            anchor_cluster_ns: local_clock.now_ns(),
+            // Only wrap when looping is explicitly requested.
+            loop_ns: show
+                .playback
+                .looping
+                .then_some(show.playback.duration)
+                .flatten()
+                .map(|seconds| (seconds * NANOS_PER_SEC as f64) as i64)
+                .filter(|&ns| ns > 0),
+            ..TransportState::STOPPED
+        },
+        None => TransportState::STOPPED,
+    };
+
+    // Downloaded media lives next to the rest of the cache; without a cache
+    // directory it goes to the system's temporary folder.
+    let assets_dir = args
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("lcplay-runner"))
+        .join("assets");
+    let runner_name = args.name.clone();
 
     // The agent lives on its own small runtime; the main thread belongs to
     // the window system (a winit requirement on some platforms). `_runtime`
@@ -144,10 +153,35 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let source = match local_show {
+        Some(show) => ShowSource::Local(show),
+        None => ShowSource::Cluster {
+            runner_name,
+            assets: AssetCache::new(assets_dir),
+        },
+    };
     let event_loop = EventLoop::new()?;
-    let mut app = App::new(show, playhead);
+    let mut app = App::new(source, playhead);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Read and validate a local show file.
+fn load_show(path: &std::path::Path) -> anyhow::Result<Show> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading show file '{}'", path.display()))?;
+    let mut show = Show::from_json(&text)
+        .with_context(|| format!("parsing show file '{}'", path.display()))?;
+    // Media paths in a show are relative to the show file, not the shell.
+    show.resolve_paths(path.parent().unwrap_or(".".as_ref()));
+    tracing::info!(
+        canvas = format!("{}x{}", show.canvas.width, show.canvas.height),
+        outputs = show.outputs.len(),
+        layers = show.layers.len(),
+        "loaded show '{}'",
+        path.display()
+    );
+    Ok(show)
 }
 
 /// Resolve `host:port` (name or literal address) to one socket address.

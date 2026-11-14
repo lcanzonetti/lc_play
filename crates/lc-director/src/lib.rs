@@ -34,6 +34,7 @@
 //! * [`server`]: the axum WebSocket/HTTP front end, one task per connection.
 //! * [`Director`]: wires sockets, tasks and persistence together.
 
+pub mod osc;
 pub mod server;
 mod store;
 
@@ -74,6 +75,8 @@ pub struct DirectorConfig {
     pub frame_rate: FrameRate,
     /// Where to persist state across restarts. `None` = keep nothing.
     pub state_dir: Option<PathBuf>,
+    /// UDP address to accept OSC show-control messages on. `None` = off.
+    pub osc_addr: Option<SocketAddr>,
     /// Multicast announcement. `None` = do not announce (static addressing).
     pub discovery: Option<DiscoveryConfig>,
     /// The clock that defines cluster time. Tests substitute a skewed one.
@@ -89,6 +92,7 @@ impl Default for DirectorConfig {
             lead: Duration::from_millis(100),
             frame_rate: FrameRate::default(),
             state_dir: None,
+            osc_addr: None,
             discovery: Some(DiscoveryConfig::default()),
             local_clock: Arc::new(MonotonicClock::new()),
         }
@@ -263,7 +267,13 @@ impl Core {
         let show = st
             .show
             .as_ref()
-            .filter(|s| hello.role == Role::Runner && cached != Some(s.id.as_str()))
+            .filter(|s| match hello.role {
+                Role::Runner => cached != Some(s.id.as_str()),
+                // The Producer edits the show, so it always starts from the
+                // current one.
+                Role::Producer => true,
+                _ => false,
+            })
             .cloned();
         (conn, welcome, show)
     }
@@ -394,6 +404,14 @@ impl Core {
         if !document.is_object() {
             return Err("load_show: the show document must be a JSON object".into());
         }
+        // Refuse what no Runner could render, here, with a message for the
+        // operator — instead of distributing it and failing on every node.
+        // (Unknown fields are allowed and preserved: the document is stored
+        // and forwarded as received.)
+        serde_json::from_value::<lc_proto::ShowDocument>(document.clone())
+            .map_err(|e| format!("load_show: {e}"))?
+            .validate()
+            .map_err(|e| format!("load_show: {e}"))?;
         let mut st = self.state();
         let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
         // A fresh id per load: unlike the revision counter it can never
@@ -540,6 +558,14 @@ impl Director {
                 }
             })
         });
+
+        if let Some(addr) = cfg.osc_addr {
+            let socket = UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("binding OSC socket {addr}"))?;
+            tracing::info!("OSC control on udp://{}", socket.local_addr()?);
+            tasks.push(tokio::spawn(osc::run(socket, core.clone())));
+        }
 
         let server = tokio::spawn(server::serve(listener, core.clone(), shutdown_rx));
 
