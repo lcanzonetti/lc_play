@@ -18,8 +18,13 @@
 //!                                    └ stco / co64   file offset of each chunk
 //! ```
 //!
-//! Fragmented MP4 (`moof`) and edit lists are not supported; such files are
-//! played through ffmpeg instead.
+//! Files this reader cannot time exactly are refused, and then played
+//! through ffmpeg instead: fragmented MP4 (`moof`), edit lists that do more
+//! than map the whole track, and variable frame rates.
+//!
+//! Everything read here comes from a file the operator dropped in: every
+//! count is checked against the size of its table before anything is
+//! allocated, so a damaged or hostile file is an error, never a crash.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -99,7 +104,7 @@ fn atom_header_at(file: &mut File, pos: u64, end: u64) -> anyhow::Result<(u64, u
         }
         s => (8, s),
     };
-    if size < header || pos + size > end {
+    if size < header || pos.checked_add(size).is_none_or(|e| e > end) {
         bail!(
             "atom '{}' at {pos} has an invalid size",
             String::from_utf8_lossy(&kind)
@@ -162,9 +167,44 @@ fn parse_moov(moov: &[u8]) -> anyhow::Result<VideoTrack> {
         if !is_video {
             continue;
         }
+        check_edit_list(trak)?;
         return parse_video_trak(mdia).context("reading the video track");
     }
     bail!("no video track")
+}
+
+/// Number of entries of a table atom (count at `count_at`, entries of
+/// `entry` bytes from `count_at + 4`), checked against the atom's size.
+fn table_count(atom: &[u8], count_at: usize, entry: usize) -> anyhow::Result<usize> {
+    let count = be32(atom, count_at)? as usize;
+    let room = atom.len().saturating_sub(count_at + 4) / entry;
+    if count > room {
+        bail!("table claims {count} entries but has room for {room}");
+    }
+    Ok(count)
+}
+
+/// An edit list that only maps the whole track from its start is harmless;
+/// anything else (an initial delay, a trimmed start, several segments)
+/// changes which frame plays when, and is left to ffmpeg.
+fn check_edit_list(trak: &[u8]) -> anyhow::Result<()> {
+    let Some(elst) = child(trak, b"edts").and_then(|e| child(e, b"elst")) else {
+        return Ok(());
+    };
+    let version = elst.first().copied().unwrap_or(0);
+    let count = table_count(elst, 4, if version == 1 { 20 } else { 12 })?;
+    if count == 0 {
+        return Ok(());
+    }
+    let media_time = if version == 1 {
+        be64(elst, 8 + 8)? as i64
+    } else {
+        be32(elst, 8 + 4)? as i32 as i64
+    };
+    if count > 1 || media_time != 0 {
+        bail!("edit list ({count} entries, starting at media time {media_time}) not supported");
+    }
+    Ok(())
 }
 
 fn parse_video_trak(mdia: &[u8]) -> anyhow::Result<VideoTrack> {
@@ -207,34 +247,33 @@ fn parse_video_trak(mdia: &[u8]) -> anyhow::Result<VideoTrack> {
     let stts = child(stbl, b"stts").context("no stts")?;
     let mut delta = 0;
     let mut most = 0;
-    for i in 0..be32(stts, 4)? as usize {
+    let mut others = 0u64;
+    for i in 0..table_count(stts, 4, 8)? {
         let (count, d) = (be32(stts, 8 + 8 * i)?, be32(stts, 12 + 8 * i)?);
         if count > most {
+            others += most as u64;
             (most, delta) = (count, d);
+        } else {
+            others += count as u64;
         }
     }
     if timescale == 0 || delta == 0 {
         bail!("no usable frame rate");
     }
+    // A single odd frame (often the last) is tolerated; a variable frame
+    // rate is not: frame N would not be at N / fps.
+    if others > 1 {
+        bail!("variable frame rate");
+    }
 
     // stsz: one size for all samples, or a table.
-    let stsz = child(stbl, b"stsz").context("no stsz")?;
-    let (uniform, count) = (be32(stsz, 4)?, be32(stsz, 8)? as usize);
-    let sizes: Vec<u32> = if uniform != 0 {
-        vec![uniform; count]
-    } else {
-        (0..count)
-            .map(|i| be32(stsz, 12 + 4 * i))
-            .collect::<anyhow::Result<_>>()?
-    };
-
     // stco / co64: chunk offsets.
     let offsets: Vec<u64> = if let Some(stco) = child(stbl, b"stco") {
-        (0..be32(stco, 4)? as usize)
+        (0..table_count(stco, 4, 4)?)
             .map(|i| be32(stco, 8 + 4 * i).map(u64::from))
             .collect::<anyhow::Result<_>>()?
     } else if let Some(co64) = child(stbl, b"co64") {
-        (0..be32(co64, 4)? as usize)
+        (0..table_count(co64, 4, 8)?)
             .map(|i| be64(co64, 8 + 8 * i))
             .collect::<anyhow::Result<_>>()?
     } else {
@@ -244,24 +283,54 @@ fn parse_video_trak(mdia: &[u8]) -> anyhow::Result<VideoTrack> {
     // stsc: runs of (first chunk, samples per chunk); a run lasts until the
     // next run's first chunk.
     let stsc = child(stbl, b"stsc").context("no stsc")?;
-    let runs: Vec<(u32, u32)> = (0..be32(stsc, 4)? as usize)
+    let runs: Vec<(u32, u32)> = (0..table_count(stsc, 4, 12)?)
         .map(|i| Ok((be32(stsc, 8 + 12 * i)?, be32(stsc, 12 + 12 * i)?)))
         .collect::<anyhow::Result<_>>()?;
+    // How many samples the chunks can hold at most: bounds the sample count.
+    let mut capacity = 0u64;
+    for (ri, &(first, per_chunk)) in runs.iter().enumerate() {
+        let last = runs
+            .get(ri + 1)
+            .map_or(offsets.len() as u64 + 1, |r| r.0 as u64);
+        capacity += last.saturating_sub(first as u64) * per_chunk as u64;
+    }
+
+    // stsz: one size for all samples, or a table.
+    let stsz = child(stbl, b"stsz").context("no stsz")?;
+    let uniform = be32(stsz, 4)?;
+    let count = if uniform != 0 {
+        be32(stsz, 8)? as usize
+    } else {
+        table_count(stsz, 8, 4)?
+    };
+    if count as u64 > capacity {
+        bail!("{count} frames claimed, but the chunks hold at most {capacity}");
+    }
+    let sizes: Vec<u32> = if uniform != 0 {
+        vec![uniform; count]
+    } else {
+        (0..count)
+            .map(|i| be32(stsz, 12 + 4 * i))
+            .collect::<anyhow::Result<_>>()?
+    };
 
     let mut frames = Vec::with_capacity(count);
     let mut sample = 0usize;
     for (ri, &(first, per_chunk)) in runs.iter().enumerate() {
         let last = runs.get(ri + 1).map_or(offsets.len() as u32 + 1, |r| r.0);
         for chunk in first..last {
-            let mut at = *offsets
-                .get(chunk as usize - 1)
-                .context("chunk index out of range")?;
+            let index = (chunk as usize)
+                .checked_sub(1)
+                .context("chunk numbers start at 1")?;
+            let mut at = *offsets.get(index).context("chunk index out of range")?;
             for _ in 0..per_chunk {
                 let Some(&size) = sizes.get(sample) else {
                     break;
                 };
                 frames.push((at, size));
-                at += size as u64;
+                at = at
+                    .checked_add(size as u64)
+                    .context("frame beyond any file")?;
                 sample += 1;
             }
         }
@@ -330,6 +399,39 @@ mod tests {
             track.frames,
             vec![(100, 10), (110, 11), (200, 12), (212, 13), (300, 14)]
         );
+    }
+
+    #[test]
+    fn hostile_tables_are_errors_not_crashes() {
+        // A sample table claiming four billion frames (the reviewer's crash).
+        let stbl = |stsz: Vec<u8>, stsc: Vec<u8>| {
+            let mut entry = vec![0u8; 78];
+            entry[4..8].copy_from_slice(b"Hap1");
+            let stsd = [be(&[0, 1]), entry].concat();
+            [
+                atom(b"stsd", &stsd),
+                atom(b"stts", &be(&[0, 1, 5, 1])),
+                atom(b"stsz", &stsz),
+                atom(b"stsc", &stsc),
+                atom(b"stco", &be(&[0, 1, 100])),
+            ]
+            .concat()
+        };
+        let moov = |stbl: Vec<u8>| {
+            let mdia = [
+                atom(b"mdhd", &be(&[0, 0, 0, 30, 0, 0])),
+                atom(b"hdlr", &[be(&[0, 0]), b"vide".to_vec()].concat()),
+                atom(b"minf", &atom(b"stbl", &stbl)),
+            ]
+            .concat();
+            atom(b"trak", &atom(b"mdia", &mdia))
+        };
+        let huge = moov(stbl(be(&[0, 1000, 0xFFFF_FFF0]), be(&[0, 1, 1, 1, 1])));
+        assert!(parse_moov(&huge).is_err());
+        let huge_table = moov(stbl(be(&[0, 0, 0xFFFF_FFF0]), be(&[0, 1, 1, 1, 1])));
+        assert!(parse_moov(&huge_table).is_err());
+        let chunk_zero = moov(stbl(be(&[0, 10, 1]), be(&[0, 1, 0, 1, 1])));
+        assert!(parse_moov(&chunk_zero).is_err());
     }
 
     #[test]

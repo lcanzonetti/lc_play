@@ -162,10 +162,6 @@ impl App {
         }
     }
 
-    /// The operator asked for the outputs to be rebuilt: close every window,
-    /// drop every loaded texture and decoder, and build it all again from
-    /// the current show — what restarting the Runner would do, without
-    /// losing the cluster connection or the clock lock.
     /// Carry out the operator's requests queued by the agent.
     fn handle_requests(&mut self, event_loop: &ActiveEventLoop) {
         for action in self.playhead.take_requests() {
@@ -231,7 +227,12 @@ impl App {
         if let Some(gpu) = &self.gpu {
             gpu.poll();
         }
-        if !self.captures.iter().all(|c| c.take_ready()) {
+        let all_done = self.captures.iter().all(|c| c.take_ready());
+        let too_old = self
+            .captures
+            .first()
+            .is_some_and(|c| c.started.elapsed() > std::time::Duration::from_secs(3));
+        if !all_done && !too_old {
             return;
         }
         let pictures: Vec<(String, u32, u32, Vec<u8>)> = self
@@ -271,6 +272,10 @@ impl App {
         });
     }
 
+    /// The operator asked for the outputs to be rebuilt: close every window,
+    /// drop every loaded texture and decoder, and build it all again from
+    /// the current show — what restarting the Runner would do, without
+    /// losing the cluster connection or the clock lock.
     fn reload_if_requested(&mut self, event_loop: &ActiveEventLoop) {
         let requested = self.playhead.reload_requests();
         if requested == self.reloads_done {
@@ -298,11 +303,13 @@ impl App {
     /// Tell the cluster which monitors this machine has (they can change:
     /// displays get plugged in after start-up).
     fn report_monitors(&self, event_loop: &ActiveEventLoop) {
+        let primary = event_loop.primary_monitor();
         let monitors = event_loop
             .available_monitors()
             .enumerate()
             .map(|(index, m)| lc_proto::MonitorInfo {
                 index,
+                primary: primary.as_ref() == Some(&m),
                 name: m.name().unwrap_or_else(|| "unnamed".into()),
                 width: m.size().width,
                 height: m.size().height,
@@ -420,7 +427,14 @@ impl App {
         for (idx, output) in outputs.iter().enumerate() {
             let rw = match existing.remove(&output.id) {
                 Some(mut rw) => {
-                    if rw.output.window != output.window {
+                    // A windowed display without an explicit size is as big
+                    // as the canvas area it shows: resizing that area
+                    // resizes the window.
+                    let size_follows_area = !output.window.fullscreen
+                        && output.window.size.is_none()
+                        && (rw.output.canvas_rect.w, rw.output.canvas_rect.h)
+                            != (output.canvas_rect.w, output.canvas_rect.h);
+                    if rw.output.window != output.window || size_follows_area {
                         apply_placement(&rw.window, output, event_loop);
                     }
                     if rw.output.name != output.name {

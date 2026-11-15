@@ -23,3 +23,4 @@ tracing-subscriber.workspace = true
 lc-proto.workspace = true
 wry = "0.57.2"
 tao = "0.37.2"
+gethostname = "1.1.0"

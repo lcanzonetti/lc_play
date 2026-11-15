@@ -970,9 +970,9 @@ stage.addEventListener('dblclick', (e) => {
   if (!S.sel) fitStage();
 });
 $('#stage-fit').onclick = fitStage;
-$('#stage-actual').onclick = () => zoomAt(1 / view.k, view.W / 2, view.H / 2);
-$('#stage-zoom-in').onclick = () => zoomAt(1.25, view.W / 2, view.H / 2);
-$('#stage-zoom-out').onclick = () => zoomAt(0.8, view.W / 2, view.H / 2);
+$('#stage-actual').onclick = () => S.doc && view.W && zoomAt(1 / view.k, view.W / 2, view.H / 2);
+$('#stage-zoom-in').onclick = () => S.doc && view.W && zoomAt(1.25, view.W / 2, view.H / 2);
+$('#stage-zoom-out').onclick = () => S.doc && view.W && zoomAt(0.8, view.W / 2, view.H / 2);
 
 /** Move `pos` (with extent `size`) so that one of its edges lands on a
  *  candidate line, if one is within `tol`. */
@@ -1291,16 +1291,23 @@ function runnerNames() {
   return [...new Set(names)];
 }
 
-/** The monitor a Runner treats as primary: the one at the desktop origin. */
-const primaryMonitor = (mons) => mons.find((m) => m.x === 0 && m.y === 0) || mons[0] || null;
+/** The monitor a Runner treats as primary, as it reports it (older Runners
+ *  do not: then the one at the desktop origin). */
+const primaryMonitor = (mons) => mons.find((m) => m.primary) || mons.find((m) => m.x === 0 && m.y === 0) || mons[0] || null;
 
-/** Is this Runner on the operator's own computer? */
-const isLocal = (node) => /^(127\.|\[::1\]|::1|localhost)/.test(node?.addr || '');
+/** Is this Runner on the operator's own computer (the one running the
+ *  Producer)? Compared by host name, which the Producer service reports. */
+function isLocal(node) {
+  const runnerHost = node?.health?.machine?.hostname;
+  if (runnerHost && S.hostname) return runnerHost.toLowerCase() === S.hostname.toLowerCase();
+  return false;
+}
 
 function runnerAction(name, action, confirmText) {
   const go = () => {
     command({ type: 'runner_action', runner: name, action });
-    toast(`${name}: ${action.replace('_', ' ')} requested.`, true);
+    // Pictures and logs are asked for continually: no message for those.
+    if (!action.startsWith('send_')) toast(`${name}: ${action.replace('_', ' ')} requested.`, true);
   };
   if (!confirmText) return go();
   ask(confirmText).then((yes) => yes && go());
@@ -1308,7 +1315,9 @@ function runnerAction(name, action, confirmText) {
 
 async function remoteDesktop(host, kind) {
   try {
-    const res = await fetch(`local/remote-desktop?host=${encodeURIComponent(host)}&kind=${kind}`, { method: 'POST' });
+    // The header proves to the Producer service that the request comes from
+    // its own page (see remote_desktop in lc-producer/src/main.rs).
+    const res = await fetch(`local/remote-desktop?host=${encodeURIComponent(host)}&kind=${kind}`, { method: 'POST', headers: { 'X-LCPlay': '1' } });
     if (!res.ok) toast(await res.text());
   } catch {
     toast('Cannot reach the Producer service to open the remote desktop.');
@@ -1756,7 +1765,7 @@ function renderInspector() {
   }
   box.append(el('div', { class: 'btns' },
     el('button', { onclick: () => addDisplay(''), title: 'A new display, to the right of the others' }, '+ Display'),
-    el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right and size the stage to them' }, 'Side by side'),
+    el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right and size the stage to them (content stays where it is on the stage)' }, 'Side by side'),
     el('button', { onclick: stageToDisplays, title: 'Make the stage exactly the area the displays cover' }, 'Stage = displays')));
 }
 
@@ -1883,6 +1892,7 @@ function tick(now) {
   const cfg = await (await fetch('config.json')).json();
   const host = location.hostname || 'localhost';
   S.assetsUrl = cfg.assets || `http://${host}:${cfg.assets_port}`;
+  S.hostname = cfg.hostname || '';
   connect(`ws://${cfg.director || `${host}:${cfg.director_port}`}/ws`, cfg.protocol);
 
   setInterval(() => send({ type: 'ping' }), 2000);  // the Director drops silent clients

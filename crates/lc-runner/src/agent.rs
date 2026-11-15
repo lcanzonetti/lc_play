@@ -468,6 +468,17 @@ impl Link {
             RunnerAction::Restart if !self.renderer => {
                 std::process::exit(crate::machine::RESTART_EXIT_CODE)
             }
+            // A headless Runner has no outputs: an empty set of pictures is
+            // the honest answer, and there is nothing to put in standby.
+            RunnerAction::SendPreview if !self.renderer => {
+                conn.send(&ClientMessage::Preview {
+                    outputs: Vec::new(),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+            RunnerAction::Standby | RunnerAction::Resume | RunnerAction::ReloadOutputs
+                if !self.renderer => {}
             RunnerAction::ReloadOutputs => self.playhead.request_reload(),
             // Everything else concerns the outputs: the renderer's job.
             other => self.playhead.request(other),

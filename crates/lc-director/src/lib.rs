@@ -218,8 +218,8 @@ struct State {
     /// in a new timebase, but valid again if `previous_clock` is adopted.
     saved_transport: Option<TransportState>,
     saved_tasks: BTreeMap<String, TransportState>,
-    /// Every Runner seen, by name: its identity and machine, for listing it
-    /// while offline and for Wake-on-LAN.
+    /// Every Runner seen, by node id (two Runners may share a name): its
+    /// name and machine, for listing it while offline and for Wake-on-LAN.
     known_runners: BTreeMap<String, KnownRunner>,
 }
 
@@ -237,7 +237,7 @@ impl Core {
                     .iter()
                     .map(|k| {
                         (
-                            k.name.clone(),
+                            k.node_id.0.clone(),
                             KnownRunner {
                                 online: false,
                                 ..k.clone()
@@ -390,14 +390,14 @@ impl Core {
         if hello.role == Role::Runner {
             let entry = st
                 .known_runners
-                .entry(hello.name.clone())
+                .entry(hello.node_id.0.clone())
                 .or_insert_with(|| KnownRunner {
                     name: hello.name.clone(),
                     node_id: hello.node_id.clone(),
                     machine: None,
                     online: true,
                 });
-            entry.node_id = hello.node_id.clone();
+            entry.name = hello.name.clone();
             self.dirty.notify_one();
         }
 
@@ -555,10 +555,10 @@ impl Core {
         };
         node.clock_skew_ns = Some(skew);
         node.frame_error = frame_error;
-        let (name, machine) = (node.name.clone(), health.machine.clone());
+        let (key, machine) = (node.node_id.0.clone(), health.machine.clone());
         node.health = Some(health);
         // Remember the machine (its network address wakes it later).
-        if let (Some(known), Some(machine)) = (st.known_runners.get_mut(&name), machine) {
+        if let (Some(known), Some(machine)) = (st.known_runners.get_mut(&key), machine) {
             if known.machine.as_ref() != Some(&machine) {
                 known.machine = Some(machine);
                 self.dirty.notify_one();
@@ -568,7 +568,13 @@ impl Core {
 
     /// Forward a Runner's log to the Producers.
     pub fn runner_logs(&self, conn: u64, lines: Vec<String>) {
-        let node = self.state().nodes.get(&conn).cloned();
+        // Only Runners report logs; anything else claiming to is ignored.
+        let node = self
+            .state()
+            .nodes
+            .get(&conn)
+            .cloned()
+            .filter(|n| n.role == Role::Runner);
         if let Some(node) = node {
             self.publish(ServerMessage::RunnerLogs {
                 node_id: node.node_id,
@@ -580,7 +586,12 @@ impl Core {
 
     /// Forward a Runner's output pictures to the Producers.
     pub fn runner_preview(&self, conn: u64, outputs: Vec<OutputPreview>) {
-        let node = self.state().nodes.get(&conn).cloned();
+        let node = self
+            .state()
+            .nodes
+            .get(&conn)
+            .cloned()
+            .filter(|n| n.role == Role::Runner);
         if let Some(node) = node {
             self.publish(ServerMessage::RunnerPreview {
                 node_id: node.node_id,
@@ -593,21 +604,39 @@ impl Core {
     /// Send a Wake-on-LAN packet to a Runner's computer.
     fn wake_runner(&self, runner: &str) -> Result<(), String> {
         let st = self.state();
-        let known = st
+        // By name (every Runner of that name) or by node id.
+        let matching: Vec<&KnownRunner> = st
             .known_runners
             .values()
-            .find(|k| k.name == runner || k.node_id.0 == runner)
-            .ok_or_else(|| format!("no runner called '{runner}' has ever connected"))?;
-        let machine = known.machine.as_ref().ok_or_else(|| {
-            format!("the network address of '{runner}' is not known yet (it has not reported it)")
-        })?;
-        let mac = machine
-            .mac
-            .as_deref()
-            .ok_or_else(|| format!("'{runner}' did not report a network card address"))?;
-        wol::wake(mac, &machine.ip).map_err(|e| format!("wake '{runner}': {e}"))?;
-        tracing::info!("sent Wake-on-LAN to '{runner}' ({mac})");
-        Ok(())
+            .filter(|k| k.name == runner || k.node_id.0 == runner)
+            .collect();
+        if matching.is_empty() {
+            return Err(format!("no runner called '{runner}' has ever connected"));
+        }
+        let mut woken = 0;
+        let mut last_error = String::new();
+        for known in matching {
+            let Some(machine) = known.machine.as_ref() else {
+                last_error = format!("the network address of '{runner}' is not known yet");
+                continue;
+            };
+            let Some(mac) = machine.mac.as_deref() else {
+                last_error = format!("'{runner}' did not report a network card address");
+                continue;
+            };
+            match wol::wake(mac, &machine.ip) {
+                Ok(()) => {
+                    tracing::info!("sent Wake-on-LAN to '{runner}' ({mac})");
+                    woken += 1;
+                }
+                Err(e) => last_error = format!("wake '{runner}': {e}"),
+            }
+        }
+        if woken == 0 {
+            Err(last_error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Execute an operator command on the main timeline. See
@@ -925,7 +954,7 @@ impl Core {
                     online: st
                         .nodes
                         .values()
-                        .any(|n| n.role == Role::Runner && n.name == k.name),
+                        .any(|n| n.role == Role::Runner && n.node_id == k.node_id),
                     ..k.clone()
                 })
                 .collect(),

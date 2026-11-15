@@ -71,6 +71,9 @@ struct UiConfig {
     assets: Option<String>,
     assets_port: u16,
     protocol: u32,
+    /// This computer's name: tells the page which Runner is on the
+    /// operator's own machine (its primary screen is left alone).
+    hostname: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -132,6 +135,7 @@ async fn serve(listener: tokio::net::TcpListener, args: Args) {
         assets: args.assets.map(|a| a.trim_end_matches('/').to_string()),
         assets_port: 7403,
         protocol: lc_proto::PROTOCOL_VERSION,
+        hostname: gethostname::gethostname().to_string_lossy().into_owned(),
     };
     let app = Router::new()
         .route(
@@ -169,12 +173,20 @@ fn rdp() -> String {
 /// `POST /local/remote-desktop?host=<ip>&kind=rdp|vnc` — open this
 /// machine's remote-desktop client on a Runner's computer.
 ///
-/// Only for the operator sitting at this machine: the request must come
-/// from this machine itself (the Producer window, or a browser on it), so
-/// nobody on the network can make the Producer's computer launch programs.
-/// The host is checked to be a plain address or host name.
+/// Only for the operator sitting at this machine, and only from the
+/// Producer's own page:
+///
+/// * the connection must come from this machine (not from the network);
+/// * the `Host` header must name this machine, so a hostile web site cannot
+///   reach the endpoint by pointing a DNS name at 127.0.0.1;
+/// * the request must carry the header `X-LCPlay: 1`. A browser sends a
+///   cross-origin request with a custom header only after asking the server
+///   (CORS preflight), which this server never approves — so another web
+///   page open in the operator's browser cannot trigger this;
+/// * the host to connect to must be a plain address or host name.
 async fn remote_desktop(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(req): axum::extract::Query<RemoteDesktop>,
 ) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
@@ -182,6 +194,22 @@ async fn remote_desktop(
         return (
             StatusCode::FORBIDDEN,
             "remote desktop can only be opened from the Producer's own machine".into(),
+        );
+    }
+    let host_header = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let host_name = host_header
+        .rsplit_once(':')
+        .map_or(host_header, |(h, _)| h)
+        .trim_matches(['[', ']']);
+    let local_host = matches!(host_name, "localhost" | "127.0.0.1" | "::1");
+    let from_page = headers.get("x-lcplay").and_then(|v| v.to_str().ok()) == Some("1");
+    if !local_host || !from_page {
+        return (
+            StatusCode::FORBIDDEN,
+            "remote desktop can only be opened from the Producer's own page".into(),
         );
     }
     let host_ok = !req.host.is_empty()
@@ -217,7 +245,13 @@ async fn remote_desktop(
         _ => return (StatusCode::BAD_REQUEST, "kind must be rdp or vnc".into()),
     };
     match command.spawn() {
-        Ok(_) => (StatusCode::OK, "opened".into()),
+        Ok(mut child) => {
+            // Reap it when it ends, so it does not linger as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            (StatusCode::OK, "opened".into())
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cannot start the remote-desktop client: {e}"),

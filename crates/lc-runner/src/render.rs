@@ -783,13 +783,15 @@ impl Gpu {
         );
         self.queue.submit(Some(encoder.finish()));
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ok_flag = ok.clone();
         let flag = ready.clone();
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
-                if result.is_ok() {
-                    flag.store(true, std::sync::atomic::Ordering::Release);
-                }
+                // Done either way; only a successful map can be read.
+                ok_flag.store(result.is_ok(), std::sync::atomic::Ordering::Release);
+                flag.store(true, std::sync::atomic::Ordering::Release);
             });
         Capture {
             name: name.to_string(),
@@ -802,6 +804,8 @@ impl Gpu {
                 wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
             ),
             ready,
+            ok,
+            started: std::time::Instant::now(),
         }
     }
 
@@ -913,7 +917,11 @@ pub struct Capture {
     pub height: u32,
     padded: u32,
     bgra: bool,
+    /// The GPU has finished with it (successfully or not)…
     ready: Arc<std::sync::atomic::AtomicBool>,
+    /// …and it can be read.
+    ok: Arc<std::sync::atomic::AtomicBool>,
+    pub started: std::time::Instant,
 }
 
 impl Capture {
@@ -924,7 +932,9 @@ impl Capture {
 
     /// RGBA pixels, once the GPU has delivered them.
     pub fn take(&self) -> Option<Vec<u8>> {
-        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire)
+            || !self.ok.load(std::sync::atomic::Ordering::Acquire)
+        {
             return None;
         }
         let data = self.buffer.slice(..).get_mapped_range();

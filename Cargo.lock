@@ -2022,6 +2022,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "gethostname",
  "lc-proto",
  "serde",
  "serde_json",

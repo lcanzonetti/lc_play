@@ -46,6 +46,10 @@ use crate::video::{media_frame, VideoContent, VideoInfo};
 /// Frames decoded ahead of the one on screen.
 const AHEAD: i64 = 4;
 
+/// Largest playback stride (frames per rendered frame) prefetched for: at
+/// 16× speed on a 60 fps clip and 60 fps output.
+const MAX_STRIDE: i64 = 16;
+
 /// The texture layout of a HAP variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HapFormat {
@@ -349,15 +353,17 @@ pub struct HapContent {
 }
 
 impl HapContent {
-    /// Whether this track can be played by [`HapContent`] on this GPU.
-    pub fn supports(track: &VideoTrack, gpu: &TextureFactory) -> bool {
-        let fits = track.width.div_ceil(4) * 4 <= gpu.max_dimension
-            && track.height.div_ceil(4) * 4 <= gpu.max_dimension;
-        gpu.supports_bc && fits && HapFormat::from_codec(&track.codec).is_some()
+    /// Frames in one pass of a looping clip (`None` if it does not loop).
+    fn loop_span(&self) -> Option<i64> {
+        let total = self.track.frames.len() as i64;
+        let first = (self.timing.media_in.max(0.0) * self.track.fps()).floor() as i64;
+        (self.timing.media_loop || self.timing.free_run)
+            .then_some(total - first)
+            .filter(|&n| n > 0)
     }
 
     fn new(path: &str, track: VideoTrack, timing: &Timing, gpu: &TextureFactory) -> Self {
-        let format = HapFormat::from_codec(&track.codec).expect("checked by supports()");
+        let format = HapFormat::from_codec(&track.codec).expect("checked by open_video");
         // Compressed textures come in whole 4×4 blocks.
         let (tw, th) = (track.width.div_ceil(4) * 4, track.height.div_ceil(4) * 4);
         let texture = gpu.texture(path, tw, th, format.texture_format());
@@ -435,6 +441,8 @@ impl HapContent {
             let mut st = self.shared.state.lock().unwrap();
             st.stop = true;
             st.ready.clear();
+            // A frame that failed (a read error) gets another chance later.
+            st.failed.clear();
         }
         self.shared.wake.notify_all();
         for handle in self.workers.drain(..) {
@@ -448,20 +456,41 @@ impl HapContent {
         let total = self.track.frames.len() as i64;
         let first = (self.timing.media_in.max(0.0) * self.track.fps()).floor() as i64;
         let loops = self.timing.media_loop || self.timing.free_run;
-        let mut frames = Vec::with_capacity(AHEAD as usize);
-        for k in 0..AHEAD {
-            let mut f = want + k * self.step;
-            if loops && total > first {
-                f = first + (f - first).rem_euclid(total - first);
-            } else if !(0..total).contains(&f) {
-                break;
-            }
-            if !frames.contains(&f) {
-                frames.push(f);
-            }
-        }
-        frames
+        prefetch_window(want, self.step, total, first, loops)
     }
+}
+
+/// The playback stride after the wanted frame moved from `last` to `want`:
+/// the actual difference, unless it is no movement, an implausible jump, or
+/// (for a loop of `span` frames) a loop wrapping round — then the previous
+/// stride stands.
+fn next_stride(previous: i64, last: i64, want: i64, span: Option<i64>) -> i64 {
+    let delta = want - last;
+    let wrapped = span.is_some_and(|span| delta.abs() > span / 2);
+    if delta != 0 && !wrapped && delta.abs() <= MAX_STRIDE {
+        delta
+    } else {
+        previous
+    }
+}
+
+/// The frames to have decoded, soonest first: `want`, then the next ones at
+/// `step` apart, wrapping into `first..total` if the clip loops and stopping
+/// at its ends otherwise.
+fn prefetch_window(want: i64, step: i64, total: i64, first: i64, loops: bool) -> Vec<i64> {
+    let mut frames = Vec::with_capacity(AHEAD as usize);
+    for k in 0..AHEAD {
+        let mut f = want + k * step;
+        if loops && total > first {
+            f = first + (f - first).rem_euclid(total - first);
+        } else if !(0..total).contains(&f) {
+            break;
+        }
+        if !frames.contains(&f) {
+            frames.push(f);
+        }
+    }
+    frames
 }
 
 fn worker(
@@ -537,9 +566,13 @@ impl Content for HapContent {
         let total = Some(self.track.frames.len() as i64);
         let want = media_frame(&self.timing, self.track.fps(), total, t);
         if let Some(last) = self.last_want {
-            if want != last {
-                self.step = (want - last).signum();
-            }
+            // The stride of playback, in frames per rendered frame: 1 at
+            // normal speed, 2 at double speed (or with a 60 fps clip on a
+            // 30 fps output), negative in reverse. Prefetching follows it, so
+            // the frames decoded are the ones that will be wanted. A jump of
+            // more than half the loop is a loop wrapping round, not a change
+            // of direction: the stride is kept.
+            self.step = next_stride(self.step, last, want, self.loop_span());
         }
         self.last_want = Some(want);
         self.start_workers();
@@ -554,7 +587,8 @@ impl Content for HapContent {
             if self.shown == Some(want) {
                 return;
             }
-            st.ready.get(&want).map(|data| (want, data.clone()))
+            // Taken out, not copied: the texture is about to hold it.
+            st.ready.remove(&want).map(|data| (want, data))
         };
         // The wanted frame is not decoded yet: keep showing the previous one
         // (never wait — every output on the machine would stall).
@@ -848,6 +882,27 @@ mod tests {
             1000.0 / per,
             out.len() as f64 / 1e6
         );
+    }
+
+    #[test]
+    fn prefetch_follows_speed_direction_and_loops() {
+        // Normal speed, double speed, reverse.
+        assert_eq!(prefetch_window(10, 1, 60, 0, false), [10, 11, 12, 13]);
+        assert_eq!(prefetch_window(10, 2, 60, 0, false), [10, 12, 14, 16]);
+        assert_eq!(prefetch_window(10, -1, 60, 0, false), [10, 9, 8, 7]);
+        // Near the end of a looping clip: wraps to its start.
+        assert_eq!(prefetch_window(58, 1, 60, 0, true), [58, 59, 0, 1]);
+        // Not looping: stops at the end.
+        assert_eq!(prefetch_window(58, 1, 60, 0, false), [58, 59]);
+
+        // The stride follows the movement…
+        assert_eq!(next_stride(1, 10, 12, None), 2);
+        assert_eq!(next_stride(1, 10, 9, None), -1);
+        // …but a loop wrapping (59 → 0) is not a reversal, and standing
+        // still or a seek keeps the stride.
+        assert_eq!(next_stride(1, 59, 0, Some(60)), 1);
+        assert_eq!(next_stride(2, 10, 10, None), 2);
+        assert_eq!(next_stride(1, 10, 500, None), 1);
     }
 
     #[test]

@@ -167,6 +167,10 @@ pub enum RunnerAction {
 pub struct MonitorInfo {
     /// Index to use in a display's `window.monitor`.
     pub index: usize,
+    /// The operating system's primary monitor (where a display with no
+    /// monitor number goes fullscreen).
+    #[serde(default)]
+    pub primary: bool,
     pub name: String,
     pub width: u32,
     pub height: u32,

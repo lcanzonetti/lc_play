@@ -66,17 +66,17 @@ Commands:
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
+| `seek` | `show_ns ≥ 0` | jump; play state unchanged |
+| `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
+| `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
+| `load_show` | `document` (JSON object) | new show revision, distributed to Runners |
+| `status` | — | Director replies with `cluster` |
 
 Runner actions: `reload_outputs` (close and rebuild the outputs), `restart`
 and `quit` (the Runner program), `standby` / `resume` (close / reopen the
 outputs, staying connected), `reboot` and `power_off` (the computer; only if
 the Runner was started with `--allow-power`), `send_logs` (it replies with
 `logs`), `send_preview` (it replies with `preview`).
-| `seek` | `show_ns ≥ 0` | jump; play state unchanged |
-| `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
-| `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
-| `load_show` | `document` (JSON object) | new show revision, distributed to Runners |
-| `status` | — | Director replies with `cluster` |
 
 Transport commands take effect `lead_ns` (default 100 ms) after the Director
 receives them, simultaneously on all Runners. `timeline` on the `command`
@@ -86,7 +86,7 @@ timeline, otherwise the id of an auxiliary timeline (task) of the show.
 ### Director → client
 
 ```json
-{ "type": "welcome", "protocol": 1, "director_id": "…", "name": "main",
+{ "type": "welcome", "protocol": 2, "director_id": "…", "name": "main",
   "clock_id": 1234, "sync_port": 7402, "lead_ns": 100000000,
   "frame_rate": { "num": 60, "den": 1 }, "transport": { … }, "show_revision": 3 }
 { "type": "transport", "clock_id": 1234, "state": { … }, "timeline": null }

@@ -235,18 +235,27 @@ impl Decoder {
         // `fps=` makes the output strictly constant-rate, so "the n-th frame
         // out of the pipe" is a well-defined point in time.
         let mut filter = format!("fps={}/{}", info.fps_num, info.fps_den);
-        if (width, height) != (info.width, info.height) {
-            filter.push_str(&format!(",scale={width}:{height}"));
-        }
+        let scale = if (width, height) != (info.width, info.height) {
+            format!("{width}:{height}:")
+        } else {
+            String::new()
+        };
         let pix_fmt = match layout {
             // Renderer textures are premultiplied; files with alpha are
             // straight.
             Layout::Rgba => {
+                if !scale.is_empty() {
+                    filter.push_str(&format!(",scale={}", scale.trim_end_matches(':')));
+                }
                 filter.push_str(",format=rgba,premultiply=inplace=1");
                 "rgba"
             }
             Layout::Yuv420 => {
-                filter.push_str(",format=yuv420p");
+                // The shader expects limited ("TV") range. Many files are
+                // full range (VP9, HEVC from phones, screen recordings); a
+                // plain format conversion would pass their levels through
+                // and crush blacks / clip whites. Convert explicitly.
+                filter.push_str(&format!(",scale={scale}out_range=tv,format=yuv420p"));
                 "yuv420p"
             }
         };
@@ -664,6 +673,45 @@ mod tests {
         let (index, frame) = d.next_blocking().unwrap();
         assert_eq!((index, box_x(&frame)), (8, Some(32)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_range_video_arrives_in_limited_range() {
+        // A full-range ("PC") white frame must reach the shader as limited-
+        // range white (Y = 235), which is what the shader assumes.
+        let dir = std::env::temp_dir().join(format!("lcplay-range-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("full.webm");
+        let ok = Command::new(ffmpeg_bin())
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=white:s=64x48:r=10:d=1",
+            ])
+            .args([
+                "-vf",
+                "scale=out_range=pc,format=yuv420p",
+                "-color_range",
+                "pc",
+            ])
+            .args(["-c:v", "libvpx-vp9"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("SKIPPED: ffmpeg with libvpx not available");
+            return;
+        }
+        let path = path.to_string_lossy();
+        let info = VideoInfo::probe(&path).unwrap();
+        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0).unwrap();
+        let (_, frame) = d.next_blocking().unwrap();
+        assert!((233..=237).contains(&frame[0]), "Y of white = {}", frame[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

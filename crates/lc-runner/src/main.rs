@@ -82,8 +82,20 @@ fn main() -> anyhow::Result<()> {
         .with_writer(lc_runner::machine::LogWriter)
         .init();
     let args = Args::parse();
+    lc_runner::machine::log_panics();
+    // The log also goes to a file next to the cache, so that what happened
+    // before a crash or restart can still be read from the Producer. The
+    // supervisor writes there too (it reports the crashes); the Runner itself
+    // reads the end of the file back when it starts.
+    let log_file = args
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("lcplay-runner-{}", args.name)))
+        .join("runner.log");
+    let is_supervisor = !args.worker && !args.no_supervise;
+    lc_runner::machine::persist_log(&log_file, !is_supervisor);
 
-    if !args.worker && !args.no_supervise {
+    if is_supervisor {
         return supervise();
     }
     if args.worker {
