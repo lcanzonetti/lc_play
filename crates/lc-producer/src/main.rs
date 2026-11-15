@@ -146,9 +146,82 @@ async fn serve(listener: tokio::net::TcpListener, args: Args) {
             "/style.css",
             get(|| async { asset("text/css; charset=utf-8", STYLE_CSS) }),
         )
-        .route("/config.json", get(move || async move { Json(config) }));
+        .route("/config.json", get(move || async move { Json(config) }))
+        .route("/local/remote-desktop", axum::routing::post(remote_desktop));
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("producer server stopped: {e}");
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteDesktop {
+    host: String,
+    /// `rdp` (Windows Remote Desktop) or `vnc`.
+    #[serde(default = "rdp")]
+    kind: String,
+}
+
+fn rdp() -> String {
+    "rdp".into()
+}
+
+/// `POST /local/remote-desktop?host=<ip>&kind=rdp|vnc` — open this
+/// machine's remote-desktop client on a Runner's computer.
+///
+/// Only for the operator sitting at this machine: the request must come
+/// from this machine itself (the Producer window, or a browser on it), so
+/// nobody on the network can make the Producer's computer launch programs.
+/// The host is checked to be a plain address or host name.
+async fn remote_desktop(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::Query(req): axum::extract::Query<RemoteDesktop>,
+) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            "remote desktop can only be opened from the Producer's own machine".into(),
+        );
+    }
+    let host_ok = !req.host.is_empty()
+        && req.host.len() < 256
+        && req
+            .host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    if !host_ok {
+        return (StatusCode::BAD_REQUEST, "not a host name or address".into());
+    }
+    let host = req.host;
+    let mut command = match (req.kind.as_str(), std::env::consts::OS) {
+        ("rdp", "windows") => {
+            let mut c = std::process::Command::new("mstsc");
+            c.arg(format!("/v:{host}"));
+            c
+        }
+        (kind @ ("rdp" | "vnc"), os) => {
+            let url = if kind == "rdp" {
+                format!("rdp://full%20address=s:{host}")
+            } else {
+                format!("vnc://{host}")
+            };
+            let mut c = std::process::Command::new(match os {
+                "windows" => "explorer",
+                "macos" => "open",
+                _ => "xdg-open",
+            });
+            c.arg(url);
+            c
+        }
+        _ => return (StatusCode::BAD_REQUEST, "kind must be rdp or vnc".into()),
+    };
+    match command.spawn() {
+        Ok(_) => (StatusCode::OK, "opened".into()),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot start the remote-desktop client: {e}"),
+        ),
     }
 }
 

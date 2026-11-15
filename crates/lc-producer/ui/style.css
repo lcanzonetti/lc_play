@@ -79,6 +79,8 @@ input[type=checkbox] { vertical-align: -2px; }
   box-shadow: 0 6px 24px rgba(0, 0, 0, .45); overflow: hidden;
 }
 .win.front { border-color: #55607a; }
+/* `.win` sets display, which would otherwise override the hidden attribute. */
+.win[hidden] { display: none; }
 .win-head {
   flex: none; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px;
   background: var(--head); border-bottom: 1px solid var(--line); cursor: move;
@@ -177,6 +179,19 @@ h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spac
 .disp { display: grid; grid-template-columns: 1fr auto auto auto; gap: 6px; align-items: center; padding: 3px 4px; border-radius: 4px; font-size: 12px; }
 .disp:hover, .disp.sel { background: var(--head); }
 .disp .name { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* runner cards: action buttons, previews */
+.runner .actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.runner .actions button { padding: 1px 7px; font-size: 12px; }
+.runner .previews { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.runner .previews figure { margin: 0; }
+.runner .previews img { display: block; max-width: 100%; width: 220px; background: #000; border: 1px solid var(--line); }
+.runner .previews figcaption { font-size: 11px; color: var(--dim); }
+.runner.offline { opacity: .75; }
+select.out { max-width: 220px; }
+pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; user-select: text; }
+#stage-zoom { min-width: 44px; text-align: center; }
+#stage-wrap.panning, #stage-wrap.panning canvas { cursor: grabbing; }
 
 #toast {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);

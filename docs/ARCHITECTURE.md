@@ -345,24 +345,66 @@ all. Content hashing is the planned fix.
 
 ### Video
 
-`lc-runner/src/video.rs`. An `ffmpeg` child process per playing video cue
-writes raw RGBA frames to a pipe. Each rendered frame the renderer computes
-the file frame that belongs to the current show time
-(`floor(media_time × fps)`) and advances the decoder's output to it, dropping
-frames the clock has passed and holding the previous one if the decoder is
-behind. A jump restarts `ffmpeg` at the new position (frame-exact: verified
-against a clip with burned-in frame numbers). A cue is pre-rolled one second
-before it starts so its first frame is already in the texture, and a second
-decoder is started just before a loop point.
+Whatever the decoder, the frame on screen is a pure function of time: each
+rendered frame computes the file frame that belongs to the layer's time
+(`floor(media_time × fps)`, `video.rs: media_frame`) and shows it if it is
+ready, or the newest frame available if not. Nothing ever waits: loading
+(probing a file, decoding an image) happens on worker threads and a layer is
+transparent until its first frame is in.
 
-This is a correctness-first implementation: it costs a full-frame memory
-copy per frame and scales with CPU, not GPU. Two Runners given the same show
-time show the same frame as long as their decoders keep up; one that cannot
-decode in real time shows the newest frame it has (i.e. runs *behind*, and
-jumps forward when it has fallen two seconds back) rather than freezing.
-Because the decoder only runs forward, **reverse playback of video is
-choppy**: the decoder is restarted at most four times a second and the
-picture held in between.
+**HAP** (`hap.rs`, `mov.rs`). HAP frames are block-compressed GPU textures
+(BC1/DXT1, BC3/DXT5, BC7), mostly wrapped in Snappy. The Runner reads the
+QuickTime sample table, so every frame is addressed directly in the file;
+two worker threads read and unpack the next few frames in the direction of
+playback (chunked frames are unpacked in parallel), and the render thread
+uploads the wanted one as a BCn texture that the GPU samples directly. Hap
+Q's scaled YCoCg is converted in the shader. Seeking, looping and reverse
+playback cost nothing extra. Measured here: unpacking a 9976×2176 frame
+takes 1–2 ms (test pattern; real footage compresses less and takes longer);
+the whole system played it at ~57 fps on lavapipe (software Vulkan, 4 CPU
+cores). Needs a GPU with BC texture support — every desktop GPU has it.
+
+**Everything else** (`video.rs`). An `ffmpeg` child process per playing
+cue, with `-hwaccel auto` (NVDEC, Quick Sync, D3D11VA, VideoToolbox where
+present), writes YUV 4:2:0 planes to a pipe — 1.5 bytes per pixel instead of
+4 for RGBA — and the shader converts them (BT.709 or BT.601, limited range).
+Only video with alpha travels as premultiplied RGBA. A jump restarts
+`ffmpeg` at the new position (frame-exact: verified against a clip with
+frame-numbered content). A cue is pre-rolled one second before it starts,
+and a second decoder is started just before a loop point. Every frame still
+crosses the CPU once, so this path scales with CPU and memory bandwidth, not
+GPU. Because the decoder only runs forward, reverse playback is choppy
+(restarts are limited to four a second).
+
+### Outputs
+
+A Runner opens one window per display assigned to it — borderless
+fullscreen on the configured monitor, or a plain window as a preview.
+Edits to a display are applied to its open window (position, size,
+fullscreen, monitor) and GPU state (warp, blend, rotation) in place; windows
+are only opened and closed when displays are added or removed. On Windows
+the renderer uses Direct3D 12 (`LCPLAY_BACKEND` overrides).
+
+### Runner management
+
+`lc-runner` is started as a supervisor that runs the real Runner as a child
+(`--worker`): exit code 0 ends both, the restart code (75) starts it again
+at once, anything else (a crash) starts it again after a growing pause. The
+child exits when the supervisor's end of its stdin closes, so killing the
+supervisor never leaves an orphan, on Windows too.
+
+Operator actions travel as `runner_action` commands; the Director forwards
+them to the named Runner. A Runner reports its machine (host name, OS,
+version, IP, the MAC of the interface it reaches the Director through) in
+its health; the Director remembers every Runner it has seen, persisted, so
+the Producer can list an offline Runner and wake it (Wake-on-LAN, sent by
+the Director as a UDP broadcast). Logs (the last 400 lines, kept in memory
+by the Runner) and output pictures (rendered small through the warp pass,
+PNG) are sent on request and relayed only to Producers and controllers.
+Rebooting or powering off the computer requires `--allow-power` on that
+Runner. Remote desktop is launched by the Producer service on its own
+machine (`mstsc` for RDP on Windows, `vnc://` / `rdp://` URLs elsewhere),
+for requests from that machine only.
 
 ## 8. Roadmap
 
@@ -371,19 +413,20 @@ picture held in between.
 | ✅ | M0 | Workspace restructure: existing server → `lc-assets`, existing engine → `lc-runner`. |
 | ✅ | M1 | Communication and synchronisation: protocol, cluster clock, discovery, control channel, Director, Runner agent, `lc-ctl`, failure handling. |
 | ✅ | M2–M5, basic | Asset upload/serving and Runner cache; unified show document rendered live; video via `ffmpeg`; Producer UI; OSC; one-machine launcher. |
+| ✅ | Performance, management | GPU-decoded HAP; hardware-decoded YUV video; non-blocking loading; outputs updated in place; supervisor; restart/quit/standby/power/Wake-on-LAN/log/preview/remote desktop. |
 
 Still to do, roughly in order of how much they limit real use:
 
 | Area | Missing |
 |---|---|
-| Playback performance | GPU-friendly decode (HAP, or hardware H.264/HEVC) instead of raw frames over a pipe; vblank-predicted sampling; audio. |
+| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); vblank-predicted sampling; audio. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
-| Authoring | Keyframes/tweens; a warp editor; snapping; free-running media that starts on its first frame; control cues executed by Runners (so they work without the Director). |
+| Authoring | Keyframes/tweens; a warp editor; free-running media that starts on its first frame; control cues executed by Runners (so they work without the Director). |
 | Packaging | An installer; a launcher without a console window; the Producer preview is the web view's own video playback, not frame-exact. |
 | External control | MIDI/MTC, Art-Net, LTC chase; per-show control mapping. |
 | Outputs | Freeform mesh warp; SDI and NDI outputs (NDI needs the proprietary NDI SDK and its licence); framelock integration. |
 | Resilience | Standby Director; arbitration between two Directors. |
-| Health | GPU load and temperature (the Runner reports fps and sync quality only). |
+| Health | GPU load and temperature (the Runner reports fps, sync quality, outputs, monitors and machine only). |
 | Security | Authentication, encryption, WebSocket origin check. |
 | Platforms | Only Linux has been run. Windows and macOS type-check but are untested. |
 

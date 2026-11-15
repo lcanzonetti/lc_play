@@ -44,7 +44,12 @@ least every 6 s (`ping` or `health`), or it is dropped.
   "sync": { "locked": true, "samples": 64, "offset_ns": 0, "drift_ppm": -3.1,
             "rtt_ns": 180000, "error_ns": 21000, "holdover_ns": 400000000 } }
 { "type": "ping" }
+{ "type": "logs", "lines": [ "…" ] }
+{ "type": "preview", "outputs": [ { "name": "Left", "width": 480, "height": 270, "png_base64": "…" } ] }
 ```
+
+`logs` and `preview` are only sent by Runners, in answer to `send_logs` /
+`send_preview`.
 
 `runner` is only sent by Runners. `show_id` identifies the cached show; the
 Director sends the show unless it matches (revisions are for humans — they
@@ -59,7 +64,14 @@ Commands:
 |---|---|---|
 | `play`, `pause` | — | |
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
-| `runner_action` | `runner` (name or node id), `action`: `reload_outputs` | that Runner closes and rebuilds its outputs |
+| `runner_action` | `runner` (name or node id), `action` | see below |
+| `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
+
+Runner actions: `reload_outputs` (close and rebuild the outputs), `restart`
+and `quit` (the Runner program), `standby` / `resume` (close / reopen the
+outputs, staying connected), `reboot` and `power_off` (the computer; only if
+the Runner was started with `--allow-power`), `send_logs` (it replies with
+`logs`), `send_preview` (it replies with `preview`).
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
@@ -79,6 +91,8 @@ timeline, otherwise the id of an auxiliary timeline (task) of the show.
   "frame_rate": { "num": 60, "den": 1 }, "transport": { … }, "show_revision": 3 }
 { "type": "transport", "clock_id": 1234, "state": { … }, "timeline": null }
 { "type": "runner_action", "node_id": "…", "action": "reload_outputs" }
+{ "type": "runner_logs", "node_id": "…", "name": "left", "lines": [ "…" ] }
+{ "type": "runner_preview", "node_id": "…", "name": "left", "outputs": [ … ] }
 { "type": "show", "revision": 3, "id": "…uuid…", "document": { … } }
 { "type": "cluster", "clock_id": 1234, "cluster_ns": 0, "frame_rate": { … },
   "transport": { … }, "show_ns": 0, "frame": 0, "show_revision": 3,
@@ -114,7 +128,12 @@ stage: nothing of it is drawn (a paused timeline, by contrast, holds its
 picture). The main timeline is always active.
 
 A Runner's `health` also reports `monitors` (index, name, size, position),
-`gpu` and `outputs` (open windows).
+`gpu`, `outputs` (open windows), `standby`, and `machine`: `hostname`, `os`,
+`version`, `ip`, `mac`, `allow_power`, `supervised`. `cluster` carries
+`known_runners`: every Runner the Director has seen (`name`, `node_id`,
+`machine`, `online`), so offline ones can be listed and woken.
+`runner_logs` / `runner_preview` are relayed to Producers and controllers,
+not to Runners.
 
 A receiver keeps the state it has until the new one's anchor is reached, and
 ignores any state whose `epoch` is not higher than the newest it knows (within

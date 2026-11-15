@@ -436,7 +436,13 @@ impl Link {
     /// Carry out an operator action addressed to this Runner. An error is
     /// the reason to end the session.
     async fn act(&self, action: RunnerAction, conn: &mut Connection) -> Result<(), String> {
-        tracing::info!("operator request: {action:?}");
+        // Pictures and logs are asked for every second or two while the
+        // operator watches them: not worth a log line each.
+        if matches!(action, RunnerAction::SendLogs | RunnerAction::SendPreview) {
+            tracing::debug!("operator request: {action:?}");
+        } else {
+            tracing::info!("operator request: {action:?}");
+        }
         match action {
             RunnerAction::SendLogs => {
                 let lines = crate::machine::recent_log();

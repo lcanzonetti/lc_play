@@ -103,6 +103,11 @@ const S = {
   status: null,         // last cluster status
   library: [],          // items on the Asset Manager
   pxPerSec: 40,         // timeline zoom
+  view: { zoom: 1, panX: 0, panY: 0 }, // stage view: zoom relative to "fit", pan in screen px
+  previewOn: new Set(), // runners whose output pictures are being shown
+  previews: {},         // runner name → [{ name, width, height, png_base64 }]
+  logRunner: '',        // runner shown in the log window
+  logs: {},             // runner name → log lines
   undo: [],
   redo: [],
 };
@@ -236,6 +241,7 @@ function defaultLayout() {
     'win-timeline':  { x: 0, y: top, w: W - right, h: H - top },
     'win-tasks':     { x: W - right, y: top, w: right, h: Math.round((H - top) * 0.4) },
     'win-runners':   { x: W - right, y: top + Math.round((H - top) * 0.4), w: right, h: H - top - Math.round((H - top) * 0.4) },
+    'win-log':       { x: Math.round(W * 0.25), y: Math.round(H * 0.15), w: Math.round(W * 0.5), h: Math.round(H * 0.5), visible: false },
   };
 }
 
@@ -398,6 +404,14 @@ function onMessage(msg) {
       pushTransport(msg.transport, MAIN);
       for (const [id, state] of Object.entries(msg.tasks || {})) pushTransport(state, id);
       renderCluster(); renderRunners();
+      break;
+    case 'runner_preview':
+      S.previews[msg.name] = msg.outputs;
+      showPreviews(msg.name);
+      break;
+    case 'runner_logs':
+      S.logs[msg.name] = msg.lines;
+      if (msg.name === S.logRunner) renderLog();
       break;
     case 'error':
       // If it was our document that was refused, no echo will come.
@@ -791,8 +805,11 @@ function drawStage() {
   if (!S.doc) return;
 
   const st = S.doc.stage;
-  const k = Math.min((W - 48) / st.width, (H - 48) / st.height);
-  view = { k, ox: (W - st.width * k) / 2, oy: (H - st.height * k) / 2 };
+  // "Fit" scale times the operator's zoom, centred, then panned.
+  const fit = Math.min((W - 48) / st.width, (H - 48) / st.height);
+  const k = fit * S.view.zoom;
+  view = { k, fit, W, H, ox: (W - st.width * k) / 2 + S.view.panX, oy: (H - st.height * k) / 2 + S.view.panY };
+  $('#stage-zoom').textContent = `${Math.round(k * 100)}%`;
   ctx.save();
   ctx.translate(view.ox, view.oy);
   ctx.scale(k, k);
@@ -885,6 +902,14 @@ stage.addEventListener('mousedown', (e) => {
   const sx = e.clientX - box.left, sy = e.clientY - box.top;        // screen
   const cx = (sx - view.ox) / view.k, cy = (sy - view.oy) / view.k; // canvas
   const start = { mx: e.clientX, my: e.clientY, undone: false };
+  // Middle button: pan, whatever is under the pointer.
+  if (e.button === 1) {
+    e.preventDefault();
+    drag = { ...start, kind: 'pan', orig: { ...S.view }, moved: false, deselect: false };
+    $('#stage-wrap').classList.add('panning');
+    return;
+  }
+  if (e.button !== 0) return;
 
   // 1. A resize handle of the selected cue?
   const sel = selectedCue();
@@ -916,19 +941,93 @@ stage.addEventListener('mousedown', (e) => {
       }
     }
   }
-  select(null);
+  // Empty area: dragging pans the view; a plain click deselects.
+  drag = { ...start, kind: 'pan', orig: { ...S.view }, moved: false, deselect: true };
 });
 
+/** Zoom by `factor`, keeping the stage point under screen point (sx, sy)
+ *  where it is. */
+function zoomAt(factor, sx, sy) {
+  const { k, fit, W, H, ox, oy } = view;
+  const zoom = clamp(S.view.zoom * factor, 0.05, 200);
+  const k2 = fit * zoom, st = S.doc.stage;
+  const cx = (sx - ox) / k, cy = (sy - oy) / k; // stage point under the pointer
+  S.view.zoom = zoom;
+  S.view.panX = sx - cx * k2 - (W - st.width * k2) / 2;
+  S.view.panY = sy - cy * k2 - (H - st.height * k2) / 2;
+}
+const fitStage = () => { S.view = { zoom: 1, panX: 0, panY: 0 }; };
+
+stage.addEventListener('wheel', (e) => {
+  if (!S.doc) return;
+  e.preventDefault();
+  const box = stage.getBoundingClientRect();
+  // Trackpads send many small deltas, mouse wheels a few large ones.
+  zoomAt(Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)), e.clientX - box.left, e.clientY - box.top);
+}, { passive: false });
+stage.addEventListener('dblclick', (e) => {
+  // Double-click on nothing in particular: back to the whole stage.
+  if (!S.sel) fitStage();
+});
+$('#stage-fit').onclick = fitStage;
+$('#stage-actual').onclick = () => zoomAt(1 / view.k, view.W / 2, view.H / 2);
+$('#stage-zoom-in').onclick = () => zoomAt(1.25, view.W / 2, view.H / 2);
+$('#stage-zoom-out').onclick = () => zoomAt(0.8, view.W / 2, view.H / 2);
+
+/** Move `pos` (with extent `size`) so that one of its edges lands on a
+ *  candidate line, if one is within `tol`. */
+function snapAxis(pos, size, candidates, tol) {
+  let best = null;
+  for (const c of candidates) {
+    for (const edge of [pos, pos + size]) {
+      const d = c - edge;
+      if (Math.abs(d) <= tol && (best === null || Math.abs(d) < Math.abs(best))) best = d;
+    }
+  }
+  return best === null ? pos : pos + best;
+}
+
+/** Lines to snap to: the stage's edges and those of every display except
+ *  `skip`; for cues, also the displays' centres. */
+function snapLines(skip, centres) {
+  const st = S.doc.stage, xs = [0, st.width], ys = [0, st.height];
+  for (const d of st.displays) {
+    if (d === skip) continue;
+    const r = d.canvas_rect;
+    xs.push(r.x, r.x + r.w); ys.push(r.y, r.y + r.h);
+    if (centres) { xs.push(r.x + r.w / 2); ys.push(r.y + r.h / 2); }
+  }
+  return { xs, ys };
+}
+
 function stageDragMove(e) {
+  if (drag.kind === 'pan') {
+    const dx = e.clientX - drag.mx, dy = e.clientY - drag.my;
+    if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; $('#stage-wrap').classList.add('panning'); }
+    S.view.panX = drag.orig.panX + dx;
+    S.view.panY = drag.orig.panY + dy;
+    return;
+  }
   // The undo point is taken on the first real movement, so a plain click
   // does not leave an empty step in the history.
   if (!drag.undone) { S.undo.push(JSON.stringify(S.doc)); S.redo = []; drag.undone = true; }
   const dx = (e.clientX - drag.mx) / view.k, dy = (e.clientY - drag.my) / view.k;
   const o = drag.orig, c = drag.target;
+  const snapping = $('#stage-snap').checked && !e.altKey, tol = 8 / view.k;
   if (drag.kind === 'move') {
-    c.x = Math.round(o.x + dx); c.y = Math.round(o.y + dy);
+    let x = o.x + dx, y = o.y + dy;
+    if (snapping) {
+      const { xs, ys } = snapLines(null, true);
+      x = snapAxis(x, c.w, xs, tol); y = snapAxis(y, c.h, ys, tol);
+    }
+    c.x = Math.round(x); c.y = Math.round(y);
   } else if (drag.kind === 'display') {
-    c.canvas_rect.x = Math.round(o.x + dx); c.canvas_rect.y = Math.round(o.y + dy);
+    let x = o.x + dx, y = o.y + dy;
+    if (snapping) {
+      const { xs, ys } = snapLines(c, false);
+      x = snapAxis(x, o.w, xs, tol); y = snapAxis(y, o.h, ys, tol);
+    }
+    c.canvas_rect.x = Math.round(x); c.canvas_rect.y = Math.round(y);
   } else {
     // Resize: the dragged corner follows the pointer, the opposite one stays.
     const left = drag.corner === 0 || drag.corner === 3, top = drag.corner < 2;
@@ -1109,6 +1208,12 @@ window.addEventListener('mousemove', (e) => {
   else if (scrubbing) scrub(e);
 });
 window.addEventListener('mouseup', (e) => {
+  if (drag?.kind === 'pan') {
+    $('#stage-wrap').classList.remove('panning');
+    if (!drag.moved && drag.deselect) select(null);
+    drag = null;
+    return;
+  }
   if (winDrag) saveLayout();
   if (scrubbing) { lastScrub = 0; scrub(e); }
   if ((drag?.undone) || (tlDrag?.undone)) sendDoc(); // final position, immediately
@@ -1159,46 +1264,127 @@ function renderTasks() {
 $('#btn-task').onclick = addTask;
 
 // ───────────────────────────── runners ─────────────────────────────
-// One card per Runner: is it healthy, what hardware does it have, which
-// displays does it drive and where do their windows go — and a button to
-// make it rebuild its outputs.
+// One card per Runner — connected, remembered from earlier, or named by a
+// display: its health and machine, what its outputs show (live pictures),
+// the displays it drives and where each one goes (a window, or fullscreen
+// on one of its monitors), and the actions an operator needs: reload
+// outputs, standby, restart, quit, reboot / power off the computer, wake it,
+// read its log, open a remote desktop on it.
 
 let runnersKey = ''; // what the window was last built from
+
+/** Everything known about a Runner, by name. */
+function runnerInfo(name) {
+  const node = (S.status?.nodes || []).find((n) => n.role === 'runner' && n.name === name) || null;
+  const known = (S.status?.known_runners || []).find((k) => k.name === name) || null;
+  const h = node?.health || null;
+  return { node, known, h, machine: h?.machine || known?.machine || null, online: !!node };
+}
+
+/** Names of all Runners worth listing. */
+function runnerNames() {
+  const names = [
+    ...(S.status?.nodes || []).filter((n) => n.role === 'runner').map((n) => n.name),
+    ...(S.status?.known_runners || []).map((k) => k.name),
+    ...(S.doc?.stage.displays || []).map((d) => d.runner).filter(Boolean),
+  ];
+  return [...new Set(names)];
+}
+
+/** The monitor a Runner treats as primary: the one at the desktop origin. */
+const primaryMonitor = (mons) => mons.find((m) => m.x === 0 && m.y === 0) || mons[0] || null;
+
+/** Is this Runner on the operator's own computer? */
+const isLocal = (node) => /^(127\.|\[::1\]|::1|localhost)/.test(node?.addr || '');
+
+function runnerAction(name, action, confirmText) {
+  const go = () => {
+    command({ type: 'runner_action', runner: name, action });
+    toast(`${name}: ${action.replace('_', ' ')} requested.`, true);
+  };
+  if (!confirmText) return go();
+  ask(confirmText).then((yes) => yes && go());
+}
+
+async function remoteDesktop(host, kind) {
+  try {
+    const res = await fetch(`local/remote-desktop?host=${encodeURIComponent(host)}&kind=${kind}`, { method: 'POST' });
+    if (!res.ok) toast(await res.text());
+  } catch {
+    toast('Cannot reach the Producer service to open the remote desktop.');
+  }
+}
 
 function renderRunners(force = false) {
   const box = $('#runners');
   if (!S.doc) return;
-  const nodes = (S.status?.nodes || []).filter((n) => n.role === 'runner');
+  const names = runnerNames();
   // Rebuilding the list under the operator's cursor would close an open
   // dropdown or steal a click: only rebuild when something shown changed.
   const key = JSON.stringify([
-    nodes.map((n) => [n.name, n.addr, n.frame_error, n.health?.sync.locked, Math.round(n.health?.fps || 0), n.health?.monitors, n.health?.gpu, n.health?.outputs]),
-    S.doc.stage.displays, S.sel, S.connected,
+    names.map((n) => {
+      const { node, h, machine, online } = runnerInfo(n);
+      return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine];
+    }),
+    S.doc.stage.displays, S.sel, S.connected, [...S.previewOn],
   ]);
   if (key === runnersKey && !force) return;
   if (box.contains(document.activeElement) && ['SELECT', 'INPUT'].includes(document.activeElement.tagName) && !force) return;
   runnersKey = key;
   box.replaceChildren();
-
-  // Runners that are connected, plus any a display names that is not.
-  const names = [...new Set([...nodes.map((n) => n.name), ...S.doc.stage.displays.map((d) => d.runner).filter(Boolean)])];
   if (!names.length) box.append(el('div', { class: 'empty' }, S.connected ? 'No Runner is connected.' : 'Not connected to the Director.'));
 
   for (const name of names) {
-    const node = nodes.find((n) => n.name === name), h = node?.health;
-    const state = !node ? 'bad' : !h ? 'warn' : node.frame_error ? 'bad' : h.sync.locked ? 'ok' : 'warn';
-    const card = el('div', { class: 'runner' },
+    const { node, h, machine, online } = runnerInfo(name);
+    const state = !online ? 'bad' : !h ? 'warn' : node.frame_error ? 'bad' : h.standby ? 'warn' : h.sync.locked ? 'ok' : 'warn';
+    const host = machine?.ip || (node?.addr || '').replace(/:\d+$/, '');
+    const card = el('div', { class: `runner${online ? '' : ' offline'}`, dataset: { runner: name } },
       el('div', { class: 'runner-head' },
         el('span', { class: `dot ${state}` }),
         el('span', { class: 'name' }, name),
-        el('span', { class: 'dim' }, node ? node.addr : 'offline'),
-        node ? el('button', {
-          title: 'Close and rebuild all of this Runner\'s outputs and reload its media',
-          onclick: () => { command({ type: 'runner_action', runner: name, action: 'reload_outputs' }); toast(`Asked ${name} to reload its outputs.`, true); },
-        }, 'Reload outputs') : null));
+        el('span', { class: 'dim' }, online ? [machine?.hostname, host].filter(Boolean).join(' · ') : 'offline')));
+
+    // Actions.
+    const act = (label, title, onclick, opts = {}) => el('button', { title, onclick, disabled: opts.disabled, class: opts.on ? 'on' : null }, label);
+    const actions = el('div', { class: 'actions' });
+    if (online) {
+      const previewing = S.previewOn.has(name);
+      const power = machine?.allow_power;
+      const noPower = 'Start this runner with --allow-power to allow this';
+      actions.append(
+        act('Preview', 'Show what its outputs show, refreshed every second or two', () => {
+          previewing ? S.previewOn.delete(name) : S.previewOn.add(name);
+          if (!previewing) runnerAction(name, 'send_preview');
+          renderRunners(true);
+        }, { on: previewing }),
+        act('Log', 'Read its recent log', () => openLog(name)),
+        act('Reload outputs', 'Close and rebuild its output windows and reload its media', () => runnerAction(name, 'reload_outputs')),
+        h?.standby
+          ? act('Resume', 'Open its outputs again', () => runnerAction(name, 'resume'))
+          : act('Standby', 'Close its outputs; it stays connected', () => runnerAction(name, 'standby', `Put ${name} in standby? Its outputs close until resumed.`)),
+        act('Restart', machine?.supervised ? 'Restart the Runner program' : 'Not supervised: Restart will only stop it',
+          () => runnerAction(name, 'restart', `Restart the Runner program on ${name}? Its outputs go dark for a few seconds.`)),
+        act('Quit', 'Stop the Runner program', () => runnerAction(name, 'quit', `Stop the Runner program on ${name}? It can only be started again on that computer${machine?.allow_power ? ' or by rebooting it' : ''}.`)),
+        act('Reboot', power ? 'Restart the computer' : noPower,
+          () => runnerAction(name, 'reboot', `Restart the computer ${machine?.hostname || name}?`), { disabled: !power }),
+        act('Power off', power ? 'Shut the computer down' : noPower,
+          () => runnerAction(name, 'power_off', `Shut down the computer ${machine?.hostname || name}? It can be woken again only if Wake-on-LAN is enabled on it.`), { disabled: !power }),
+      );
+    } else {
+      actions.append(act('Wake', machine?.mac ? `Send a Wake-on-LAN packet to ${machine.mac}` : 'Its network card address is not known yet',
+        () => { command({ type: 'wake_runner', runner: name }); toast(`Wake-on-LAN sent to ${name}.`, true); }, { disabled: !machine?.mac }));
+    }
+    if (host) {
+      actions.append(
+        act('RDP', `Open Windows Remote Desktop on ${host} (the remote computer must allow it)`, () => remoteDesktop(host, 'rdp')),
+        act('VNC', `Open a VNC viewer on ${host} (the remote computer must run a VNC server)`, () => remoteDesktop(host, 'vnc')));
+    }
+    card.append(actions);
+
     if (h) {
       card.append(el('div', { class: 'kv' },
         el('span', {}, 'Status'), el('span', {}, [
+          h.standby ? 'STANDBY' : null,
           h.fps ? `${h.fps.toFixed(0)} fps` : 'not rendering',
           h.sync.locked ? `clock ±${Math.max(1, Math.round(h.sync.error_ns / 1000))} µs` : 'clock syncing',
           node.frame_error ? `${node.frame_error > 0 ? '+' : ''}${node.frame_error} frames off` : null,
@@ -1206,47 +1392,177 @@ function renderRunners(force = false) {
         ].filter(Boolean).join(' · ')),
         el('span', {}, 'GPU'), el('span', {}, h.gpu || '—'),
         el('span', {}, 'Monitors'), el('span', {}, h.monitors?.length
-          ? h.monitors.map((m) => `#${m.index} ${m.width}×${m.height} at ${m.x},${m.y}`).join('   ')
+          ? h.monitors.map((m) => `#${m.index} ${m.width}×${m.height}${m === primaryMonitor(h.monitors) ? ' (primary)' : ''}`).join('   ')
+          : '—'),
+        el('span', {}, 'Machine'), el('span', {}, machine
+          ? [machine.os, `LC Play ${machine.version}`, machine.mac ? `MAC ${machine.mac}` : null, machine.allow_power ? 'power control allowed' : null].filter(Boolean).join(' · ')
           : '—')));
     }
+    if (S.previewOn.has(name)) card.append(el('div', { class: 'previews', dataset: { runner: name } }));
 
     // The displays this Runner drives: its own, and those assigned to none.
     card.append(el('h4', {}, 'Displays'));
     const displays = S.doc.stage.displays.filter((d) => d.runner === name || d.runner === '');
+    if (!displays.length) card.append(el('div', { class: 'note' }, 'None.'));
     for (const d of displays) {
       const selected = S.sel?.type === 'display' && S.sel.id === d.id;
-      const full = el('input', { type: 'checkbox', title: 'Fullscreen' });
-      full.checked = d.window.fullscreen;
-      full.onchange = () => edit(() => (d.window.fullscreen = full.checked));
-      const mon = el('select', { title: 'Monitor' }, el('option', { value: '' }, 'primary'));
-      for (const m of h?.monitors || []) mon.append(el('option', { value: m.index }, `#${m.index} ${m.width}×${m.height}`));
-      // A monitor number the Runner did not report (yet) must stay selectable.
-      if (d.window.monitor != null && ![...mon.options].some((o) => o.value === String(d.window.monitor))) mon.append(el('option', { value: d.window.monitor }, `#${d.window.monitor}`));
-      mon.value = d.window.monitor ?? '';
-      mon.onchange = () => edit(() => (d.window.monitor = mon.value === '' ? null : Number(mon.value)));
-      const where = d.window.fullscreen ? 'fullscreen' : `window ${d.window.size ? d.window.size.join('×') : 'auto'}${d.window.position ? ' at ' + d.window.position.join(',') : ''}`;
       card.append(el('div', { class: `disp${selected ? ' sel' : ''}` },
         el('span', { class: 'name', title: 'Edit in the Inspector', onclick: () => select({ type: 'display', id: d.id }) },
-          `${d.name || 'display'} — ${d.canvas_rect.w}×${d.canvas_rect.h} · ${where}${d.runner ? '' : ' (any runner)'}`),
-        el('label', { class: 'dim' }, full, ' full'), mon,
+          `${d.name || 'display'} — ${d.canvas_rect.w}×${d.canvas_rect.h}${d.runner ? '' : ' (any runner)'}`),
+        outputPicker(d, h?.monitors || []),
+        el('span', {}),
         el('button', { class: 'small', title: 'Edit position, size, blend…', onclick: () => select({ type: 'display', id: d.id }) }, '✎')));
     }
     card.append(el('div', { class: 'btns' }, el('button', { onclick: () => addDisplay(name) }, '+ Display on this runner')));
     box.append(card);
+    showPreviews(name);
   }
 }
 
+/** Where a display's picture goes: a window (a preview on the operator's
+ *  screen), or fullscreen on one of the Runner's monitors. */
+function outputPicker(d, monitors) {
+  const sel = el('select', { class: 'out', title: 'Where this display appears on its Runner' },
+    el('option', { value: 'w' }, 'Window (preview)'),
+    el('option', { value: 'p' }, 'Fullscreen · primary monitor'));
+  for (const m of monitors) sel.append(el('option', { value: `m${m.index}` }, `Fullscreen · #${m.index} ${m.width}×${m.height}`));
+  const current = !d.window.fullscreen ? 'w' : d.window.monitor == null ? 'p' : `m${d.window.monitor}`;
+  // A monitor the Runner has not reported (yet) must stay selectable.
+  if (![...sel.options].some((o) => o.value === current)) sel.append(el('option', { value: current }, `Fullscreen · #${d.window.monitor} (not connected)`));
+  sel.value = current;
+  sel.onchange = () => edit(() => {
+    if (sel.value === 'w') {
+      d.window.fullscreen = false;
+      d.window.size ??= [960, Math.max(1, Math.round((960 * d.canvas_rect.h) / d.canvas_rect.w))];
+    } else {
+      d.window.fullscreen = true;
+      d.window.monitor = sel.value === 'p' ? null : Number(sel.value.slice(1));
+    }
+  });
+  return sel;
+}
+
+/** Put the latest pictures of a Runner's outputs into its card. */
+function showPreviews(name) {
+  const holder = [...document.querySelectorAll('#runners .previews')].find((n) => n.dataset.runner === name);
+  if (!holder) return;
+  const outputs = S.previews[name];
+  holder.replaceChildren(...(outputs?.length
+    ? outputs.map((o) => el('figure', {}, el('img', { src: `data:image/png;base64,${o.png_base64}`, alt: o.name }), el('figcaption', {}, o.name)))
+    : [el('div', { class: 'note' }, outputs ? 'No outputs open.' : 'Waiting for pictures…')]));
+}
+
+function openLog(name) {
+  S.logRunner = name;
+  const win = $('#win-log');
+  layout[win.id].visible = true;
+  focusWindow(win);
+  applyLayout(); saveLayout();
+  renderLogChoices();
+  runnerAction(name, 'send_logs');
+  renderLog();
+}
+
+function renderLogChoices() {
+  const sel = $('#log-runner');
+  const names = runnerNames().filter((n) => runnerInfo(n).online);
+  if (S.logRunner && !names.includes(S.logRunner)) names.push(S.logRunner);
+  sel.replaceChildren(...names.map((n) => el('option', { value: n }, n)));
+  sel.value = S.logRunner;
+}
+
+function renderLog() {
+  const pre = $('#log-text');
+  const lines = S.logs[S.logRunner];
+  const atBottom = pre.parentElement.scrollTop + pre.parentElement.clientHeight >= pre.parentElement.scrollHeight - 20;
+  pre.textContent = !S.logRunner ? 'Choose a runner.' : lines ? lines.join('\n') : 'Waiting for the log…';
+  if (atBottom || $('#log-follow').checked) pre.parentElement.scrollTop = pre.parentElement.scrollHeight;
+}
+$('#log-runner').onchange = (e) => { S.logRunner = e.target.value; runnerAction(S.logRunner, 'send_logs'); renderLog(); };
+$('#log-refresh').onclick = () => S.logRunner && runnerAction(S.logRunner, 'send_logs');
+
+// Live pictures and a following log are refreshed while their windows are
+// open, and only then (each picture is a few tens of kilobytes).
+setInterval(() => {
+  if (!S.connected) return;
+  if (layout['win-runners']?.visible) {
+    for (const name of S.previewOn) if (runnerInfo(name).online) command({ type: 'runner_action', runner: name, action: 'send_preview' });
+  }
+  if (layout['win-log']?.visible && $('#log-follow').checked && S.logRunner && runnerInfo(S.logRunner).online) {
+    command({ type: 'runner_action', runner: S.logRunner, action: 'send_logs' });
+  }
+}, 1500);
+
+/** A monitor of `runner` that no display uses yet, for a new display to go
+ *  fullscreen on. On the operator's own computer the primary monitor is
+ *  left alone: covering it would hide the Producer. */
+function freeMonitor(runner) {
+  const nodes = (S.status?.nodes || []).filter((n) => n.role === 'runner');
+  const node = runner ? nodes.find((n) => n.name === runner) : nodes.length === 1 ? nodes[0] : null;
+  const mons = node?.health?.monitors || [];
+  if (!mons.length) return null;
+  const primary = primaryMonitor(mons);
+  const used = new Set(S.doc.stage.displays
+    .filter((d) => d.window.fullscreen && (d.runner === runner || d.runner === '' || runner === ''))
+    .map((d) => d.window.monitor ?? primary.index));
+  return mons.find((m) => !used.has(m.index) && !(isLocal(node) && m === primary)) || null;
+}
+
+/** A new display: placed to the right of the existing ones on the stage
+ *  (the stage grows to fit), fullscreen on a free monitor of its Runner if
+ *  there is one, otherwise a preview window. */
 function addDisplay(runner = '') {
+  const st = S.doc.stage, n = st.displays.length + 1;
+  const mon = freeMonitor(runner);
+  const [w, h] = mon ? [mon.width, mon.height] : [1920, 1080];
+  const x = st.displays.reduce((right, d) => Math.max(right, d.canvas_rect.x + d.canvas_rect.w), 0);
   edit(() => {
-    const st = S.doc.stage, n = st.displays.length + 1;
     const d = {
-      id: uid(), name: `Display ${n}`, runner, canvas_rect: { x: 0, y: 0, w: st.width, h: st.height },
-      window: { fullscreen: false, position: [60 + 40 * n, 60 + 40 * n], size: [960, Math.round((960 * st.height) / st.width)] },
+      id: uid(), name: `Display ${n}`, runner, canvas_rect: { x, y: 0, w, h },
+      window: mon
+        ? { fullscreen: true, monitor: mon.index, position: null, size: null }
+        : { fullscreen: false, position: [60 + 40 * n, 60 + 40 * n], size: [960, Math.round((960 * h) / w)] },
     };
     st.displays.push(d);
+    st.width = Math.max(st.width, x + w);
+    st.height = Math.max(st.height, h);
     normalize(S.doc);
     S.sel = { type: 'display', id: d.id };
   });
+  fitStage();
+  toast(mon
+    ? `Display ${n}: fullscreen on monitor #${mon.index} (${mon.width}×${mon.height}).`
+    : `Display ${n}: shown in a window — ${runner || 'the runner'} has no free monitor${runner === '' ? '' : ''}. Choose fullscreen in the Runners window once a monitor is connected.`, true);
+}
+
+/** Line the displays up left to right, in their current order, and size
+ *  the stage to them. */
+function arrangeSideBySide() {
+  edit(() => {
+    const st = S.doc.stage;
+    let x = 0, h = 0;
+    for (const d of [...st.displays].sort((a, b) => a.canvas_rect.x - b.canvas_rect.x)) {
+      d.canvas_rect.x = x; d.canvas_rect.y = 0;
+      x += d.canvas_rect.w; h = Math.max(h, d.canvas_rect.h);
+    }
+    if (x > 0) { st.width = x; st.height = h; }
+  });
+  fitStage();
+}
+
+/** Make the stage exactly the area the displays cover. */
+function stageToDisplays() {
+  const ds = S.doc.stage.displays;
+  if (!ds.length) return;
+  edit(() => {
+    const minX = Math.min(...ds.map((d) => d.canvas_rect.x)), minY = Math.min(...ds.map((d) => d.canvas_rect.y));
+    // Content positions move with the displays, so nothing shifts on screen.
+    for (const d of ds) { d.canvas_rect.x -= minX; d.canvas_rect.y -= minY; }
+    for (const tl of tlIds()) for (const t of tlObj(tl).tracks) for (const c of t.cues) { c.x -= minX; c.y -= minY; }
+    S.doc.stage.width = Math.max(...ds.map((d) => d.canvas_rect.x + d.canvas_rect.w));
+    S.doc.stage.height = Math.max(...ds.map((d) => d.canvas_rect.y + d.canvas_rect.h));
+  });
+  fitStage();
 }
 
 // ───────────────────────────── inspector ─────────────────────────────
@@ -1438,7 +1754,10 @@ function renderInspector() {
       el('span', {}, d.name || 'display'),
       el('span', { class: 'dim' }, `${d.canvas_rect.w}×${d.canvas_rect.h}${d.runner ? ' @' + d.runner : ''}`)));
   }
-  box.append(el('div', { class: 'btns' }, el('button', { onclick: () => addDisplay('') }, '+ Display')));
+  box.append(el('div', { class: 'btns' },
+    el('button', { onclick: () => addDisplay(''), title: 'A new display, to the right of the others' }, '+ Display'),
+    el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right and size the stage to them' }, 'Side by side'),
+    el('button', { onclick: stageToDisplays, title: 'Make the stage exactly the area the displays cover' }, 'Stage = displays')));
 }
 
 // ───────────────────────────── top bar ─────────────────────────────

@@ -56,7 +56,14 @@
 <div id="desktop">
 
   <section class="win" id="win-stage" data-title="Stage">
-    <header class="win-head"><span class="win-title">Stage</span><button class="win-close" title="Hide">✕</button></header>
+    <header class="win-head"><span class="win-title">Stage</span>
+      <button id="stage-zoom-out" class="small" title="Zoom out (mouse wheel)">−</button>
+      <span id="stage-zoom" class="dim mono" title="Zoom">100%</span>
+      <button id="stage-zoom-in" class="small" title="Zoom in (mouse wheel)">+</button>
+      <button id="stage-fit" class="small" title="Fit the whole stage (double-click an empty area)">Fit</button>
+      <button id="stage-actual" class="small" title="1 stage pixel = 1 screen pixel">1:1</button>
+      <label class="dim" title="Snap edges to other displays and the stage while dragging (hold Alt to disable)"><input type="checkbox" id="stage-snap" checked> snap</label>
+      <button class="win-close" title="Hide">✕</button></header>
     <div class="win-body" id="stage-wrap"><canvas id="stage"></canvas></div>
     <div class="win-grip"></div>
   </section>
@@ -113,6 +120,16 @@
       <button id="btn-task">+ Task</button>
       <button class="win-close" title="Hide">✕</button></header>
     <div class="win-body scroll pad" id="tasks"></div>
+    <div class="win-grip"></div>
+  </section>
+
+  <section class="win" id="win-log" data-title="Runner log">
+    <header class="win-head"><span class="win-title">Runner log</span>
+      <select id="log-runner"></select>
+      <label class="dim"><input type="checkbox" id="log-follow" checked> follow</label>
+      <button id="log-refresh" class="small">Refresh</button>
+      <button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body scroll"><pre id="log-text" class="log"></pre></div>
     <div class="win-grip"></div>
   </section>
 
