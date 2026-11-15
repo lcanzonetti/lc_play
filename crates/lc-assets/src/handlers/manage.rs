@@ -202,9 +202,9 @@ pub async fn thumbnail(
         .unwrap()
         .get(&id)
         .filter(|(size, _)| *size == item.size)
-        .map(|(_, jpeg)| jpeg.clone());
-    let jpeg = match cached {
-        Some(jpeg) => jpeg,
+        .map(|(_, png)| png.clone());
+    let png = match cached {
+        Some(png) => png,
         None => {
             // Shares the transcode budget: a panel full of new files must
             // not start dozens of ffmpeg processes at once.
@@ -233,13 +233,13 @@ pub async fn thumbnail(
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
-            let jpeg = Bytes::from(out.stdout);
+            let png = Bytes::from(out.stdout);
             state
                 .thumbs
                 .lock()
                 .unwrap()
-                .insert(id, (item.size, jpeg.clone()));
-            jpeg
+                .insert(id, (item.size, png.clone()));
+            png
         }
     };
     Ok((
@@ -247,7 +247,7 @@ pub async fn thumbnail(
             (header::CONTENT_TYPE, "image/png"),
             (header::CACHE_CONTROL, "max-age=3600"),
         ],
-        jpeg,
+        png,
     )
         .into_response())
 }

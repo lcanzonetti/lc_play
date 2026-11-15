@@ -66,31 +66,62 @@ const CONTROL_LOOKAHEAD_NS: i64 = 300_000_000;
 /// How often the control-cue scheduler runs.
 const CONTROL_PERIOD: Duration = Duration::from_millis(50);
 
-/// Cluster time at which `state` (in force, playing forward, currently at
-/// `position`) reaches `cue` — or `None` if it will not (the cue is behind
-/// the playhead and the timeline does not loop).
-fn cue_fire_time(state: &TransportState, position: i64, cue: &ControlCue, now: i64) -> Option<i64> {
+/// A control cue is still fired if its moment passed up to this long ago
+/// (the scheduler ran late, or playback started exactly on the cue). The
+/// change is then anchored in the recent past, which Runners apply at once
+/// with the correct timing.
+const CONTROL_GRACE_NS: i64 = 200_000_000;
+
+/// When will `state` (playing forward) next reach `cue`?
+///
+/// Returns the cluster time and the *lap* (0 = before the timeline's first
+/// wrap since this state began; always 0 without looping), or `None` if it
+/// will not: the cue is behind the playhead of a timeline that does not
+/// loop, or beyond the loop length.
+///
+/// The time is computed from the state's anchor, not from "now": it is a
+/// property of the transport state, the same on every scheduler pass, which
+/// makes each (state, cue, lap) easy to fire exactly once.
+fn cue_fire_time(
+    state: &TransportState,
+    cue: &ControlCue,
+    now: i64,
+    fires_at_start: bool,
+) -> Option<(i64, i64)> {
+    let rate = state.rate_permille as i128;
+    // Show time → cluster time, rounding *up*: rounding down could land a
+    // nanosecond short of the cue, which on a frame boundary is the
+    // previous frame.
+    let to_cluster = |show: i128| ((show * 1000 + rate - 1) / rate) as i64;
     let at_show = (cue.at_s * NANOS_PER_SEC as f64).round() as i64;
-    let mut ahead = at_show - position;
-    match state.loop_ns {
-        // Looping: a cue behind the playhead comes round again — unless it
-        // lies beyond the loop length and is never reached.
-        Some(len) if len > 0 => {
-            if at_show >= len {
+    let earliest = now - CONTROL_GRACE_NS;
+
+    match state.loop_ns.filter(|len| *len > 0) {
+        None => {
+            let ahead = at_show - state.anchor_show_ns;
+            if ahead < 0 || (ahead == 0 && !fires_at_start) {
                 return None;
             }
-            if ahead <= 0 {
-                ahead += len;
-            }
+            let at = state.anchor_cluster_ns + to_cluster(ahead as i128);
+            (at >= earliest).then_some((at, 0))
         }
-        // A cue exactly at the playhead has just been executed (that is how
-        // a pause cue leaves things); only cues strictly ahead count.
-        _ if ahead <= 0 => return None,
-        _ => {}
+        Some(len) => {
+            if at_show >= len {
+                return None; // never reached
+            }
+            let start = state.anchor_show_ns.rem_euclid(len);
+            // Distance to the cue's first passage, then one loop per lap.
+            let mut ahead = (at_show - start).rem_euclid(len);
+            if ahead == 0 && !fires_at_start {
+                ahead = len;
+            }
+            let first = state.anchor_cluster_ns + to_cluster(ahead as i128);
+            let lap_ns = to_cluster(len as i128).max(1);
+            // The first passage that is not already in the past.
+            let lap = ((earliest - first).max(0) + lap_ns - 1) / lap_ns;
+            Some((first + lap * lap_ns, lap))
+        }
     }
-    // Show time advances at `rate`; convert the distance to cluster time.
-    let cluster = (ahead as i128 * 1000 / state.rate_permille as i128) as i64;
-    Some(now + cluster)
 }
 
 /// Fastest/slowest playback rate accepted (±16×).
@@ -148,6 +179,14 @@ pub struct Core {
     dirty: Notify,
 }
 
+/// A control cue that has been scheduled and whose moment has not passed.
+struct Fired {
+    /// Cluster time it was scheduled for.
+    at: i64,
+    /// Timeline whose transport it changes.
+    target: String,
+}
+
 struct State {
     /// Transport of the main timeline.
     timeline: TransportTimeline,
@@ -160,9 +199,10 @@ struct State {
     /// needs to know about.
     parsed: Option<Arc<ShowDocument>>,
     /// Control cues already scheduled: (timeline, cue id) → the cluster time
-    /// they were scheduled for. Keeps a cue from firing on every scheduler
-    /// pass while its moment approaches.
-    fired: HashMap<(String, String), i64>,
+    /// they were scheduled for. Keyed by (timeline, cue, transport epoch,
+    /// lap): each passage of a playhead over a cue fires exactly once, and a
+    /// new transport state (a jump back, an operator command) starts anew.
+    fired: HashMap<(String, String, u64, i64), Fired>,
     /// Connected nodes by connection id (a node may briefly have two
     /// connections while it reconnects).
     nodes: BTreeMap<u64, NodeStatus>,
@@ -299,6 +339,26 @@ impl Core {
                             timeline: None,
                         });
                         self.dirty.notify_one();
+                    }
+                }
+                // The same for every auxiliary timeline it is running.
+                if same_timebase {
+                    for (id, state) in &runner.tasks {
+                        let newer = match st.tasks.get_mut(id) {
+                            Some(tl) => tl.push(*state),
+                            None => {
+                                st.tasks.insert(id.clone(), TransportTimeline::new(*state));
+                                true
+                            }
+                        };
+                        if newer {
+                            self.publish(ServerMessage::Transport {
+                                clock_id: self.clock.clock_id(),
+                                state: *state,
+                                timeline: Some(id.clone()),
+                            });
+                            self.dirty.notify_one();
+                        }
                     }
                 }
             }
@@ -502,12 +562,28 @@ impl Core {
         };
 
         let mut st = self.state();
+        if let Some(id) = timeline {
+            Self::ensure_task(&st, id)?;
+        }
         // Anchor in the future so every Runner holds the new state before it
         // applies.
         let at = self.clock.now_ns() + self.lead_ns;
-        self.apply(&mut st, timeline, change, at)?;
+        self.apply(&mut st, timeline, change, at);
         st.anchored = true;
         Ok(())
+    }
+
+    /// A transport command may only name a task of the current show.
+    fn ensure_task(st: &State, id: &str) -> Result<(), String> {
+        let known = st
+            .parsed
+            .as_ref()
+            .is_some_and(|doc| doc.tasks.iter().any(|t| t.id == id));
+        if known {
+            Ok(())
+        } else {
+            Err(format!("unknown timeline '{id}'"))
+        }
     }
 
     /// Give `timeline` a new transport state: `change`, taking effect at
@@ -518,24 +594,17 @@ impl Core {
         timeline: Option<&str>,
         change: TransportChange,
         at: i64,
-    ) -> Result<TransportState, String> {
+    ) -> TransportState {
         let now = self.clock.now_ns();
         let tl = match timeline {
             None => &mut st.timeline,
-            Some(id) => {
-                let known = st
-                    .parsed
-                    .as_ref()
-                    .is_some_and(|doc| doc.tasks.iter().any(|t| t.id == id));
-                if !known {
-                    return Err(format!("unknown timeline '{id}'"));
-                }
-                // A task's transport comes into being the first time it is
-                // commanded; until then it is simply inactive.
-                st.tasks
-                    .entry(id.to_string())
-                    .or_insert_with(|| TransportTimeline::new(TransportState::INACTIVE))
-            }
+            // A task's transport comes into being the first time it is
+            // commanded; until then it is simply inactive. It is never
+            // removed again (see `load_show`): its epochs must keep rising.
+            Some(id) => st
+                .tasks
+                .entry(id.to_string())
+                .or_insert_with(|| TransportTimeline::new(TransportState::INACTIVE)),
         };
         // Derive from the state that will be in force *then*, so two commands
         // issued within one lead time compose correctly.
@@ -546,13 +615,22 @@ impl Core {
         tl.push(next);
         tl.prune(now);
 
+        // A control cue already scheduled for this timeline at a *later*
+        // instant was derived from the state this one replaces, and — having
+        // the lower epoch — will now never take effect. Forget that it was
+        // scheduled, so the scheduler derives it again. (For a cue on this
+        // same timeline that happens anyway, since the new state has a new
+        // epoch; this covers cues on *other* timelines that target it.)
+        let name = timeline.unwrap_or(MAIN_TIMELINE);
+        st.fired.retain(|_, f| !(f.target == name && f.at > at));
+
         self.publish(ServerMessage::Transport {
             clock_id: self.clock.clock_id(),
             state: next,
             timeline: timeline.map(str::to_string),
         });
         self.dirty.notify_one();
-        Ok(next)
+        next
     }
 
     /// Forward an action to the Runner called (or identified as) `runner`.
@@ -590,7 +668,9 @@ impl Core {
             return;
         };
         let now = self.clock.now_ns();
-        st.fired.retain(|_, at| *at > now - NANOS_PER_SEC);
+        // Entries are needed for as long as their moment could still be
+        // considered (the grace period), not longer.
+        st.fired.retain(|_, f| f.at >= now - 2 * CONTROL_GRACE_NS);
 
         let main = (None, &doc.control_cues);
         let tasks = doc
@@ -605,38 +685,52 @@ impl Core {
                     None => continue,
                 },
             };
-            // Only a state that is in force, playing forward, has a future
-            // to look into. (A pending state is looked at once it applies.)
-            if !state.active
-                || !state.playing
-                || state.rate_permille <= 0
-                || state.anchor_cluster_ns > now
-            {
+            // Only a state that plays forward has cues ahead of it. (It may
+            // still be pending: its cues are scheduled from its anchor.)
+            if !state.active || !state.playing || state.rate_permille <= 0 {
                 continue;
             }
-            let position = state.show_time_at(now);
-            for cue in cues {
-                let Some(at) = cue_fire_time(&state, position, cue, now) else {
-                    continue;
-                };
-                if at - now > CONTROL_LOOKAHEAD_NS {
-                    continue;
-                }
-                let key = (
-                    timeline.unwrap_or(MAIN_TIMELINE).to_string(),
-                    cue.id.clone(),
-                );
-                if st.fired.contains_key(&key) {
-                    continue;
-                }
-                st.fired.insert(key, at);
-
+            for (index, cue) in cues.iter().enumerate() {
                 // Which timeline the cue acts on.
                 let target = match cue.target.as_str() {
                     "" => timeline,
                     MAIN_TIMELINE => None,
                     other => Some(other),
                 };
+                // What if playback starts exactly *on* the cue (from the top,
+                // or after a seek onto it)? It fires — "start this task with
+                // the show" is a cue at 0 — with one exception: a cue that
+                // pauses or stops its own timeline. That one has, as far as
+                // anyone can tell, just been executed (it is where a pause
+                // cue leaves the playhead), and firing it again would make
+                // it impossible to play on.
+                let halts_itself = target == timeline
+                    && matches!(cue.action, ControlAction::Pause | ControlAction::Stop);
+                let Some((at, lap)) = cue_fire_time(&state, cue, now, !halts_itself) else {
+                    continue;
+                };
+                if at - now > CONTROL_LOOKAHEAD_NS {
+                    continue;
+                }
+                // The cue is identified by its position in the list as well
+                // as its id: hand-written shows may leave ids empty.
+                let key = (
+                    timeline.unwrap_or(MAIN_TIMELINE).to_string(),
+                    format!("{index}:{}", cue.id),
+                    state.epoch,
+                    lap,
+                );
+                if st.fired.contains_key(&key) {
+                    continue;
+                }
+                st.fired.insert(
+                    key,
+                    Fired {
+                        at,
+                        target: target.unwrap_or(MAIN_TIMELINE).to_string(),
+                    },
+                );
+
                 let change = match cue.action {
                     ControlAction::Play => TransportChange::Play,
                     ControlAction::Pause => TransportChange::Pause,
@@ -647,16 +741,16 @@ impl Core {
                         TransportChange::Seek((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
                     }
                 };
-                match self.apply(&mut st, target, change, at) {
-                    Ok(_) => tracing::info!(
-                        "control cue: {:?} {} (at {:.2} s on {})",
-                        cue.action,
-                        target.unwrap_or(MAIN_TIMELINE),
-                        cue.at_s,
-                        timeline.unwrap_or(MAIN_TIMELINE),
-                    ),
-                    Err(e) => tracing::warn!("control cue at {:.2} s: {e}", cue.at_s),
-                }
+                self.apply(&mut st, target, change, at);
+                // The cue's own entry must survive the clean-up in `apply`
+                // (it is scheduled *at* `at`, not after it) — it does.
+                tracing::info!(
+                    "control cue: {:?} {} (at {:.2} s on {})",
+                    cue.action,
+                    target.unwrap_or(MAIN_TIMELINE),
+                    cue.at_s,
+                    timeline.unwrap_or(MAIN_TIMELINE),
+                );
             }
         }
     }
@@ -673,9 +767,26 @@ impl Core {
             serde_json::from_value(document.clone()).map_err(|e| format!("load_show: {e}"))?;
         parsed.validate().map_err(|e| format!("load_show: {e}"))?;
         let mut st = self.state();
-        // A task that no longer exists has no transport either.
-        st.tasks
-            .retain(|id, _| parsed.tasks.iter().any(|t| &t.id == id));
+        // A task that is no longer in the show goes off stage — but its
+        // transport is *kept*, stopped. Dropping it would restart its epochs
+        // at 1 if the task ever came back (an undo, an older show file), and
+        // every Runner and Producer still holding the old, higher epoch would
+        // ignore the "new" task's commands as stale.
+        let removed: Vec<String> = st
+            .tasks
+            .iter()
+            .filter(|(id, tl)| tl.latest().active && !parsed.tasks.iter().any(|t| &t.id == *id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let at = self.clock.now_ns() + self.lead_ns;
+        for id in removed {
+            self.apply(
+                &mut st,
+                Some(&id),
+                TransportChange::Stop { deactivate: true },
+                at,
+            );
+        }
         st.parsed = Some(Arc::new(parsed));
         let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
         // A fresh id per load: unlike the revision counter it can never

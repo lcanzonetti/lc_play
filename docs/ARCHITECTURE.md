@@ -298,7 +298,8 @@ The Director, not the Runners, executes control cues. A scheduler looks
 300 ms ahead on every playing timeline; a cue inside that window becomes a
 transport change anchored at the exact cluster instant the playhead reaches
 it, published before that instant. So a pause cue stops every output on the
-same frame (verified to the nanosecond in the Director's tests) — but while
+same frame (verified to the nanosecond in the Director's tests, at normal
+speed) — but while
 the Director is down, control cues do not fire and Runners play through
 them. Moving their execution into the Runners is possible (they are part of
 the show document) and is the way to remove that dependency.

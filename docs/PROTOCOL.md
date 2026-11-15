@@ -220,7 +220,13 @@ broadcasts them back. Other tools may ignore it.
 * `tasks` are auxiliary timelines: same shape as the main one (`tracks`,
   `duration_s`, `control_cues`), each with its own transport, drawn in front
   of the main timeline while active.
-* A control cue fires when its timeline, playing forward, reaches `at_s`.
+* A control cue fires when its timeline, playing forward, reaches `at_s` —
+  including when playback *starts* exactly on it (a `play` cue at 0 starts
+  its task with the show). The one exception: a cue that pauses or stops its
+  own timeline does not fire when playback starts on it, otherwise one could
+  never play on from a pause cue.
+* A task keeps running past its `duration_s` (which is the length shown in
+  the editor) until it is stopped or a control cue acts on it.
   `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
   timeline acted on — empty for the cue's own, `"main"`, or a task id. The
   Director schedules the resulting transport change for the exact cluster
@@ -238,7 +244,7 @@ broadcasts them back. Other tools may ignore it.
 | `/lcplay/seek` | seconds | jump |
 | `/lcplay/rate` | speed (1.0 = normal) | |
 | `/lcplay/loop` | seconds, 0 = off | |
-| `/lcplay/task/<id>/play`, `/pause`, `/stop`, `/seek` | as above | the same for task `<id>` |
+| `/lcplay/task/<id>/play`, `/pause`, `/stop`, `/seek`, `/rate`, `/loop` | as above | the same for task `<id>` |
 
 Numeric arguments may be float, double, int or long. For play/pause/stop a
 single argument of `0` is ignored (a control surface's button release).

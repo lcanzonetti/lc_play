@@ -81,7 +81,6 @@ fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let browser_only = args.browser;
-    let port = args.port;
 
     // The HTTP server runs on its own thread: on most platforms the window
     // system insists on owning the main thread.
@@ -89,20 +88,40 @@ fn main() -> anyhow::Result<()> {
     let listener = runtime.block_on(tokio::net::TcpListener::bind(SocketAddr::new(
         args.bind, args.port,
     )))?;
-    tracing::info!("producer interface on http://{}", listener.local_addr()?);
+    let local = listener.local_addr()?;
+    tracing::info!("producer interface on http://{local}");
+    // Where the window finds the interface: the address actually bound
+    // (loopback if it is bound to all addresses).
+    let host = if local.ip().is_unspecified() {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        local.ip()
+    };
+    let url = format!("http://{}/", SocketAddr::new(host, local.port()));
     let server = runtime.spawn(serve(listener, args));
 
-    if browser_only {
-        // Serve until Ctrl-C.
-        runtime.block_on(async {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = server => {}
-            }
-        });
-        return Ok(());
+    if !browser_only {
+        // Closing the window ends the process from inside `run`. If we get
+        // here, the window could not be opened at all (no display, no web
+        // view runtime): say so, and keep serving for a browser — the
+        // operator still needs the interface.
+        let failure = match std::panic::catch_unwind(|| window::run(&url)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => "the window system could not be initialised".to_string(),
+        };
+        tracing::error!(
+            "cannot open the Producer window: {failure}. Open {url} in a browser instead."
+        );
     }
-    window::run(&format!("http://127.0.0.1:{port}/"))
+    // Serve until Ctrl-C.
+    runtime.block_on(async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = server => {}
+        }
+    });
+    Ok(())
 }
 
 /// Serve the interface on `listener` forever.

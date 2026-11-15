@@ -496,3 +496,110 @@ async fn a_runner_action_reaches_the_runner_it_names() {
     }
     director.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_command_just_before_a_cue_does_not_cancel_it() {
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "hold", "at_s": 1.0, "action": "pause" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    // 0.8 s in: the pause is already scheduled (300 ms look-ahead). An
+    // unrelated command now replaces the transport state it was derived from.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    core.command(Command::SetRate {
+        rate_permille: 1000,
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let status = core.status();
+    assert!(!status.transport.playing, "the cue still paused the show");
+    assert_eq!(status.show_ns, NANOS_PER_SEC);
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_short_jump_back_loop_keeps_looping() {
+    // Loop the section 0.2–0.5 s: far shorter than any bookkeeping interval.
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "back", "at_s": 0.5, "action": "jump", "to_s": 0.2 } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let status = core.status();
+        assert!(status.transport.playing);
+        assert!(
+            status.show_ns <= 520_000_000,
+            "escaped the loop: at {} ns",
+            status.show_ns
+        );
+    }
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cue_at_the_start_position_fires_unless_it_would_trap_playback() {
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [
+            { "id": "with-show", "at_s": 0, "action": "play", "target": "bed" },
+            { "id": "hold",      "at_s": 0, "action": "pause" }
+        ],
+        "tasks": [ { "id": "bed" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let status = core.status();
+    assert!(
+        status
+            .tasks
+            .get("bed")
+            .is_some_and(|t| t.active && t.playing),
+        "a play cue at 0 starts its task with the show"
+    );
+    assert!(
+        status.transport.playing && status.show_ns > 0,
+        "a pause cue at the start position does not stop playback from starting"
+    );
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_that_leaves_and_returns_keeps_rising_epochs() {
+    let with_task = serde_json::json!({ "tasks": [ { "id": "intro" } ] });
+    let director = director_with_show(with_task.clone()).await;
+    let core = director.core();
+    for command in [Command::Play, Command::Pause, Command::Play] {
+        core.command_on(command, Some("intro")).unwrap();
+    }
+    let before = core.status().tasks["intro"].epoch;
+
+    // The task disappears from the show (deleted)…
+    core.command(Command::LoadShow {
+        document: serde_json::json!({}),
+    })
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(core.command_on(Command::Play, Some("intro")).is_err());
+    let stopped = core.status().tasks["intro"];
+    assert!(!stopped.active, "a removed task is taken off stage");
+    assert!(stopped.epoch > before);
+
+    // …and comes back (undo). Anything that still holds its old transport —
+    // a Runner, a Producer — only accepts states with a higher epoch.
+    core.command(Command::LoadShow {
+        document: with_task,
+    })
+    .unwrap();
+    core.command_on(Command::Play, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await; // past the lead time
+    let resumed = core.status().tasks["intro"];
+    assert!(resumed.playing && resumed.epoch > stopped.epoch);
+    director.shutdown().await;
+}

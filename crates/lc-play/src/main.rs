@@ -179,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
                         *slot = None;
                         // The Producer window *is* the application: closing
                         // it ends the session, like closing any program.
-                        if *name == "producer" && !args.browser {
+                        // (A clean exit only: if it *failed*, the services
+                        // must keep running like for any other failure.)
+                        if *name == "producer" && !args.browser && status.success() {
                             println!("[launcher] the Producer window was closed.");
                             window_closed = true;
                         } else {

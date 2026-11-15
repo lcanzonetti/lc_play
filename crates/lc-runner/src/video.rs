@@ -315,6 +315,9 @@ impl VideoContent {
                     (first + elapsed).min(total - 1)
                 }
             }
+            // Length unknown: a free-running clip cannot be looped (cluster
+            // time is far beyond any file), so it holds its first frame.
+            _ if self.timing.free_run => first,
             _ => first + elapsed,
         }
     }

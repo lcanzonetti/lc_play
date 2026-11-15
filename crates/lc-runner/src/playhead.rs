@@ -233,14 +233,6 @@ impl Playhead {
         }
     }
 
-    /// Forget auxiliary timelines that are not in `keep` (the show no longer
-    /// has them).
-    pub fn retain_tasks(&self, keep: &[&str]) {
-        self.lock()
-            .tasks
-            .retain(|id, _| keep.contains(&id.as_str()));
-    }
-
     /// A local operator action (keyboard on a stand-alone Runner): takes
     /// effect immediately, no lead time needed with a single node.
     pub fn apply_local(&self, change: TransportChange) {

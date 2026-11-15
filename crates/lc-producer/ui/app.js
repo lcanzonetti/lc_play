@@ -511,14 +511,21 @@ function select(sel) {
   renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
 }
 
-function deleteSelection() {
+async function deleteSelection() {
   if (!S.sel) return;
   const { type, id } = S.sel;
+  // A whole timeline is too much to lose to a stray Delete key.
+  if (type === 'task' && !(await ask(`Delete the task "${tlName(id)}" with everything on it?`))) return;
   edit(() => {
     if (type === 'cue') { const hit = findCue(id); if (hit) hit.track.cues.splice(hit.ci, 1); }
     else if (type === 'control') { const hit = findControl(id); if (hit) hit.list.splice(hit.i, 1); }
     else if (type === 'track') { const hit = findTrack(id); if (hit) tlObj(hit.tl).tracks.splice(hit.ti, 1); }
-    else if (type === 'task') S.doc.tasks = S.doc.tasks.filter((t) => t.id !== id);
+    else if (type === 'task') {
+      S.doc.tasks = S.doc.tasks.filter((t) => t.id !== id);
+      // Control cues that acted on the task have nothing left to act on (and
+      // the Director would refuse a show that still refers to it).
+      for (const tl of tlIds()) { const o = tlObj(tl); o.control_cues = o.control_cues.filter((cc) => cc.target !== id); }
+    }
     else if (type === 'display') S.doc.stage.displays = S.doc.stage.displays.filter((d) => d.id !== id);
     S.sel = null;
   });
