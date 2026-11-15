@@ -33,6 +33,16 @@ pub struct TransportState {
     pub anchor_show_ns: i64,
     /// If set, show time wraps into `0..loop_ns`.
     pub loop_ns: Option<i64>,
+    /// Whether the timeline is on stage at all. The main timeline always is.
+    /// An auxiliary timeline (a *task*) is inactive until it is first played
+    /// and again after it is stopped: an inactive timeline renders nothing,
+    /// whereas a paused one holds its picture.
+    #[serde(default = "yes")]
+    pub active: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl TransportState {
@@ -44,6 +54,14 @@ impl TransportState {
         anchor_cluster_ns: 0,
         anchor_show_ns: 0,
         loop_ns: None,
+        active: true,
+    };
+
+    /// The state of an auxiliary timeline that has not been started: off
+    /// stage, at zero.
+    pub const INACTIVE: TransportState = TransportState {
+        active: false,
+        ..TransportState::STOPPED
     };
 
     /// Show time at `cluster_ns`.
@@ -128,6 +146,7 @@ mod tests {
             anchor_cluster_ns,
             anchor_show_ns,
             loop_ns: None,
+            active: true,
         }
     }
 

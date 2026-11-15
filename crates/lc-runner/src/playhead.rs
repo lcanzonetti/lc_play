@@ -15,10 +15,11 @@
 //! cluster clock is then simply its local clock, and transport changes come
 //! from the keyboard via [`Playhead::apply_local`].
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use lc_proto::{ClockId, FrameRate, TransportState, NANOS_PER_SEC};
+use lc_proto::{ClockId, FrameRate, MonitorInfo, TransportState, NANOS_PER_SEC};
 use lc_time::{next_state, ClusterClock, TransportChange, TransportTimeline};
 
 /// A show document as distributed by the Director.
@@ -54,10 +55,28 @@ pub struct Playhead {
     connected: AtomicBool,
     /// Presentation rate measured by the renderer (f32 bits; 0 = unknown).
     fps_bits: AtomicU32,
+    /// Incremented each time the operator asks this Runner to rebuild its
+    /// outputs; the renderer acts when it sees the number change.
+    reload_requests: AtomicU64,
+    /// What the renderer knows about its hardware, for the health report.
+    hardware: Mutex<Hardware>,
+}
+
+/// Facts about the machine, filled in by the renderer.
+#[derive(Debug, Clone, Default)]
+pub struct Hardware {
+    pub monitors: Vec<MonitorInfo>,
+    pub gpu: Option<String>,
+    /// Output windows currently open.
+    pub outputs: u32,
 }
 
 struct Inner {
+    /// The main timeline's transport.
     timeline: TransportTimeline,
+    /// Transports of the auxiliary timelines, by timeline id. A timeline
+    /// without an entry has never been started and is inactive.
+    tasks: BTreeMap<String, TransportTimeline>,
     /// Timebase the timeline's anchors are expressed in. `None` = local time
     /// (stand-alone, or restored from cache before any Director was seen).
     timeline_clock: Option<ClockId>,
@@ -73,6 +92,7 @@ impl Playhead {
             clock,
             inner: Mutex::new(Inner {
                 timeline: TransportTimeline::new(initial),
+                tasks: BTreeMap::new(),
                 timeline_clock: None,
                 frame_rate,
                 show: None,
@@ -80,6 +100,8 @@ impl Playhead {
             }),
             connected: AtomicBool::new(false),
             fps_bits: AtomicU32::new(0),
+            reload_requests: AtomicU64::new(0),
+            hardware: Mutex::new(Hardware::default()),
         }
     }
 
@@ -124,6 +146,37 @@ impl Playhead {
         }
     }
 
+    /// Show time of an auxiliary timeline at cluster time `cluster_ns`, in
+    /// seconds — or `None` while it is off stage (never started, or
+    /// stopped), in which case nothing of it is drawn.
+    ///
+    /// `cluster_ns` should be the one from the frame's [`position`]
+    /// (Self::position), so that all timelines are sampled at one instant.
+    pub fn task_seconds(&self, id: &str, cluster_ns: i64) -> Option<f64> {
+        let inner = self.lock();
+        let state = inner.tasks.get(id)?.state_at(cluster_ns);
+        state
+            .active
+            .then(|| state.show_time_at(cluster_ns) as f64 / NANOS_PER_SEC as f64)
+    }
+
+    /// Newest transport state of every auxiliary timeline.
+    pub fn task_transports(&self) -> BTreeMap<String, TransportState> {
+        self.lock()
+            .tasks
+            .iter()
+            .map(|(id, tl)| (id.clone(), tl.latest()))
+            .collect()
+    }
+
+    /// Install auxiliary-timeline transports restored from the cache.
+    pub fn restore_tasks(&self, tasks: BTreeMap<String, TransportState>) {
+        self.lock().tasks = tasks
+            .into_iter()
+            .map(|(id, state)| (id, TransportTimeline::new(state)))
+            .collect();
+    }
+
     /// Newest transport state known (in force or still pending).
     pub fn transport(&self) -> TransportState {
         self.lock().timeline.latest()
@@ -142,20 +195,50 @@ impl Playhead {
         self.lock().frame_rate = frame_rate;
     }
 
-    /// A transport state from the Director, expressed in timebase `clock_id`.
+    /// A transport state from the Director, expressed in timebase `clock_id`,
+    /// for the main timeline (`timeline == None`) or an auxiliary one.
     ///
     /// Same timebase as before: queued, and takes over at its anchor (stale
-    /// epochs are ignored). Different timebase: replaces everything.
+    /// epochs are ignored). Different timebase: everything known so far —
+    /// all timelines — is void and is replaced.
     /// Returns whether the state was accepted.
-    pub fn accept(&self, clock_id: ClockId, state: TransportState) -> bool {
+    pub fn accept(&self, clock_id: ClockId, timeline: Option<&str>, state: TransportState) -> bool {
         let mut inner = self.lock();
-        if inner.timeline_clock == Some(clock_id) {
-            inner.timeline.push(state)
-        } else {
-            inner.timeline.replace(state);
+        if inner.timeline_clock != Some(clock_id) {
+            // New timebase. Anchors of the old one mean nothing in it, for
+            // any timeline; the Director sends the current states next.
             inner.timeline_clock = Some(clock_id);
-            true
+            inner.tasks.clear();
+            match timeline {
+                None => inner.timeline.replace(state),
+                Some(id) => {
+                    inner
+                        .tasks
+                        .insert(id.to_string(), TransportTimeline::new(state));
+                }
+            }
+            return true;
         }
+        match timeline {
+            None => inner.timeline.push(state),
+            Some(id) => match inner.tasks.get_mut(id) {
+                Some(tl) => tl.push(state),
+                None => {
+                    inner
+                        .tasks
+                        .insert(id.to_string(), TransportTimeline::new(state));
+                    true
+                }
+            },
+        }
+    }
+
+    /// Forget auxiliary timelines that are not in `keep` (the show no longer
+    /// has them).
+    pub fn retain_tasks(&self, keep: &[&str]) {
+        self.lock()
+            .tasks
+            .retain(|id, _| keep.contains(&id.as_str()));
     }
 
     /// A local operator action (keyboard on a stand-alone Runner): takes
@@ -177,7 +260,33 @@ impl Playhead {
     /// Drop transport states that can no longer apply. Housekeeping.
     pub fn prune(&self) {
         let now = self.clock.now_ns();
-        self.lock().timeline.prune(now);
+        let mut inner = self.lock();
+        inner.timeline.prune(now);
+        for tl in inner.tasks.values_mut() {
+            tl.prune(now);
+        }
+    }
+
+    /// Ask the renderer to rebuild its outputs (operator action).
+    pub fn request_reload(&self) {
+        self.reload_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of reload requests so far; the renderer compares it with the
+    /// number it has acted on.
+    pub fn reload_requests(&self) -> u64 {
+        self.reload_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn hardware(&self) -> Hardware {
+        self.hardware
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn update_hardware(&self, update: impl FnOnce(&mut Hardware)) {
+        update(&mut self.hardware.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     pub fn show(&self) -> Option<Arc<ShowDoc>> {
@@ -280,8 +389,9 @@ mod tests {
             anchor_cluster_ns: 1000 * S,
             anchor_show_ns: 50 * S,
             loop_ns: None,
+            active: true,
         };
-        assert!(ph.accept(7, director_state));
+        assert!(ph.accept(7, None, director_state));
         assert_eq!(
             ph.position().show_ns,
             3 * S,
@@ -292,6 +402,56 @@ mod tests {
         assert!(ph.clock.ingest(7, 4 * S, 1004 * S, 1004 * S, 4 * S));
         assert_eq!(ph.position().show_ns, 54 * S);
         assert!(ph.is_clustered());
+    }
+
+    #[test]
+    fn auxiliary_timelines_run_on_their_own_transport() {
+        let (local, ph) = playhead();
+        ph.clock.follow(1);
+        ph.clock.ingest(1, 0, 0, 0, 0);
+        ph.accept(1, None, TransportState::STOPPED);
+        assert_eq!(
+            ph.task_seconds("intro", 0),
+            None,
+            "never started: off stage"
+        );
+
+        let playing = TransportState {
+            epoch: 1,
+            playing: true,
+            anchor_cluster_ns: S,
+            ..TransportState::INACTIVE
+        };
+        let playing = TransportState {
+            active: true,
+            ..playing
+        };
+        assert!(ph.accept(1, Some("intro"), playing));
+        local.0.store(3 * S, Ordering::Relaxed);
+        let cluster = ph.position().cluster_ns;
+        assert_eq!(ph.task_seconds("intro", cluster), Some(2.0));
+        assert_eq!(ph.position().show_ns, 0, "the main timeline is unaffected");
+
+        // Stopped: off stage again.
+        let stopped = TransportState {
+            epoch: 2,
+            anchor_cluster_ns: 3 * S,
+            ..TransportState::INACTIVE
+        };
+        assert!(ph.accept(1, Some("intro"), stopped));
+        assert_eq!(ph.task_seconds("intro", 3 * S), None);
+
+        // A different timebase voids every timeline's state.
+        ph.accept(
+            1,
+            Some("intro"),
+            TransportState {
+                epoch: 3,
+                ..playing
+            },
+        );
+        ph.accept(2, None, TransportState::STOPPED);
+        assert!(ph.task_transports().is_empty());
     }
 
     #[test]
@@ -309,13 +469,13 @@ mod tests {
             anchor_cluster_ns: 2 * S,
             ..TransportState::STOPPED
         };
-        assert!(ph.accept(1, stopped));
-        assert!(ph.accept(1, play_at_2));
+        assert!(ph.accept(1, None, stopped));
+        assert!(ph.accept(1, None, play_at_2));
         let stale = TransportState {
             epoch: 3,
             ..play_at_2
         };
-        assert!(!ph.accept(1, stale), "stale epoch");
+        assert!(!ph.accept(1, None, stale), "stale epoch");
 
         local.0.store(S, Ordering::Relaxed);
         assert!(!ph.position().transport.playing, "not before its anchor");

@@ -129,6 +129,22 @@ impl Agent {
             None => cfg.initial_transport,
         };
         let playhead = Arc::new(Playhead::new(clock.clone(), initial, cfg.frame_rate));
+        // Auxiliary timelines resume the same way as the main one.
+        if let Some(saved) = cache.as_ref().and_then(Cache::load_tasks) {
+            let now = clock.now_ns();
+            playhead.restore_tasks(
+                saved
+                    .into_iter()
+                    .map(|(id, state)| {
+                        let state = TransportState {
+                            anchor_cluster_ns: now,
+                            ..state
+                        };
+                        (id, state)
+                    })
+                    .collect(),
+            );
+        }
         if let Some(show) = cache.as_ref().and_then(Cache::load_show) {
             tracing::info!("restored show revision {} from cache", show.revision);
             playhead.set_show(show);
@@ -269,6 +285,11 @@ impl Link {
                 clock_id: reading.clock_id.filter(|_| holding),
                 cluster_now_ns: holding.then_some(reading.cluster_ns),
                 transport: holding.then(|| self.playhead.transport()),
+                tasks: if holding {
+                    self.playhead.task_transports()
+                } else {
+                    Default::default()
+                },
             }),
         }
     }
@@ -282,7 +303,11 @@ impl Link {
         // timebase, then the sync target; the first sample releases the hold.
         playhead.clock.follow(welcome.clock_id);
         playhead.set_frame_rate(welcome.frame_rate);
-        if playhead.accept(welcome.clock_id, welcome.transport) {
+        let mut changed = playhead.accept(welcome.clock_id, None, welcome.transport);
+        for (id, state) in &welcome.tasks {
+            changed |= playhead.accept(welcome.clock_id, Some(id), *state);
+        }
+        if changed {
             self.save_transport();
         }
         let _ = self
@@ -305,14 +330,25 @@ impl Link {
                     };
                     last_heard = Instant::now();
                     match msg {
-                        ServerMessage::Transport { clock_id, state } => {
+                        ServerMessage::RunnerAction { node_id, action } => {
+                            // Broadcast to everybody; only the addressee acts.
+                            if node_id == self.node_id {
+                                tracing::info!("operator request: {action:?}");
+                                match action {
+                                    lc_proto::RunnerAction::ReloadOutputs => {
+                                        playhead.request_reload()
+                                    }
+                                }
+                            }
+                        }
+                        ServerMessage::Transport { clock_id, state, timeline } => {
                             if clock_id != welcome.clock_id {
                                 // The Director switched timebase under us.
                                 // Start over so the handshake re-establishes
                                 // clock and transport together.
                                 return "director changed timebase".into();
                             }
-                            if playhead.accept(clock_id, state) {
+                            if playhead.accept(clock_id, timeline.as_deref(), state) {
                                 self.save_transport();
                             }
                         }
@@ -368,6 +404,7 @@ impl Link {
 
     fn health(&self) -> Health {
         let pos = self.playhead.position();
+        let hardware = self.playhead.hardware();
         Health {
             cluster_ns: pos.cluster_ns,
             show_ns: pos.show_ns,
@@ -376,12 +413,16 @@ impl Link {
             show_revision: self.playhead.show().map(|s| s.revision),
             sync: self.playhead.clock.quality(),
             fps: self.playhead.fps(),
+            monitors: hardware.monitors,
+            gpu: hardware.gpu,
+            outputs: hardware.outputs,
         }
     }
 
     fn save_transport(&self) {
         if let Some(cache) = &self.cache {
             cache.save_transport(&self.playhead.transport());
+            cache.save_tasks(&self.playhead.task_transports());
         }
     }
 }
@@ -456,6 +497,14 @@ impl Cache {
 
     fn save_transport(&self, state: &TransportState) {
         self.write("transport.json", state);
+    }
+
+    fn load_tasks(&self) -> Option<std::collections::BTreeMap<String, TransportState>> {
+        self.read("tasks.json")
+    }
+
+    fn save_tasks(&self, tasks: &std::collections::BTreeMap<String, TransportState>) {
+        self.write("tasks.json", tasks);
     }
 }
 

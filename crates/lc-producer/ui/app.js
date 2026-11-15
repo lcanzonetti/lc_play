@@ -2,12 +2,11 @@
 /*
  * LC Play Producer — the operator's interface.
  *
- * One file, no framework, no build step: open it in a browser and it works;
- * edit it and reload. It talks to two services directly:
+ * One file, no framework, no build step. It talks to two services directly:
  *
- *   Director       WebSocket  — receives the show + transport + cluster status,
- *                               sends show edits and transport commands
- *   Asset Manager  HTTP       — media list, upload, thumbnails
+ *   Director       WebSocket  — receives the show + transports + cluster
+ *                               status, sends show edits and commands
+ *   Asset Manager  HTTP       — media list, upload, thumbnails, media files
  *
  * How the pieces fit:
  *
@@ -19,22 +18,25 @@
  *   drawn here. Every edit goes through edit() (undo + redraw + send).
  * - The whole document is sent on every change. It is small, and it means
  *   the Director and Runners never hold a half-applied edit.
- * - Show time is never "pushed" to us: like a Runner, we hold the transport
- *   state and compute the position ourselves each animation frame from the
- *   cluster clock (estimated from the Director's status messages).
+ * - A show has several TIMELINES: the main one, plus any number of auxiliary
+ *   timelines ("tasks"). Each has its own transport. Time is never pushed to
+ *   us: like a Runner, we hold each timeline's transport state and compute
+ *   its position ourselves, every animation frame, from the cluster clock.
  *
- * Sections: helpers · state · network · time · editing · assets · stage ·
- * timeline · inspector · top bar · start-up.
+ * Sections: helpers · state · window manager · network · time · editing ·
+ * assets · preview media · stage · timeline · tasks · runners · inspector ·
+ * top bar · start-up.
  */
 
 // ───────────────────────────── helpers ─────────────────────────────
 
 const $ = (sel) => document.querySelector(sel);
-const NS = 1e9; // nanoseconds per second
+const NS = 1e9;            // nanoseconds per second
+const MAIN = 'main';       // id of the main timeline
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const round2 = (v) => Math.round(v * 100) / 100;
 // Short random id. (crypto.randomUUID needs HTTPS or localhost; the Producer
-// is often opened over plain HTTP from another machine.)
+// may be opened over plain HTTP from another machine.)
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 /** Create an element: el('div', {class:'x', onclick: fn}, child, 'text', …). */
@@ -69,20 +71,33 @@ function toast(message, info = false) {
   toastTimer = setTimeout(() => (t.hidden = true), info ? 2500 : 6000);
 }
 
+/** "Are you sure?" as a promise. Our own dialog rather than confirm(): an
+ *  embedded web view (the stand-alone app) does not always provide one. */
+function ask(message) {
+  return new Promise((resolve) => {
+    $('#modal-text').textContent = message;
+    $('#modal').hidden = false;
+    const done = (answer) => { $('#modal').hidden = true; resolve(answer); };
+    $('#modal-yes').onclick = () => done(true);
+    $('#modal-no').onclick = () => done(false);
+  });
+}
+
 // ───────────────────────────── state ─────────────────────────────
 
 const S = {
   assetsUrl: '',        // base URL of the Asset Manager
   ws: null,
   connected: false,
-  doc: null,            // the show document being edited
   clientId: 'producer-' + uid(), // identifies this page's edits when they come back
   editN: 0,             // number of the last document this page sent
+  doc: null,            // the show document being edited
   lastSent: '',         // JSON of the document as last sent/received (change detection)
   dirty: false,         // there are edits the Director has not received
   holdForeign: false,   // ignore other senders' shows until ours is confirmed
-  sel: null,            // { type: 'cue' | 'display', id }
-  transports: [],       // transport states known, oldest first (at most 2)
+  sel: null,            // { type: 'cue'|'display'|'control'|'track'|'task', id }
+  tl: MAIN,             // the timeline open in the Timeline window
+  transports: {},       // timeline id → transport states known, oldest first (≤ 2)
   frameRate: { num: 60, den: 1 },
   clockOffsetNs: null,  // cluster time − performance.now(), null until known
   status: null,         // last cluster status
@@ -90,7 +105,6 @@ const S = {
   pxPerSec: 40,         // timeline zoom
   undo: [],
   redo: [],
-  thumbs: new Map(),    // asset id → Image
 };
 
 /** A new, empty show that already puts something on a laptop screen: one
@@ -118,6 +132,8 @@ function normalize(doc) {
   doc.duration_s ??= 60;
   doc.assets ??= [];
   doc.tracks ??= [];
+  doc.control_cues ??= [];
+  doc.tasks ??= [];
   const st = (doc.stage ??= {});
   st.width ??= 1920; st.height ??= 1080;
   st.background ??= [0, 0, 0, 1];
@@ -131,30 +147,170 @@ function normalize(doc) {
     d.warp_corners ??= null;
     d.blend = Object.assign({ left: 0, right: 0, top: 0, bottom: 0, gamma: 2.2 }, d.blend);
   }
-  for (const t of doc.tracks) {
-    t.id ||= uid(); t.name ??= ''; t.cues ??= [];
-    for (const c of t.cues) {
-      c.id ||= uid();
-      Object.assign(c, Object.assign({
-        name: '', source: { type: 'color', rgba: [0.5, 0.5, 0.5, 1] },
-        start_s: 0, duration_s: 10, in_s: 0, loop: false,
-        x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0,
-      }, c));
+  for (const task of doc.tasks) {
+    task.id ||= uid(); task.name ??= ''; task.duration_s ??= 30;
+    task.tracks ??= []; task.control_cues ??= [];
+  }
+  // Every timeline — the document itself is the main one.
+  for (const tl of [doc, ...doc.tasks]) {
+    for (const cc of tl.control_cues) {
+      cc.id ||= uid();
+      Object.assign(cc, Object.assign({ name: '', at_s: 0, action: 'pause', target: '', to_s: 0 }, cc));
+    }
+    for (const t of tl.tracks) {
+      t.id ||= uid(); t.name ??= ''; t.cues ??= []; t.free_run ??= false;
+      for (const c of t.cues) {
+        c.id ||= uid();
+        Object.assign(c, Object.assign({
+          name: '', source: { type: 'color', rgba: [0.5, 0.5, 0.5, 1] },
+          start_s: 0, duration_s: 10, in_s: 0, loop: false,
+          x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0,
+        }, c));
+      }
     }
   }
   return doc;
 }
 
+// A "timeline object" is anything with tracks, duration_s and control_cues:
+// the document (main timeline) or one of its tasks.
+const tlObj = (id) => (id === MAIN ? S.doc : S.doc.tasks.find((t) => t.id === id)) || null;
+const tlName = (id) => (id === MAIN ? 'Main' : tlObj(id)?.name || 'Task');
+/** All timeline ids, front-most first (tasks render in front of main). */
+const tlIds = () => [...S.doc.tasks.map((t) => t.id), MAIN];
+
 function findCue(id) {
-  for (const [ti, track] of S.doc.tracks.entries()) {
-    const ci = track.cues.findIndex((c) => c.id === id);
-    if (ci >= 0) return { cue: track.cues[ci], track, ti, ci };
+  for (const tl of tlIds()) {
+    for (const [ti, track] of tlObj(tl).tracks.entries()) {
+      const ci = track.cues.findIndex((c) => c.id === id);
+      if (ci >= 0) return { cue: track.cues[ci], track, ti, ci, tl };
+    }
+  }
+  return null;
+}
+function findTrack(id) {
+  for (const tl of tlIds()) {
+    const ti = tlObj(tl).tracks.findIndex((t) => t.id === id);
+    if (ti >= 0) return { track: tlObj(tl).tracks[ti], ti, tl };
+  }
+  return null;
+}
+function findControl(id) {
+  for (const tl of tlIds()) {
+    const list = tlObj(tl).control_cues, i = list.findIndex((c) => c.id === id);
+    if (i >= 0) return { cc: list[i], list, i, tl };
   }
   return null;
 }
 const findDisplay = (id) => S.doc.stage.displays.find((d) => d.id === id) || null;
 const assetOf = (cue) => (cue.source.type === 'asset' ? S.doc.assets.find((a) => a.id === cue.source.asset) : null);
 const selectedCue = () => (S.sel?.type === 'cue' ? findCue(S.sel.id)?.cue : null) || null;
+
+/** Does the current selection still exist? */
+function selectionExists() {
+  if (!S.sel) return true;
+  const { type, id } = S.sel;
+  return !!({ cue: findCue, display: findDisplay, control: findControl, track: findTrack, task: (i) => tlObj(i) }[type]?.(id));
+}
+
+// ───────────────────────────── window manager ─────────────────────────────
+// Every panel is a floating window: drag its title bar to move it, its
+// bottom-right corner to resize it, the ✕ to hide it (the "Windows" menu
+// brings it back). The layout is remembered in this browser.
+
+const LAYOUT_KEY = 'lcplay.layout.v2';
+const desktop = $('#desktop');
+const wins = [...document.querySelectorAll('.win')];
+let layout = {};   // window id → { x, y, w, h, visible, z }
+let zTop = 10;
+
+/** The layout a new user starts with: stage in the middle, assets left,
+ *  inspector right, timeline along the bottom, tasks and runners beside it. */
+function defaultLayout() {
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  const top = Math.round(H * 0.57), side = 250, insp = 300, right = Math.min(400, Math.round(W * 0.3));
+  return {
+    'win-assets':    { x: 0, y: 0, w: side, h: top },
+    'win-stage':     { x: side, y: 0, w: W - side - insp, h: top },
+    'win-inspector': { x: W - insp, y: 0, w: insp, h: top },
+    'win-timeline':  { x: 0, y: top, w: W - right, h: H - top },
+    'win-tasks':     { x: W - right, y: top, w: right, h: Math.round((H - top) * 0.4) },
+    'win-runners':   { x: W - right, y: top + Math.round((H - top) * 0.4), w: right, h: H - top - Math.round((H - top) * 0.4) },
+  };
+}
+
+function applyLayout() {
+  const W = desktop.clientWidth, H = desktop.clientHeight;
+  for (const win of wins) {
+    const r = layout[win.id];
+    // Keep every window reachable: inside the desktop, title bar visible.
+    r.w = clamp(r.w, 180, Math.max(180, W)); r.h = clamp(r.h, 90, Math.max(90, H));
+    r.x = clamp(r.x, 0, Math.max(0, W - 60)); r.y = clamp(r.y, 0, Math.max(0, H - 30));
+    Object.assign(win.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px', zIndex: r.z });
+    win.hidden = !r.visible;
+  }
+  renderWindowMenu();
+}
+
+function saveLayout() {
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch { /* private mode: not remembered */ }
+}
+
+function loadLayout(reset = false) {
+  let saved = {};
+  if (!reset) { try { saved = JSON.parse(localStorage.getItem(LAYOUT_KEY)) || {}; } catch { /* corrupt: start over */ } }
+  const def = defaultLayout();
+  layout = {};
+  wins.forEach((win, i) => { layout[win.id] = Object.assign({ visible: true, z: 10 + i }, def[win.id], saved[win.id]); });
+  zTop = Math.max(...Object.values(layout).map((r) => r.z));
+  applyLayout();
+}
+
+function focusWindow(win) {
+  layout[win.id].z = ++zTop;
+  win.style.zIndex = zTop;
+  wins.forEach((w) => w.classList.toggle('front', w === win));
+}
+
+function renderWindowMenu() {
+  const list = $('#win-menu-list');
+  list.replaceChildren();
+  for (const win of wins) {
+    const box = el('input', { type: 'checkbox' });
+    box.checked = layout[win.id].visible;
+    box.onchange = () => {
+      layout[win.id].visible = box.checked;
+      if (box.checked) focusWindow(win);
+      applyLayout(); saveLayout(); refreshAll();
+    };
+    list.append(el('label', {}, box, ' ' + win.dataset.title));
+  }
+  list.append(el('button', { onclick: () => { loadLayout(true); saveLayout(); refreshAll(); } }, 'Reset layout'));
+}
+
+let winDrag = null; // { win, kind: 'move'|'size', mx, my, orig }
+for (const win of wins) {
+  win.addEventListener('mousedown', () => focusWindow(win), true);
+  win.querySelector('.win-head').addEventListener('mousedown', (e) => {
+    if (e.target.closest('button, input, select, .tab')) return; // a control in the title bar
+    winDrag = { win, kind: 'move', mx: e.clientX, my: e.clientY, orig: { ...layout[win.id] } };
+    e.preventDefault();
+  });
+  win.querySelector('.win-grip').addEventListener('mousedown', (e) => {
+    winDrag = { win, kind: 'size', mx: e.clientX, my: e.clientY, orig: { ...layout[win.id] } };
+    e.preventDefault();
+  });
+  win.querySelector('.win-close').addEventListener('click', () => {
+    layout[win.id].visible = false;
+    applyLayout(); saveLayout();
+  });
+}
+function windowDragMove(e) {
+  const r = layout[winDrag.win.id], o = winDrag.orig, dx = e.clientX - winDrag.mx, dy = e.clientY - winDrag.my;
+  if (winDrag.kind === 'move') { r.x = o.x + dx; r.y = o.y + dy; } else { r.w = o.w + dx; r.h = o.h + dy; }
+  applyLayout();
+}
+window.addEventListener('resize', applyLayout);
 
 // ───────────────────────────── network ─────────────────────────────
 
@@ -169,7 +325,7 @@ function connect(url, protocol) {
   ws.onclose = () => {
     S.connected = false;
     S.status = null;
-    renderCluster();
+    renderCluster(); renderRunners();
     // The Director may simply be restarting: keep trying.
     setTimeout(() => connect(url, protocol), 1000);
   };
@@ -178,7 +334,8 @@ function connect(url, protocol) {
 function send(message) {
   if (S.ws?.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify(message));
 }
-const command = (cmd) => send({ type: 'command', command: cmd });
+/** Send a command; `tl` names the timeline a transport command is for. */
+const command = (cmd, tl = MAIN) => send({ type: 'command', command: cmd, timeline: tl === MAIN ? null : tl });
 
 function onMessage(msg) {
   switch (msg.type) {
@@ -186,9 +343,10 @@ function onMessage(msg) {
       S.frameRate = msg.frame_rate;
       // A new connection may be to a restarted Director, whose transport
       // epochs and clock are unrelated to the old ones: start afresh.
-      S.transports = [];
+      S.transports = {};
       S.clockOffsetNs = null;
-      pushTransport(msg.transport);
+      pushTransport(msg.transport, MAIN);
+      for (const [id, state] of Object.entries(msg.tasks || {})) pushTransport(state, id);
       command({ type: 'status' }); // gives us the cluster clock right away
       if (S.doc) {
         // Reconnected while holding a show. If we have edits the Director
@@ -208,7 +366,7 @@ function onMessage(msg) {
       }
       break;
     case 'transport':
-      pushTransport(msg.state);
+      pushTransport(msg.state, msg.timeline || MAIN);
       break;
     case 'show': {
       // Every document this page sends carries a tag ({by, n}); the Director
@@ -237,8 +395,9 @@ function onMessage(msg) {
       // Our estimate of the cluster clock: accurate to the network delay of
       // this message, which is ample for moving a playhead on screen.
       S.clockOffsetNs = msg.cluster_ns - performance.now() * 1e6;
-      pushTransport(msg.transport);
-      renderCluster();
+      pushTransport(msg.transport, MAIN);
+      for (const [id, state] of Object.entries(msg.tasks || {})) pushTransport(state, id);
+      renderCluster(); renderRunners();
       break;
     case 'error':
       // If it was our document that was refused, no echo will come.
@@ -252,27 +411,33 @@ function onMessage(msg) {
 // The same arithmetic a Runner does (lc-proto/src/transport.rs), in floating
 // point — good to well under a frame, which is all a UI needs.
 
-function pushTransport(state) {
-  const newest = S.transports[S.transports.length - 1];
+function pushTransport(state, tl) {
+  const list = (S.transports[tl] ??= []);
+  const newest = list[list.length - 1];
   if (newest && state.epoch <= newest.epoch) return;
-  S.transports.push(state);
-  if (S.transports.length > 2) S.transports.shift();
+  list.push(state);
+  if (list.length > 2) list.shift();
 }
 
 const clusterNow = () => (S.clockOffsetNs == null ? null : performance.now() * 1e6 + S.clockOffsetNs);
 
-/** The transport state in force now: the newest whose anchor has passed. */
-function currentTransport() {
+/** The transport state of timeline `tl` in force now: the newest whose
+ *  anchor has passed. Null for a task that was never started. */
+function currentTransport(tl = MAIN) {
+  const list = S.transports[tl];
+  if (!list?.length) return null;
   const now = clusterNow();
-  const list = S.transports;
-  if (!list.length) return null;
   for (let i = list.length - 1; i >= 0; i--) if (now == null || list[i].anchor_cluster_ns <= now) return list[i];
   return list[0];
 }
 
-/** Show time in seconds, now. */
-function showSeconds() {
-  const t = currentTransport();
+/** Is the timeline on stage? The main one always is; a task only between
+ *  play and stop. */
+const isActive = (tl) => tl === MAIN || !!currentTransport(tl)?.active;
+
+/** Timeline time in seconds, now. */
+function showSeconds(tl = MAIN) {
+  const t = currentTransport(tl);
   if (!t) return 0;
   const now = clusterNow();
   const elapsed = t.playing && now != null ? Math.max(0, now - t.anchor_cluster_ns) : 0;
@@ -281,7 +446,7 @@ function showSeconds() {
   return ns / NS;
 }
 
-const seek = (seconds) => command({ type: 'seek', show_ns: Math.round(Math.max(0, seconds) * NS) });
+const seek = (seconds, tl = MAIN) => command({ type: 'seek', show_ns: Math.round(Math.max(0, seconds) * NS) }, tl);
 
 // ───────────────────────────── editing ─────────────────────────────
 
@@ -295,7 +460,9 @@ function edit(change, { inspector = true } = {}) {
 }
 
 function afterChange(inspector = true) {
-  renderTimeline();
+  if (!tlObj(S.tl)) S.tl = MAIN;      // the open timeline was deleted
+  if (!selectionExists()) S.sel = null;
+  renderTimeline(); renderTasks(); renderRunners(true);
   if (inspector) renderInspector();
   scheduleSend();
 }
@@ -333,46 +500,45 @@ function stepHistory(from, to) {
 }
 
 function refreshAll() {
-  // The selection may refer to something that no longer exists.
-  if (S.sel && !(S.sel.type === 'cue' ? findCue(S.sel.id) : findDisplay(S.sel.id))) S.sel = null;
-  renderTimeline();
-  renderInspector();
+  if (!S.doc) return;
+  if (!tlObj(S.tl)) S.tl = MAIN;
+  if (!selectionExists()) S.sel = null;
+  renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
 }
 
 function select(sel) {
   S.sel = sel;
-  renderTimeline();
-  renderInspector();
+  renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
 }
 
 function deleteSelection() {
   if (!S.sel) return;
   const { type, id } = S.sel;
   edit(() => {
-    if (type === 'cue') {
-      const hit = findCue(id);
-      if (hit) hit.track.cues.splice(hit.ci, 1);
-    } else {
-      S.doc.stage.displays = S.doc.stage.displays.filter((d) => d.id !== id);
-    }
+    if (type === 'cue') { const hit = findCue(id); if (hit) hit.track.cues.splice(hit.ci, 1); }
+    else if (type === 'control') { const hit = findControl(id); if (hit) hit.list.splice(hit.i, 1); }
+    else if (type === 'track') { const hit = findTrack(id); if (hit) tlObj(hit.tl).tracks.splice(hit.ti, 1); }
+    else if (type === 'task') S.doc.tasks = S.doc.tasks.filter((t) => t.id !== id);
+    else if (type === 'display') S.doc.stage.displays = S.doc.stage.displays.filter((d) => d.id !== id);
     S.sel = null;
   });
 }
 
-/** Add a cue to track `ti` at time `t`, select it, and grow the timeline if
- *  the cue ends after it. */
-function addCue(cue, ti, t) {
+/** Add a cue to track `ti` of timeline `tl` at time `t`, select it, and
+ *  grow the timeline if the cue ends after it. */
+function addCue(cue, tl, ti, t) {
   edit(() => {
-    if (!S.doc.tracks.length) S.doc.tracks.push({ id: uid(), name: 'Track 1', cues: [] });
-    const track = S.doc.tracks[clamp(ti, 0, S.doc.tracks.length - 1)];
+    const obj = tlObj(tl);
+    if (!obj.tracks.length) obj.tracks.push({ id: uid(), name: 'Track 1', cues: [] });
+    const track = obj.tracks[clamp(ti, 0, obj.tracks.length - 1)];
     cue.id = uid();
     cue.start_s = round2(Math.max(0, t));
     track.cues.push(cue);
-    S.doc.duration_s = Math.max(S.doc.duration_s, Math.ceil(cue.start_s + cue.duration_s));
+    obj.duration_s = Math.max(obj.duration_s, Math.ceil(cue.start_s + cue.duration_s));
     normalize(S.doc);
     S.sel = { type: 'cue', id: cue.id };
   });
-  syncLoop(); // the timeline may have grown
+  syncLoop(); // the main timeline may have grown
 }
 
 /** Largest rectangle with the media's aspect that fits the stage, centred. */
@@ -383,7 +549,7 @@ function fitRect(mediaW, mediaH, enlarge) {
   return { x: Math.round((sw - w) / 2), y: Math.round((sh - h) / 2), w, h };
 }
 
-function addAssetCue(item, ti, t) {
+function addAssetCue(item, tl, ti, t) {
   const kind = item.kind; // 'video' | 'image'
   // Record the asset in the show, with the URL Runners will fetch it from.
   const entry = {
@@ -392,15 +558,24 @@ function addAssetCue(item, ti, t) {
     size: item.size, width: item.width || 0, height: item.height || 0,
     duration_s: item.duration_s || 0,
   };
-  const rect = fitRect(item.width || 1920, item.height || 1080, false);
   const cue = {
     name: item.name, source: { type: 'asset', asset: item.id },
     duration_s: kind === 'video' && item.duration_s > 0 ? round2(item.duration_s) : 10,
-    ...rect,
+    ...fitRect(item.width || 1920, item.height || 1080, false),
   };
   // Upsert before the cue is added: validation requires the asset to exist.
   S.doc.assets = S.doc.assets.filter((a) => a.id !== item.id).concat(entry);
-  addCue(cue, ti, t);
+  addCue(cue, tl, ti, t);
+}
+
+function addTask() {
+  edit(() => {
+    const task = { id: 'task-' + uid(), name: `Task ${S.doc.tasks.length + 1}`, duration_s: 30, tracks: [{ id: uid(), name: 'Track 1', cues: [] }], control_cues: [] };
+    S.doc.tasks.push(task);
+    normalize(S.doc);
+    S.tl = task.id;
+    S.sel = { type: 'task', id: task.id };
+  });
 }
 
 // ───────────────────────────── assets ─────────────────────────────
@@ -436,7 +611,6 @@ function reconcileAssets() {
   edit(() => {
     for (const [a, item] of stale) {
       Object.assign(a, { size: item.size, width: item.width || 0, height: item.height || 0, duration_s: item.duration_s || 0 });
-      S.thumbs.delete(a.id);
     }
   });
   toast(`${stale.map(([a]) => a.name).join(', ')}: file changed on the Asset Manager — show updated.`, true);
@@ -453,7 +627,7 @@ function renderAssets(problem) {
     list.append(el('div', {
       class: 'asset', draggable: 'true', title: item.name,
       ondragstart: (e) => e.dataTransfer.setData('text/lcplay-asset', item.id),
-      ondblclick: () => addAssetCue(item, 0, showSeconds()),
+      ondblclick: () => addAssetCue(item, S.tl, 0, showSeconds(S.tl)),
     },
       // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
       el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
@@ -464,8 +638,8 @@ function renderAssets(problem) {
 }
 
 async function deleteAsset(item) {
-  const used = S.doc.tracks.some((t) => t.cues.some((c) => c.source.asset === item.id));
-  if (!confirm(`Delete "${item.name}" from the Asset Manager?` + (used ? '\n\nIt is used in this show; those cues will show a placeholder.' : ''))) return;
+  const used = tlIds().some((tl) => tlObj(tl).tracks.some((t) => t.cues.some((c) => c.source.asset === item.id)));
+  if (!(await ask(`Delete "${item.name}" from the Asset Manager?` + (used ? '\n\nIt is used in this show; those cues will show a placeholder.' : '')))) return;
   try {
     const res = await fetch(`${S.assetsUrl}/api/items/${item.id}`, { method: 'DELETE' });
     if (!res.ok) toast(`Could not delete ${item.name}: ${await res.text()}`);
@@ -495,21 +669,102 @@ async function uploadFiles(files) {
   loadLibrary();
 }
 
-/** Thumbnail image for an asset of the show (loaded once, then cached). */
-function thumbFor(asset) {
-  let img = S.thumbs.get(asset.id);
-  if (!img) {
-    img = new Image();
-    img.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
-    S.thumbs.set(asset.id, img);
+// ───────────────────────────── preview media ─────────────────────────────
+// What the stage draws for a cue. This is a PREVIEW of the content, played
+// by the browser — not the Runner's picture. It is kept in step with the
+// timeline the same way a Runner is: nothing "plays along"; every frame we
+// compute where the media should be and correct the element if it is not.
+//
+//   image cue → the image itself (its thumbnail until it has loaded)
+//   video cue → a muted <video>, one per cue, steered to the right time
+//
+// A video the browser cannot decode (ProRes, HAP, …) falls back to its
+// thumbnail; the Runner, which decodes with ffmpeg, still plays it.
+
+const previews = new Map(); // key → { kind, node, thumb, failed }
+
+function previewFor(cue, asset) {
+  // One element per video cue (each has its own position); images are
+  // shared per file. The size is in the key so a replaced file reloads.
+  const key = asset.kind === 'video' ? `v:${cue.id}:${asset.id}:${asset.size}` : `i:${asset.id}:${asset.size}`;
+  let p = previews.get(key);
+  if (!p) {
+    const thumb = new Image();
+    thumb.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
+    p = { kind: asset.kind, thumb, failed: false };
+    if (asset.kind === 'video') {
+      p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: asset.url });
+      p.node.addEventListener('error', () => (p.failed = true));
+    } else {
+      p.node = new Image();
+      p.node.onerror = () => (p.failed = true);
+      p.node.src = asset.url;
+    }
+    previews.set(key, p);
   }
-  return img.complete && img.naturalWidth ? img : null;
+  p.used = performance.now();
+  return p;
+}
+
+/** Steer a preview video to `target` seconds; return something drawable. */
+function steerVideo(p, target, playing, rate) {
+  const v = p.node;
+  if (p.failed || v.readyState < 1) return drawable(p.thumb);
+  if (Number.isFinite(v.duration) && v.duration > 0) target = clamp(target, 0, Math.max(0, v.duration - 0.05));
+  const off = Math.abs(v.currentTime - target);
+  if (playing && rate > 0) {
+    // Let it run, and only jump when it has drifted visibly: constant
+    // seeking would make it stutter.
+    const r = clamp(rate, 0.1, 8);
+    if (v.playbackRate !== r) v.playbackRate = r;
+    if (v.paused) v.play().catch(() => {});
+    if (off > 0.3) v.currentTime = target;
+  } else {
+    // Paused, or playing backwards (which a <video> cannot do): follow the
+    // position by seeking.
+    if (!v.paused) v.pause();
+    if (off > 0.04 && !v.seeking) v.currentTime = target;
+  }
+  return v.readyState >= 2 ? v : drawable(p.thumb);
+}
+
+const drawable = (img) => (img.complete && img.naturalWidth ? img : null);
+
+/** Pause videos whose cue is off air and forget previews nothing has asked
+ *  for in a while (deleted cues, replaced files). */
+function tidyPreviews(now) {
+  for (const [key, p] of previews) {
+    const idle = now - (p.used || 0);
+    if (p.kind === 'video' && idle > 300 && !p.node.paused) p.node.pause();
+    if (idle > 30000) {
+      if (p.kind === 'video') { p.node.removeAttribute('src'); p.node.load(); }
+      previews.delete(key);
+    }
+  }
+}
+
+/** The picture for `cue` at timeline time `t` (or null: draw a placeholder). */
+function cuePicture(cue, track, t, tl, onAir) {
+  const asset = assetOf(cue);
+  if (!asset) return null;
+  const p = previewFor(cue, asset);
+  if (asset.kind !== 'video') return (!p.failed && drawable(p.node)) || drawable(p.thumb);
+  const tr = currentTransport(tl);
+  const length = asset.duration_s || p.node.duration || 0;
+  if (track.free_run) {
+    // Free-running: loops on the cluster clock, whatever the timeline does.
+    const now = (clusterNow() ?? 0) / NS, span = Math.max(0.1, length - cue.in_s);
+    return steerVideo(p, cue.in_s + (now % span), onAir, 1);
+  }
+  let media = cue.in_s + Math.max(0, t - cue.start_s);
+  if (cue.loop && length > cue.in_s) media = cue.in_s + ((media - cue.in_s) % (length - cue.in_s));
+  return steerVideo(p, media, onAir && !!tr?.playing, (tr?.rate_permille ?? 1000) / 1000);
 }
 
 // ───────────────────────────── stage ─────────────────────────────
-// A 2D-canvas preview of the stage at the current show time: the canvas, the
-// displays cut from it, and the cues active now (as thumbnails — this is a
-// layout view, not a video monitor). Redrawn every animation frame.
+// A 2D-canvas view of the stage: the canvas, the displays cut from it, and
+// every cue that is on air on any timeline, with its content. Redrawn every
+// animation frame.
 
 const stage = $('#stage');
 const ctx = stage.getContext('2d');
@@ -518,11 +773,12 @@ let displayTabs = [];               // screen rects of display name tabs, for hi
 let drag = null;                    // the stage drag in progress
 const HANDLE = 5;                   // half-size of a resize handle, screen px
 
-function drawStage(t) {
+function drawStage() {
   const wrap = $('#stage-wrap');
   const dpr = window.devicePixelRatio || 1;
   const W = wrap.clientWidth, H = wrap.clientHeight;
-  if (stage.width !== W * dpr || stage.height !== H * dpr) { stage.width = W * dpr; stage.height = H * dpr; }
+  if (W < 2 || H < 2) return; // window hidden
+  if (stage.width !== Math.round(W * dpr) || stage.height !== Math.round(H * dpr)) { stage.width = Math.round(W * dpr); stage.height = Math.round(H * dpr); }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
   if (!S.doc) return;
@@ -537,34 +793,37 @@ function drawStage(t) {
   ctx.fillStyle = rgbaCss(st.background);
   ctx.fillRect(0, 0, st.width, st.height);
 
-  // Cues, back to front: the last track is at the back.
+  // Back to front: the main timeline first, then the tasks (the first task
+  // is front-most); within a timeline the last track is at the back.
   const sel = selectedCue();
-  for (const track of [...S.doc.tracks].reverse()) {
-    for (const cue of track.cues) {
-      const active = t >= cue.start_s && t < cue.start_s + cue.duration_s;
-      // The selected cue is always shown (ghosted when not on air), so it
-      // can be positioned without scrubbing to it first.
-      if (!active && cue !== sel) continue;
-      const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
-                 * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
-      ctx.save();
-      ctx.translate(cue.x + cue.w / 2, cue.y + cue.h / 2);
-      ctx.rotate((cue.rotation * Math.PI) / 180);
-      ctx.globalAlpha = active ? cue.opacity * fade : 0.25;
-      const asset = assetOf(cue);
-      const img = asset && thumbFor(asset);
-      if (img) ctx.drawImage(img, -cue.w / 2, -cue.h / 2, cue.w, cue.h);
-      else {
-        ctx.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
-        ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+  for (const tl of tlIds().reverse()) {
+    const t = showSeconds(tl), active = isActive(tl);
+    for (const track of [...tlObj(tl).tracks].reverse()) {
+      for (const cue of track.cues) {
+        const onAir = active && t >= cue.start_s && t < cue.start_s + cue.duration_s;
+        // The selected cue is always shown (ghosted when not on air), so it
+        // can be positioned without scrubbing to it first.
+        if (!onAir && cue !== sel) continue;
+        const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
+                   * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
+        ctx.save();
+        ctx.translate(cue.x + cue.w / 2, cue.y + cue.h / 2);
+        ctx.rotate((cue.rotation * Math.PI) / 180);
+        ctx.globalAlpha = onAir ? cue.opacity * fade : 0.3;
+        const picture = cue.source.type === 'asset' ? cuePicture(cue, track, onAir ? t : cue.start_s, tl, onAir) : null;
+        if (picture) ctx.drawImage(picture, -cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        else {
+          ctx.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
+          ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        }
+        if (cue === sel) {
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 2 / k;
+          ctx.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        }
+        ctx.restore();
       }
-      if (cue === sel) {
-        ctx.globalAlpha = 1;
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2 / k;
-        ctx.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
-      }
-      ctx.restore();
     }
   }
   ctx.restore();
@@ -636,14 +895,17 @@ stage.addEventListener('mousedown', (e) => {
     return;
   }
   // 3. The front-most cue under the pointer that is on air (or selected).
-  const t = showSeconds();
-  for (const track of S.doc.tracks) {
-    for (const cue of [...track.cues].reverse()) {
-      const visible = (t >= cue.start_s && t < cue.start_s + cue.duration_s) || cue === sel;
-      if (visible && cueContains(cue, cx, cy)) {
-        select({ type: 'cue', id: cue.id });
-        drag = { ...start, kind: 'move', target: cue, orig: { ...cue } };
-        return;
+  for (const tl of tlIds()) {
+    const t = showSeconds(tl), active = isActive(tl);
+    for (const track of tlObj(tl).tracks) {
+      for (const cue of [...track.cues].reverse()) {
+        const visible = (active && t >= cue.start_s && t < cue.start_s + cue.duration_s) || cue === sel;
+        if (visible && cueContains(cue, cx, cy)) {
+          if (S.tl !== tl) S.tl = tl; // open the timeline the cue is on
+          select({ type: 'cue', id: cue.id });
+          drag = { ...start, kind: 'move', target: cue, orig: { ...cue } };
+          return;
+        }
       }
     }
   }
@@ -677,15 +939,31 @@ function stageDragMove(e) {
 }
 
 // ───────────────────────────── timeline ─────────────────────────────
-// Tracks top to bottom (the first is in front), time left to right. Built
-// from plain DOM elements; rebuilt whenever the document changes.
+// One timeline at a time is open in the Timeline window; the tabs in its
+// title bar switch between the main timeline and the tasks. Tracks top to
+// bottom (the first is in front), time left to right, control cues in a row
+// of their own above the tracks.
 
-const HEAD_W = 120; // width of the track-name column; matches --head-w in CSS
+const HEAD_W = 130; // width of the track-name column; matches --head-w in CSS
+const ACTION_ICON = { pause: '⏸', play: '▶', stop: '⏹', jump: '↩' };
 let tlDrag = null;  // the timeline drag in progress
+
+function renderTabs() {
+  const tabs = $('#tl-tabs');
+  tabs.replaceChildren();
+  for (const id of [MAIN, ...S.doc.tasks.map((t) => t.id)]) {
+    const tr = currentTransport(id);
+    const state = id === MAIN ? null : !tr?.active ? '' : tr.playing ? 'ok' : 'warn';
+    tabs.append(el('button', { class: `tab${id === S.tl ? ' on' : ''}`, onclick: () => { S.tl = id; refreshAll(); } },
+      state != null ? el('span', { class: `dot ${state}` }) : null, tlName(id)));
+  }
+  tabs.append(el('button', { class: 'tab', title: 'New auxiliary timeline', onclick: addTask }, '+'));
+}
 
 function renderTimeline() {
   if (!S.doc) return;
-  const pps = S.pxPerSec, width = S.doc.duration_s * pps;
+  renderTabs();
+  const obj = tlObj(S.tl), pps = S.pxPerSec, width = obj.duration_s * pps;
   $('#tl-body').style.width = HEAD_W + width + 40 + 'px';
 
   // Ruler: pick the smallest "nice" step that leaves labels ≥ 60 px apart.
@@ -693,14 +971,25 @@ function renderTimeline() {
   ruler.style.width = width + 'px';
   ruler.replaceChildren();
   const step = [0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600].find((s) => s * pps >= 60) || 600;
-  for (let t = 0; t <= S.doc.duration_s; t += step) {
+  for (let t = 0; t <= obj.duration_s; t += step) {
     const label = t >= 60 ? `${Math.floor(t / 60)}:${String(Math.round(t % 60)).padStart(2, '0')}` : `${t}s`;
     ruler.append(el('div', { class: 'tick', style: `left:${t * pps}px` }, label));
   }
 
+  // Control cues: flags standing on their point in time.
+  const cuelane = $('#cuelane');
+  cuelane.style.width = width + 'px';
+  cuelane.replaceChildren();
+  for (const cc of obj.control_cues) {
+    const selected = S.sel?.type === 'control' && S.sel.id === cc.id;
+    const target = cc.target ? ` ${tlName(cc.target)}` : '';
+    const text = `${ACTION_ICON[cc.action] || '?'}${target}${cc.action === 'jump' ? ` → ${cc.to_s}s` : ''}`;
+    cuelane.append(el('div', { class: `ctl${selected ? ' sel' : ''}`, dataset: { id: cc.id }, style: `left:${cc.at_s * pps}px`, title: cc.name || `${cc.action} at ${cc.at_s} s` }, text));
+  }
+
   const tracks = $('#tracks');
   tracks.replaceChildren();
-  S.doc.tracks.forEach((track, ti) => {
+  obj.tracks.forEach((track, ti) => {
     const lane = el('div', {
       class: 'lane', style: `width:${width}px`, dataset: { ti },
       ondragover: (e) => { e.preventDefault(); lane.classList.add('drop'); },
@@ -709,27 +998,26 @@ function renderTimeline() {
         e.preventDefault();
         lane.classList.remove('drop');
         const item = S.library?.find((i) => i.id === e.dataTransfer.getData('text/lcplay-asset'));
-        if (item) addAssetCue(item, ti, (e.clientX - lane.getBoundingClientRect().left) / pps);
+        if (item) addAssetCue(item, S.tl, ti, (e.clientX - lane.getBoundingClientRect().left) / pps);
       },
     });
     for (const cue of track.cues) {
       const selected = S.sel?.type === 'cue' && S.sel.id === cue.id;
       lane.append(el('div', {
-        class: `cue ${cue.source.type}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
+        class: `cue ${cue.source.type}${track.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
       }, cue.name || (cue.source.type === 'color' ? 'colour' : 'cue'),
         el('div', { class: 'h l' }), el('div', { class: 'h r' })));
     }
+    const selected = S.sel?.type === 'track' && S.sel.id === track.id;
     tracks.append(el('div', { class: 'track' },
-      el('div', { class: 'track-head' },
-        el('span', {
-          class: 'name', title: 'Double-click to rename',
-          ondblclick: () => { const n = prompt('Track name', track.name); if (n != null) edit(() => (track.name = n)); },
-        }, track.name || `Track ${ti + 1}`),
+      el('div', { class: `track-head${selected ? ' sel' : ''}`, title: 'Click to select the track', onclick: () => select({ type: 'track', id: track.id }) },
+        el('span', { class: 'name' }, track.name || `Track ${ti + 1}`),
         el('button', {
-          class: 'danger', title: 'Delete track',
-          onclick: () => { if (!track.cues.length || confirm(`Delete "${track.name}" and its ${track.cues.length} cue(s)?`)) edit(() => S.doc.tracks.splice(ti, 1)); },
-        }, '✕')),
+          class: `small${track.free_run ? ' on' : ''}`,
+          title: 'Free run: video on this track loops on its own and keeps moving while the timeline is paused',
+          onclick: (e) => { e.stopPropagation(); edit(() => (track.free_run = !track.free_run)); },
+        }, '∞')),
       lane));
   });
 }
@@ -746,63 +1034,217 @@ $('#tracks').addEventListener('mousedown', (e) => {
   tlDrag = { kind: handle, id: hit.cue.id, mx: e.clientX, orig: { ...hit.cue }, undone: false };
   e.preventDefault();
 });
+$('#cuelane').addEventListener('mousedown', (e) => {
+  const node = e.target.closest('.ctl');
+  if (!node) return select(null);
+  const hit = findControl(node.dataset.id);
+  if (!hit) return;
+  select({ type: 'control', id: hit.cc.id });
+  tlDrag = { kind: 'control', id: hit.cc.id, mx: e.clientX, orig: { ...hit.cc }, undone: false };
+  e.preventDefault();
+});
 
 function timelineDragMove(e) {
-  const hit = findCue(tlDrag.id);
-  if (!hit) return;
-  if (!tlDrag.undone) { S.undo.push(JSON.stringify(S.doc)); S.redo = []; tlDrag.undone = true; }
-  const dt = (e.clientX - tlDrag.mx) / S.pxPerSec, o = tlDrag.orig, c = hit.cue;
-  if (tlDrag.kind === 'move') {
-    c.start_s = round2(Math.max(0, o.start_s + dt));
-    // Dragging up/down moves the cue to the track under the pointer.
-    const lane = document.elementFromPoint(e.clientX, e.clientY)?.closest('.lane');
-    const ti = lane ? Number(lane.dataset.ti) : hit.ti;
-    if (ti !== hit.ti && S.doc.tracks[ti]) {
-      hit.track.cues.splice(hit.ci, 1);
-      S.doc.tracks[ti].cues.push(c);
-    }
-  } else if (tlDrag.kind === 'length') {
-    c.duration_s = round2(Math.max(0.1, o.duration_s + dt));
+  const dt = (e.clientX - tlDrag.mx) / S.pxPerSec, o = tlDrag.orig;
+  const takeUndo = () => { if (!tlDrag.undone) { S.undo.push(JSON.stringify(S.doc)); S.redo = []; tlDrag.undone = true; } };
+
+  if (tlDrag.kind === 'control') {
+    const hit = findControl(tlDrag.id);
+    if (!hit) return;
+    takeUndo();
+    hit.cc.at_s = round2(clamp(o.at_s + dt, 0, tlObj(hit.tl).duration_s));
   } else {
-    // Trim the start: the end stays where it is, and a video's in-point
-    // moves with it so the picture at any given show time does not change.
-    const d = clamp(dt, -o.start_s, o.duration_s - 0.1);
-    c.start_s = round2(o.start_s + d);
-    c.duration_s = round2(o.duration_s - d);
-    if (assetOf(c)?.kind === 'video') c.in_s = round2(Math.max(0, o.in_s + d));
+    const hit = findCue(tlDrag.id);
+    if (!hit) return;
+    takeUndo();
+    const c = hit.cue, obj = tlObj(hit.tl);
+    if (tlDrag.kind === 'move') {
+      c.start_s = round2(Math.max(0, o.start_s + dt));
+      // Dragging up/down moves the cue to the track under the pointer.
+      const lane = document.elementFromPoint(e.clientX, e.clientY)?.closest('#tracks .lane');
+      const ti = lane ? Number(lane.dataset.ti) : hit.ti;
+      if (ti !== hit.ti && obj.tracks[ti]) {
+        hit.track.cues.splice(hit.ci, 1);
+        obj.tracks[ti].cues.push(c);
+      }
+    } else if (tlDrag.kind === 'length') {
+      c.duration_s = round2(Math.max(0.1, o.duration_s + dt));
+    } else {
+      // Trim the start: the end stays where it is, and a video's in-point
+      // moves with it so the picture at any given time does not change.
+      const d = clamp(dt, -o.start_s, o.duration_s - 0.1);
+      c.start_s = round2(o.start_s + d);
+      c.duration_s = round2(o.duration_s - d);
+      if (assetOf(c)?.kind === 'video') c.in_s = round2(Math.max(0, o.in_s + d));
+    }
+    const grown = Math.max(obj.duration_s, Math.ceil(c.start_s + c.duration_s));
+    if (grown !== obj.duration_s) { obj.duration_s = grown; syncLoop(); }
   }
-  const grown = Math.max(S.doc.duration_s, Math.ceil(c.start_s + c.duration_s));
-  if (grown !== S.doc.duration_s) { S.doc.duration_s = grown; syncLoop(); }
   renderTimeline();
   renderInspector();
   scheduleSend();
 }
 
-// Scrubbing: press or drag on the ruler to move the playhead.
+// Scrubbing: press or drag on the ruler to move the open timeline's playhead.
 let scrubbing = false, lastScrub = 0;
 function scrub(e) {
-  const t = clamp((e.clientX - $('#ruler').getBoundingClientRect().left) / S.pxPerSec, 0, S.doc.duration_s);
+  const t = clamp((e.clientX - $('#ruler').getBoundingClientRect().left) / S.pxPerSec, 0, tlObj(S.tl).duration_s);
   // Each seek is a transport change for the whole cluster: do not flood it.
-  if (performance.now() - lastScrub > 60) { seek(t); lastScrub = performance.now(); }
+  if (performance.now() - lastScrub > 60) { seek(t, S.tl); lastScrub = performance.now(); }
 }
 $('#ruler').addEventListener('mousedown', (e) => { scrubbing = true; lastScrub = 0; scrub(e); });
 
 // Drags are followed on the window, so they continue outside their panel.
 window.addEventListener('mousemove', (e) => {
-  if (drag) stageDragMove(e);
+  if (winDrag) windowDragMove(e);
+  else if (drag) stageDragMove(e);
   else if (tlDrag) timelineDragMove(e);
   else if (scrubbing) scrub(e);
 });
 window.addEventListener('mouseup', (e) => {
+  if (winDrag) saveLayout();
   if (scrubbing) { lastScrub = 0; scrub(e); }
   if ((drag?.undone) || (tlDrag?.undone)) sendDoc(); // final position, immediately
-  drag = tlDrag = null;
+  winDrag = drag = tlDrag = null;
   scrubbing = false;
 });
 
+$('#tl-play').onclick = () => command({ type: currentTransport(S.tl)?.playing ? 'pause' : 'play' }, S.tl);
+$('#tl-stop').onclick = () => command({ type: 'stop' }, S.tl);
+$('#btn-track').onclick = () => edit(() => { const o = tlObj(S.tl); o.tracks.push({ id: uid(), name: `Track ${o.tracks.length + 1}`, cues: [], free_run: false }); });
+$('#btn-control').onclick = () => edit(() => {
+  const cc = { id: uid(), name: '', at_s: round2(showSeconds(S.tl)), action: 'pause', target: '', to_s: 0 };
+  tlObj(S.tl).control_cues.push(cc);
+  S.sel = { type: 'control', id: cc.id };
+});
+$('#zoom').oninput = (e) => { S.pxPerSec = Number(e.target.value); renderTimeline(); };
+
+// ───────────────────────────── tasks ─────────────────────────────
+// The auxiliary timelines and their transports: what is running, and the
+// buttons to start, pause and stop each.
+
+const taskStateText = (id) => {
+  const tr = currentTransport(id);
+  if (!tr?.active) return 'stopped';
+  return `${tr.playing ? 'playing' : 'paused'} · ${showSeconds(id).toFixed(1)} s`;
+};
+
+function renderTasks() {
+  const box = $('#tasks');
+  box.replaceChildren();
+  if (!S.doc) return;
+  if (!S.doc.tasks.length) {
+    box.append(el('div', { class: 'empty' }, 'No tasks. A task is an extra timeline that runs independently of the main one — started by you, by a control cue, or by show control (OSC).'));
+    return;
+  }
+  for (const task of S.doc.tasks) {
+    const tr = currentTransport(task.id);
+    const selected = (S.sel?.type === 'task' && S.sel.id === task.id) || S.tl === task.id;
+    box.append(el('div', { class: `task${selected ? ' sel' : ''}` },
+      el('span', { class: `dot ${!tr?.active ? '' : tr.playing ? 'ok' : 'warn'}` }),
+      el('span', { class: 'name', title: 'Open in the Timeline window', onclick: () => { S.tl = task.id; select({ type: 'task', id: task.id }); } }, task.name || 'Task'),
+      el('span', { class: 'state dim mono', dataset: { tl: task.id } }, taskStateText(task.id)),
+      el('button', { class: 'small', title: 'Play', onclick: () => command({ type: 'play' }, task.id) }, '▶'),
+      el('button', { class: 'small', title: 'Pause', onclick: () => command({ type: 'pause' }, task.id) }, '⏸'),
+      el('button', { class: 'small', title: 'Stop (take off stage)', onclick: () => command({ type: 'stop' }, task.id) }, '⏹')));
+  }
+}
+$('#btn-task').onclick = addTask;
+
+// ───────────────────────────── runners ─────────────────────────────
+// One card per Runner: is it healthy, what hardware does it have, which
+// displays does it drive and where do their windows go — and a button to
+// make it rebuild its outputs.
+
+let runnersKey = ''; // what the window was last built from
+
+function renderRunners(force = false) {
+  const box = $('#runners');
+  if (!S.doc) return;
+  const nodes = (S.status?.nodes || []).filter((n) => n.role === 'runner');
+  // Rebuilding the list under the operator's cursor would close an open
+  // dropdown or steal a click: only rebuild when something shown changed.
+  const key = JSON.stringify([
+    nodes.map((n) => [n.name, n.addr, n.frame_error, n.health?.sync.locked, Math.round(n.health?.fps || 0), n.health?.monitors, n.health?.gpu, n.health?.outputs]),
+    S.doc.stage.displays, S.sel, S.connected,
+  ]);
+  if (key === runnersKey && !force) return;
+  if (box.contains(document.activeElement) && ['SELECT', 'INPUT'].includes(document.activeElement.tagName) && !force) return;
+  runnersKey = key;
+  box.replaceChildren();
+
+  // Runners that are connected, plus any a display names that is not.
+  const names = [...new Set([...nodes.map((n) => n.name), ...S.doc.stage.displays.map((d) => d.runner).filter(Boolean)])];
+  if (!names.length) box.append(el('div', { class: 'empty' }, S.connected ? 'No Runner is connected.' : 'Not connected to the Director.'));
+
+  for (const name of names) {
+    const node = nodes.find((n) => n.name === name), h = node?.health;
+    const state = !node ? 'bad' : !h ? 'warn' : node.frame_error ? 'bad' : h.sync.locked ? 'ok' : 'warn';
+    const card = el('div', { class: 'runner' },
+      el('div', { class: 'runner-head' },
+        el('span', { class: `dot ${state}` }),
+        el('span', { class: 'name' }, name),
+        el('span', { class: 'dim' }, node ? node.addr : 'offline'),
+        node ? el('button', {
+          title: 'Close and rebuild all of this Runner\'s outputs and reload its media',
+          onclick: () => { command({ type: 'runner_action', runner: name, action: 'reload_outputs' }); toast(`Asked ${name} to reload its outputs.`, true); },
+        }, 'Reload outputs') : null));
+    if (h) {
+      card.append(el('div', { class: 'kv' },
+        el('span', {}, 'Status'), el('span', {}, [
+          h.fps ? `${h.fps.toFixed(0)} fps` : 'not rendering',
+          h.sync.locked ? `clock ±${Math.max(1, Math.round(h.sync.error_ns / 1000))} µs` : 'clock syncing',
+          node.frame_error ? `${node.frame_error > 0 ? '+' : ''}${node.frame_error} frames off` : null,
+          `${h.outputs ?? 0} output(s)`,
+        ].filter(Boolean).join(' · ')),
+        el('span', {}, 'GPU'), el('span', {}, h.gpu || '—'),
+        el('span', {}, 'Monitors'), el('span', {}, h.monitors?.length
+          ? h.monitors.map((m) => `#${m.index} ${m.width}×${m.height} at ${m.x},${m.y}`).join('   ')
+          : '—')));
+    }
+
+    // The displays this Runner drives: its own, and those assigned to none.
+    card.append(el('h4', {}, 'Displays'));
+    const displays = S.doc.stage.displays.filter((d) => d.runner === name || d.runner === '');
+    for (const d of displays) {
+      const selected = S.sel?.type === 'display' && S.sel.id === d.id;
+      const full = el('input', { type: 'checkbox', title: 'Fullscreen' });
+      full.checked = d.window.fullscreen;
+      full.onchange = () => edit(() => (d.window.fullscreen = full.checked));
+      const mon = el('select', { title: 'Monitor' }, el('option', { value: '' }, 'primary'));
+      for (const m of h?.monitors || []) mon.append(el('option', { value: m.index }, `#${m.index} ${m.width}×${m.height}`));
+      // A monitor number the Runner did not report (yet) must stay selectable.
+      if (d.window.monitor != null && ![...mon.options].some((o) => o.value === String(d.window.monitor))) mon.append(el('option', { value: d.window.monitor }, `#${d.window.monitor}`));
+      mon.value = d.window.monitor ?? '';
+      mon.onchange = () => edit(() => (d.window.monitor = mon.value === '' ? null : Number(mon.value)));
+      const where = d.window.fullscreen ? 'fullscreen' : `window ${d.window.size ? d.window.size.join('×') : 'auto'}${d.window.position ? ' at ' + d.window.position.join(',') : ''}`;
+      card.append(el('div', { class: `disp${selected ? ' sel' : ''}` },
+        el('span', { class: 'name', title: 'Edit in the Inspector', onclick: () => select({ type: 'display', id: d.id }) },
+          `${d.name || 'display'} — ${d.canvas_rect.w}×${d.canvas_rect.h} · ${where}${d.runner ? '' : ' (any runner)'}`),
+        el('label', { class: 'dim' }, full, ' full'), mon,
+        el('button', { class: 'small', title: 'Edit position, size, blend…', onclick: () => select({ type: 'display', id: d.id }) }, '✎')));
+    }
+    card.append(el('div', { class: 'btns' }, el('button', { onclick: () => addDisplay(name) }, '+ Display on this runner')));
+    box.append(card);
+  }
+}
+
+function addDisplay(runner = '') {
+  edit(() => {
+    const st = S.doc.stage, n = st.displays.length + 1;
+    const d = {
+      id: uid(), name: `Display ${n}`, runner, canvas_rect: { x: 0, y: 0, w: st.width, h: st.height },
+      window: { fullscreen: false, position: [60 + 40 * n, 60 + 40 * n], size: [960, Math.round((960 * st.height) / st.width)] },
+    };
+    st.displays.push(d);
+    normalize(S.doc);
+    S.sel = { type: 'display', id: d.id };
+  });
+}
+
 // ───────────────────────────── inspector ─────────────────────────────
-// Properties of whatever is selected: a cue, a display, or — with nothing
-// selected — the show itself.
+// Properties of whatever is selected — a cue, a control cue, a track, a
+// task, a display — or, with nothing selected, of the show itself.
 
 /** A labelled input bound to obj[key]. Changes are committed on Enter/blur
  *  (not per keystroke), each as one undo step. */
@@ -824,7 +1266,7 @@ function field(label, obj, key, opts = {}) {
   return el('div', { class: 'row' }, el('label', {}, label), input);
 }
 
-/** Two numbers on one row (x/y, w/h): [label, obj, keyA, keyB, opts]. */
+/** Two numbers on one row (x/y, w/h). */
 function pair(label, obj, a, b, opts = {}) {
   const row = el('div', { class: 'row two' }, el('label', {}, label));
   for (const key of [a, b]) row.append(field('', obj, key, opts).lastChild);
@@ -845,25 +1287,37 @@ function optionalPair(label, obj, key, min) {
   return row;
 }
 
+/** A dropdown bound to obj[key]; options are [value, label] pairs. Rebuilds
+ *  the inspector afterwards, since a choice may show or hide other fields. */
+function choice(label, obj, key, options) {
+  const sel = el('select', { class: 'wide' });
+  for (const [value, text] of options) sel.append(el('option', { value }, text));
+  sel.value = obj[key];
+  sel.onchange = () => { sel.blur(); edit(() => (obj[key] = sel.value)); };
+  return el('div', { class: 'row' }, el('label', {}, label), sel);
+}
+
 function colorField(label, obj, key) {
   const input = el('input', { type: 'color', value: rgbaToHex(obj[key]) });
   input.addEventListener('change', () => edit(() => (obj[key] = [...hexToRgb(input.value), obj[key][3] ?? 1]), { inspector: false }));
   return el('div', { class: 'row' }, el('label', {}, label), input);
 }
 
+const note = (text) => el('div', { class: 'note' }, text);
+const deleteButton = (text) => el('div', { class: 'btns' }, el('button', { class: 'danger', onclick: deleteSelection }, text));
+
 function renderInspector() {
   const box = $('#inspector');
   // Do not rebuild under the operator's cursor while they are typing here.
-  if (box.contains(document.activeElement) && document.activeElement.tagName === 'INPUT' && (drag || tlDrag) === null && box.dataset.sel === JSON.stringify(S.sel)) {
-    return;
-  }
+  if (box.contains(document.activeElement) && document.activeElement.tagName === 'INPUT' && !drag && !tlDrag && box.dataset.sel === JSON.stringify(S.sel)) return;
   box.dataset.sel = JSON.stringify(S.sel);
   box.replaceChildren();
   if (!S.doc) return;
   const sec = { step: 0.1, min: 0 };
+  const type = S.sel?.type;
 
-  if (S.sel?.type === 'cue') {
-    const c = findCue(S.sel.id).cue, asset = assetOf(c);
+  if (type === 'cue') {
+    const { cue: c, track } = findCue(S.sel.id), asset = assetOf(c);
     box.append(
       el('h3', {}, 'Cue'),
       field('Name', c, 'name', { type: 'text' }),
@@ -873,7 +1327,10 @@ function renderInspector() {
       field('Fade in (s)', c, 'fade_in_s', sec),
       field('Fade out (s)', c, 'fade_out_s', sec),
     );
-    if (asset?.kind === 'video') box.append(field('In point (s)', c, 'in_s', sec), field('Loop video', c, 'loop', { type: 'checkbox' }));
+    if (asset?.kind === 'video') {
+      box.append(field('In point (s)', c, 'in_s', sec), field('Loop video', c, 'loop', { type: 'checkbox' }));
+      if (track.free_run) box.append(note('This track is free-running: the video loops on its own clock; start and duration only decide when it is visible.'));
+    }
     box.append(
       el('h4', {}, 'Position on stage'),
       pair('X / Y', c, 'x', 'y'),
@@ -886,36 +1343,75 @@ function renderInspector() {
     box.append(el('div', { class: 'btns' },
       el('button', { onclick: () => edit(() => Object.assign(c, fitRect(mw, mh, true))) }, 'Fit to stage'),
       asset?.width ? el('button', { onclick: () => edit(() => Object.assign(c, { w: asset.width, h: asset.height })) }, 'Original size') : null,
-      el('button', { onclick: () => seek(c.start_s) }, 'Go to cue'),
+      el('button', { onclick: () => seek(c.start_s, findCue(c.id).tl) }, 'Go to cue'),
       el('button', { class: 'danger', onclick: deleteSelection }, 'Delete')));
     return;
   }
 
-  if (S.sel?.type === 'display') {
+  if (type === 'control') {
+    const { cc, tl } = findControl(S.sel.id);
+    // "This timeline" plus every other timeline as a possible target.
+    const targets = [['', `This timeline (${tlName(tl)})`], ...[MAIN, ...S.doc.tasks.map((t) => t.id)].filter((id) => id !== tl).map((id) => [id, tlName(id)])];
+    box.append(
+      el('h3', {}, 'Control cue'),
+      field('Name', cc, 'name', { type: 'text' }),
+      field('At (s)', cc, 'at_s', sec),
+      choice('Action', cc, 'action', [['pause', 'Pause'], ['play', 'Play'], ['stop', 'Stop'], ['jump', 'Jump to…']]),
+      choice('Timeline', cc, 'target', targets),
+    );
+    if (cc.action === 'jump') box.append(field('Jump to (s)', cc, 'to_s', sec));
+    box.append(
+      note('Fires when this timeline\'s playhead reaches it while playing forward, on the exact frame, on all Runners. Control cues are executed by the Director: they do not fire while it is offline.'),
+      deleteButton('Delete control cue'));
+    return;
+  }
+
+  if (type === 'track') {
+    const { track } = findTrack(S.sel.id);
+    box.append(
+      el('h3', {}, 'Track'),
+      field('Name', track, 'name', { type: 'text' }),
+      field('Free run', track, 'free_run', { type: 'checkbox' }),
+      note('Free run: video on this track loops continuously and keeps moving while the timeline is paused or scrubbed — for backgrounds and ambient loops. Its cues still decide when it is visible. The loop is tied to the cluster clock, so all Runners show the same frame, but a clip does not necessarily start from its first frame.'),
+      deleteButton('Delete track'));
+    return;
+  }
+
+  if (type === 'task') {
+    const task = tlObj(S.sel.id);
+    box.append(
+      el('h3', {}, 'Task'),
+      field('Name', task, 'name', { type: 'text' }),
+      field('Length (s)', task, 'duration_s', { min: 1 }),
+      note(`An auxiliary timeline with its own transport. It is off stage until played, and is drawn in front of the main timeline. Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
+      deleteButton('Delete task'));
+    return;
+  }
+
+  if (type === 'display') {
     const d = findDisplay(S.sel.id);
     const frac = { step: 0.01, min: 0 };
     box.append(
       el('h3', {}, 'Display'),
       field('Name', d, 'name', { type: 'text' }),
       field('Runner', d, 'runner', { type: 'text' }),
-      el('div', { class: 'dim' }, "The Runner's --name; empty = any Runner."),
+      note("The Runner's --name; empty = any Runner."),
       el('h4', {}, 'Area of the stage it shows'),
       pair('X / Y', d.canvas_rect, 'x', 'y'),
       pair('W / H', d.canvas_rect, 'w', 'h', { min: 1 }),
-      el('h4', {}, "Window on the Runner"),
+      el('h4', {}, 'Window on the Runner'),
       field('Fullscreen', d.window, 'fullscreen', { type: 'checkbox' }),
       field('Monitor #', d.window, 'monitor', { min: 0, optional: true }),
       optionalPair('Position', d.window, 'position'),
       optionalPair('Size', d.window, 'size', 1),
-      el('div', { class: 'dim' }, 'Windowed: position and size in desktop pixels. Fullscreen: uses the monitor number the Runner logs at start-up.'),
+      note('Windowed: position and size in desktop pixels. Fullscreen: on the monitor with that number (see the Runners window).'),
       el('h4', {}, 'Output'),
       field('Rotation (°)', d, 'rotation_degrees', { step: 90, min: 0, set: (v) => (((v % 360) / 90) | 0) * 90 }),
       el('h4', {}, 'Edge blend (fraction of the output)'),
       pair('Left / Right', d.blend, 'left', 'right', frac),
       pair('Top / Bottom', d.blend, 'top', 'bottom', frac),
       field('Gamma', d.blend, 'gamma', { step: 0.1, min: 0.1 }),
-      el('div', { class: 'btns' }, el('button', { class: 'danger', onclick: deleteSelection }, 'Delete display')),
-    );
+      deleteButton('Delete display'));
     return;
   }
 
@@ -935,21 +1431,12 @@ function renderInspector() {
       el('span', {}, d.name || 'display'),
       el('span', { class: 'dim' }, `${d.canvas_rect.w}×${d.canvas_rect.h}${d.runner ? ' @' + d.runner : ''}`)));
   }
-  box.append(el('div', { class: 'btns' }, el('button', {
-    onclick: () => edit(() => {
-      const n = st.displays.length + 1;
-      const d = { id: uid(), name: `Display ${n}`, canvas_rect: { x: 0, y: 0, w: st.width, h: st.height },
-        window: { fullscreen: false, position: [60 + 40 * n, 60 + 40 * n], size: [960, Math.round((960 * st.height) / st.width)] } };
-      st.displays.push(d);
-      normalize(S.doc);
-      S.sel = { type: 'display', id: d.id };
-    }),
-  }, '+ Display')));
+  box.append(el('div', { class: 'btns' }, el('button', { onclick: () => addDisplay('') }, '+ Display')));
 }
 
 // ───────────────────────────── top bar ─────────────────────────────
 
-/** Looping wraps at the timeline length; keep the two in step. */
+/** Looping wraps at the main timeline's length; keep the two in step. */
 function syncLoop() {
   if ($('#chk-loop').checked) command({ type: 'set_loop', loop_ns: Math.round(S.doc.duration_s * NS) });
 }
@@ -976,15 +1463,15 @@ function renderCluster() {
 }
 
 $('#btn-play').onclick = () => command({ type: currentTransport()?.playing ? 'pause' : 'play' });
-$('#btn-stop').onclick = () => { command({ type: 'pause' }); seek(0); };
+$('#btn-stop').onclick = () => command({ type: 'stop' });
 $('#chk-loop').onchange = (e) => command({ type: 'set_loop', loop_ns: e.target.checked ? Math.round(S.doc.duration_s * NS) : null });
 $('#sel-rate').onchange = (e) => command({ type: 'set_rate', rate_permille: Number(e.target.value) });
 $('#btn-undo').onclick = () => stepHistory(S.undo, S.redo);
 $('#btn-redo').onclick = () => stepHistory(S.redo, S.undo);
-$('#btn-track').onclick = () => edit(() => S.doc.tracks.push({ id: uid(), name: `Track ${S.doc.tracks.length + 1}`, cues: [] }));
-$('#btn-color').onclick = () => addCue({ name: 'Colour', source: { type: 'color', rgba: [0.1, 0.4, 0.8, 1] }, duration_s: 10, ...fitRect(640, 360, false) }, 0, showSeconds());
-$('#zoom').oninput = (e) => { S.pxPerSec = Number(e.target.value); renderTimeline(); };
-$('#btn-new').onclick = () => { if (confirm('Start a new, empty show? The current one is replaced on the Director.')) edit(() => { S.doc = defaultDoc(); S.sel = null; }); };
+$('#btn-color').onclick = () => addCue({ name: 'Colour', source: { type: 'color', rgba: [0.1, 0.4, 0.8, 1] }, duration_s: 10, ...fitRect(640, 360, false) }, S.tl, 0, showSeconds(S.tl));
+$('#btn-new').onclick = async () => {
+  if (await ask('Start a new, empty show? The current one is replaced on the Director.')) edit(() => { S.doc = defaultDoc(); S.sel = null; S.tl = MAIN; });
+};
 $('#btn-save').onclick = () => {
   const a = el('a', { href: URL.createObjectURL(new Blob([JSON.stringify(S.doc, null, 2)], { type: 'application/json' })), download: `${S.doc.name || 'show'}.lcplay.json` });
   a.click();
@@ -998,7 +1485,7 @@ $('#file-open').onchange = async (e) => {
   try {
     const doc = normalize(JSON.parse(await file.text()));
     delete doc._edit;
-    edit(() => { S.doc = doc; S.sel = null; });
+    edit(() => { S.doc = doc; S.sel = null; S.tl = MAIN; });
   } catch (err) { toast(`Cannot open ${file.name}: ${err.message}`); }
 };
 $('#btn-upload').onclick = () => $('#file-upload').click();
@@ -1021,31 +1508,50 @@ window.addEventListener('keydown', (e) => {
   else if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); (e.shiftKey ? $('#btn-redo') : $('#btn-undo')).click(); }
   else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); $('#btn-redo').click(); }
 });
+// Close the Windows menu when clicking elsewhere.
+window.addEventListener('mousedown', (e) => { if (!e.target.closest('#win-menu')) $('#win-menu').open = false; });
 
+let taskSignature = '';
 /** Per-frame update of everything that moves with time. */
-function tick() {
-  const t = showSeconds(), tr = currentTransport();
-  const hh = Math.floor(t / 3600), mm = Math.floor(t / 60) % 60, ss = (t % 60).toFixed(2).padStart(5, '0');
-  $('#time').textContent = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${ss}`;
-  $('#frame').textContent = 'f ' + Math.floor((t * S.frameRate.num) / S.frameRate.den);
-  $('#btn-play').textContent = tr?.playing ? '⏸' : '▶';
-  // Loop and rate reflect the cluster's state (another controller — OSC,
-  // lc-ctl — may have changed them), unless the operator is on the control.
-  if (tr && document.activeElement !== $('#chk-loop')) $('#chk-loop').checked = tr.loop_ns > 0;
-  if (tr && document.activeElement !== $('#sel-rate')) {
-    const sel = $('#sel-rate'), value = String(tr.rate_permille);
-    // A rate set elsewhere (OSC, lc-ctl) may not be one of the presets.
-    if (![...sel.options].some((o) => o.value === value)) sel.append(el('option', { value }, `${tr.rate_permille / 1000}×`));
-    sel.value = value;
+function tick(now) {
+  if (S.doc) {
+    const t = showSeconds(), tr = currentTransport();
+    const hh = Math.floor(t / 3600), mm = Math.floor(t / 60) % 60, ss = (t % 60).toFixed(2).padStart(5, '0');
+    $('#time').textContent = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${ss}`;
+    $('#frame').textContent = 'f ' + Math.floor((t * S.frameRate.num) / S.frameRate.den);
+    $('#btn-play').textContent = tr?.playing ? '⏸' : '▶';
+    // Loop and rate reflect the cluster's state (another controller — OSC,
+    // lc-ctl — may have changed them), unless the operator is on the control.
+    if (tr && document.activeElement !== $('#chk-loop')) $('#chk-loop').checked = tr.loop_ns > 0;
+    if (tr && document.activeElement !== $('#sel-rate')) {
+      const sel = $('#sel-rate'), value = String(tr.rate_permille);
+      // A rate set elsewhere (OSC, lc-ctl) may not be one of the presets.
+      if (![...sel.options].some((o) => o.value === value)) sel.append(el('option', { value }, `${tr.rate_permille / 1000}×`));
+      sel.value = value;
+    }
+
+    // The open timeline: its own transport buttons, time and playhead.
+    const tlT = showSeconds(S.tl), tlTr = currentTransport(S.tl);
+    $('#tl-play').textContent = tlTr?.playing ? '⏸' : '▶';
+    $('#tl-time').textContent = isActive(S.tl) ? `${tlT.toFixed(2)} s` : 'stopped';
+    $('#playhead').style.left = HEAD_W + tlT * S.pxPerSec + 'px';
+
+    // Tasks: rebuild the lists when a state changes (stopped/paused/playing),
+    // otherwise just update the running times in place.
+    const signature = S.doc.tasks.map((task) => { const s = currentTransport(task.id); return `${task.id}:${s?.active}:${s?.playing}`; }).join();
+    if (signature !== taskSignature) { taskSignature = signature; renderTasks(); renderTabs(); }
+    for (const node of document.querySelectorAll('#tasks .state')) node.textContent = taskStateText(node.dataset.tl);
+
+    drawStage();
+    tidyPreviews(now);
   }
-  $('#playhead').style.left = HEAD_W + t * S.pxPerSec + 'px';
-  drawStage(t);
   requestAnimationFrame(tick);
 }
 
 // ───────────────────────────── start-up ─────────────────────────────
 
 (async function start() {
+  loadLayout();
   // The Producer service tells us where the other services are; anything it
   // leaves open means "same host as this page, default port".
   const cfg = await (await fetch('config.json')).json();

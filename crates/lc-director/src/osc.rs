@@ -13,6 +13,7 @@
 //! | `/lcplay/seek`   | seconds (number)    | jump to that show time |
 //! | `/lcplay/rate`   | speed (1.0 = normal)| set playback rate |
 //! | `/lcplay/loop`   | seconds, or 0 = off | loop the show at that length |
+//! | `/lcplay/task/<id>/play` (`pause`, `stop`, `seek`) | as above | the same, for the auxiliary timeline `<id>` |
 //!
 //! For `play`, `pause` and `stop` a single numeric argument of `0` is
 //! ignored: control surfaces send `1` when a button is pressed and `0` when
@@ -55,10 +56,10 @@ fn handle_packet(core: &Core, packet: OscPacket, from: &str) {
         OscPacket::Message(msg) => {
             let addr = msg.addr.clone();
             match commands_for(&msg) {
-                Ok(commands) => {
+                Ok((commands, timeline)) => {
                     for command in commands {
                         tracing::info!("osc {addr} from {from}");
-                        if let Err(e) = core.command(command) {
+                        if let Err(e) = core.command_on(command, timeline.as_deref()) {
                             tracing::warn!("osc {addr}: {e}");
                         }
                     }
@@ -88,8 +89,23 @@ fn number(msg: &OscMessage) -> Option<f64> {
     }
 }
 
-/// Translate one OSC message into zero or more commands.
-fn commands_for(msg: &OscMessage) -> Result<Vec<Command>, String> {
+/// Translate one OSC message into zero or more commands and the timeline
+/// they are for (`None` = the main timeline).
+fn commands_for(msg: &OscMessage) -> Result<(Vec<Command>, Option<String>), String> {
+    // "/lcplay/task/<id>/<verb>" addresses an auxiliary timeline with the
+    // same verbs as the main one.
+    let (verb, timeline) = match msg.addr.strip_prefix("/lcplay/task/") {
+        Some(rest) => match rest.split_once('/') {
+            Some((id, verb)) if !id.is_empty() => (format!("/lcplay/{verb}"), Some(id.to_string())),
+            _ => return Err("expected /lcplay/task/<id>/<play|pause|stop|seek>".into()),
+        },
+        None => (msg.addr.clone(), None),
+    };
+    let stop = if timeline.is_some() {
+        vec![Command::Stop]
+    } else {
+        vec![Command::Pause, Command::Seek { show_ns: 0 }]
+    };
     // Button release (see module docs).
     let released = number(msg) == Some(0.0);
     let seconds = |what: &str| {
@@ -98,11 +114,11 @@ fn commands_for(msg: &OscMessage) -> Result<Vec<Command>, String> {
             .map(|v| (v * NANOS_PER_SEC as f64).round() as i64)
             .ok_or_else(|| format!("expects {what} as a non-negative number"))
     };
-    Ok(match msg.addr.as_str() {
+    let commands = match verb.as_str() {
         "/lcplay/play" | "/lcplay/pause" | "/lcplay/stop" if released => vec![],
         "/lcplay/play" => vec![Command::Play],
         "/lcplay/pause" => vec![Command::Pause],
-        "/lcplay/stop" => vec![Command::Pause, Command::Seek { show_ns: 0 }],
+        "/lcplay/stop" => stop,
         "/lcplay/seek" => vec![Command::Seek {
             show_ns: seconds("the show time in seconds")?,
         }],
@@ -120,8 +136,9 @@ fn commands_for(msg: &OscMessage) -> Result<Vec<Command>, String> {
                 loop_ns: (ns > 0).then_some(ns),
             }]
         }
-        other => return Err(format!("unknown address '{other}'")),
-    })
+        _ => return Err(format!("unknown address '{}'", msg.addr)),
+    };
+    Ok((commands, timeline))
 }
 
 #[cfg(test)]
@@ -135,48 +152,68 @@ mod tests {
         }
     }
 
+    /// What a message for the main timeline should translate to.
+    fn main(commands: Vec<Command>) -> Result<(Vec<Command>, Option<String>), String> {
+        Ok((commands, None))
+    }
+
     #[test]
     fn transport_addresses_map_to_commands() {
         assert_eq!(
             commands_for(&msg("/lcplay/play", vec![])),
-            Ok(vec![Command::Play])
+            main(vec![Command::Play])
         );
         assert_eq!(
             commands_for(&msg("/lcplay/stop", vec![])),
-            Ok(vec![Command::Pause, Command::Seek { show_ns: 0 }])
+            main(vec![Command::Pause, Command::Seek { show_ns: 0 }])
         );
         assert_eq!(
             commands_for(&msg("/lcplay/seek", vec![OscType::Float(12.5)])),
-            Ok(vec![Command::Seek {
+            main(vec![Command::Seek {
                 show_ns: 12_500_000_000
             }])
         );
         // Integer arguments work too (many desks only send ints).
         assert_eq!(
             commands_for(&msg("/lcplay/loop", vec![OscType::Int(30)])),
-            Ok(vec![Command::SetLoop {
+            main(vec![Command::SetLoop {
                 loop_ns: Some(30 * NANOS_PER_SEC)
             }])
         );
         assert_eq!(
             commands_for(&msg("/lcplay/loop", vec![OscType::Int(0)])),
-            Ok(vec![Command::SetLoop { loop_ns: None }])
+            main(vec![Command::SetLoop { loop_ns: None }])
         );
         assert_eq!(
             commands_for(&msg("/lcplay/rate", vec![OscType::Double(0.5)])),
-            Ok(vec![Command::SetRate { rate_permille: 500 }])
+            main(vec![Command::SetRate { rate_permille: 500 }])
         );
+    }
+
+    #[test]
+    fn task_addresses_target_an_auxiliary_timeline() {
+        assert_eq!(
+            commands_for(&msg("/lcplay/task/intro/play", vec![])),
+            Ok((vec![Command::Play], Some("intro".into())))
+        );
+        // Stopping a task is a real stop (off stage), not pause-and-rewind.
+        assert_eq!(
+            commands_for(&msg("/lcplay/task/intro/stop", vec![])),
+            Ok((vec![Command::Stop], Some("intro".into())))
+        );
+        assert!(commands_for(&msg("/lcplay/task/intro", vec![])).is_err());
+        assert!(commands_for(&msg("/lcplay/task//play", vec![])).is_err());
     }
 
     #[test]
     fn button_release_does_not_fire_again() {
         assert_eq!(
             commands_for(&msg("/lcplay/play", vec![OscType::Float(1.0)])),
-            Ok(vec![Command::Play])
+            main(vec![Command::Play])
         );
         assert_eq!(
             commands_for(&msg("/lcplay/play", vec![OscType::Float(0.0)])),
-            Ok(vec![])
+            main(vec![])
         );
     }
 

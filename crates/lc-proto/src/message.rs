@@ -8,6 +8,8 @@
 //! or from a script, and unknown tags fail loudly instead of being
 //! misinterpreted.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ClockId, FrameRate, NodeId, Role, TransportState};
@@ -21,6 +23,10 @@ pub enum ClientMessage {
     /// An operator action. Any role may send commands; Runners normally don't.
     Command {
         command: Command,
+        /// Which timeline a transport command is for: `None` (or absent) is
+        /// the main timeline, otherwise the id of an auxiliary timeline.
+        #[serde(default)]
+        timeline: Option<String>,
     },
     /// Periodic Runner status (1 Hz).
     Health(Health),
@@ -62,6 +68,9 @@ pub struct RunnerHello {
     /// Transport state the Runner is currently executing.
     #[serde(default)]
     pub transport: Option<TransportState>,
+    /// …and those of the auxiliary timelines, by timeline id.
+    #[serde(default)]
+    pub tasks: BTreeMap<String, TransportState>,
 }
 
 /// Operator actions. Deliberately small: these are also the verbs the
@@ -71,6 +80,9 @@ pub struct RunnerHello {
 pub enum Command {
     Play,
     Pause,
+    /// Main timeline: pause and return to the start. Auxiliary timeline:
+    /// take it off stage (it renders nothing until played again).
+    Stop,
     /// Jump to an absolute show time; keeps the play/pause state.
     Seek {
         show_ns: i64,
@@ -90,6 +102,35 @@ pub enum Command {
     },
     /// Ask for an immediate [`ServerMessage::Cluster`].
     Status,
+    /// Tell one Runner to do something to itself. `runner` is its name or
+    /// node id.
+    RunnerAction {
+        runner: String,
+        action: RunnerAction,
+    },
+}
+
+/// What a Runner can be asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerAction {
+    /// Close and rebuild all outputs and reload all media — the remedy when
+    /// a display was re-plugged or an output came up wrong.
+    ReloadOutputs,
+}
+
+/// One monitor attached to a Runner, as its window system reports it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Index to use in a display's `window.monitor`.
+    pub index: usize,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Position of its top-left corner on the Runner's desktop.
+    pub x: i32,
+    pub y: i32,
+    pub scale: f64,
 }
 
 /// One Runner's self-reported state.
@@ -110,6 +151,15 @@ pub struct Health {
     /// Measured presentation rate, when a renderer is running.
     #[serde(default)]
     pub fps: Option<f32>,
+    /// The Runner's monitors (empty for a headless Runner).
+    #[serde(default)]
+    pub monitors: Vec<MonitorInfo>,
+    /// The GPU it renders with.
+    #[serde(default)]
+    pub gpu: Option<String>,
+    /// Number of output windows currently open.
+    #[serde(default)]
+    pub outputs: u32,
 }
 
 /// How well a Runner's clock is locked to the Director's.
@@ -141,6 +191,14 @@ pub enum ServerMessage {
     Transport {
         clock_id: ClockId,
         state: TransportState,
+        /// `None` = the main timeline, otherwise an auxiliary timeline's id.
+        #[serde(default)]
+        timeline: Option<String>,
+    },
+    /// Addressed to one Runner (the others ignore it).
+    RunnerAction {
+        node_id: NodeId,
+        action: RunnerAction,
     },
     /// The show document. Sent to a Runner whose cached revision differs, and
     /// to everyone when a new show is loaded.
@@ -175,6 +233,9 @@ pub struct Welcome {
     pub frame_rate: FrameRate,
     /// Transport state in force right now.
     pub transport: TransportState,
+    /// Transport states of the auxiliary timelines, by timeline id.
+    #[serde(default)]
+    pub tasks: BTreeMap<String, TransportState>,
     #[serde(default)]
     pub show_revision: Option<u64>,
 }
@@ -186,6 +247,9 @@ pub struct ClusterStatus {
     pub cluster_ns: i64,
     pub frame_rate: FrameRate,
     pub transport: TransportState,
+    /// Transport states of the auxiliary timelines, by timeline id.
+    #[serde(default)]
+    pub tasks: BTreeMap<String, TransportState>,
     /// Show time / frame at `cluster_ns` according to the Director.
     pub show_ns: i64,
     pub frame: i64,
@@ -227,11 +291,12 @@ mod tests {
             command: Command::Seek {
                 show_ns: 1_500_000_000,
             },
+            timeline: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
             json,
-            r#"{"type":"command","command":{"type":"seek","show_ns":1500000000}}"#
+            r#"{"type":"command","command":{"type":"seek","show_ns":1500000000},"timeline":null}"#
         );
         assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), msg);
     }

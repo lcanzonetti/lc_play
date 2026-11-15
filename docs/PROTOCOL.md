@@ -1,4 +1,4 @@
-# LC Play wire protocol (version 1)
+# LC Play wire protocol (version 2)
 
 Source of truth: `crates/lc-proto` (messages) and `crates/lc-time/src/wire.rs`
 (sync packet). This file is the human-readable summary. All times are signed
@@ -38,7 +38,7 @@ least every 6 s (`ping` or `health`), or it is dropped.
 { "type": "hello", "protocol": 1, "node_id": "…", "role": "runner", "name": "left",
   "runner": { "show_revision": 3, "show_id": "…uuid…", "clock_id": 1234,
               "cluster_now_ns": 98765432100, "transport": { … } } }
-{ "type": "command", "command": { "type": "play" } }
+{ "type": "command", "command": { "type": "play" }, "timeline": null }
 { "type": "health", "cluster_ns": 0, "show_ns": 0, "frame": 0, "transport_epoch": 2,
   "show_revision": 3, "fps": 59.9,
   "sync": { "locked": true, "samples": 64, "offset_ns": 0, "drift_ppm": -3.1,
@@ -58,6 +58,8 @@ Commands:
 | `type` | Fields | Effect |
 |---|---|---|
 | `play`, `pause` | — | |
+| `stop` | — | main timeline: pause and rewind; a task: take it off stage |
+| `runner_action` | `runner` (name or node id), `action`: `reload_outputs` | that Runner closes and rebuilds its outputs |
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
@@ -65,7 +67,9 @@ Commands:
 | `status` | — | Director replies with `cluster` |
 
 Transport commands take effect `lead_ns` (default 100 ms) after the Director
-receives them, simultaneously on all Runners.
+receives them, simultaneously on all Runners. `timeline` on the `command`
+message selects the transport they act on: `null`/absent/`"main"` is the main
+timeline, otherwise the id of an auxiliary timeline (task) of the show.
 
 ### Director → client
 
@@ -73,7 +77,8 @@ receives them, simultaneously on all Runners.
 { "type": "welcome", "protocol": 1, "director_id": "…", "name": "main",
   "clock_id": 1234, "sync_port": 7402, "lead_ns": 100000000,
   "frame_rate": { "num": 60, "den": 1 }, "transport": { … }, "show_revision": 3 }
-{ "type": "transport", "clock_id": 1234, "state": { … } }
+{ "type": "transport", "clock_id": 1234, "state": { … }, "timeline": null }
+{ "type": "runner_action", "node_id": "…", "action": "reload_outputs" }
 { "type": "show", "revision": 3, "id": "…uuid…", "document": { … } }
 { "type": "cluster", "clock_id": 1234, "cluster_ns": 0, "frame_rate": { … },
   "transport": { … }, "show_ns": 0, "frame": 0, "show_revision": 3,
@@ -89,7 +94,8 @@ receives them, simultaneously on all Runners.
 
 ```json
 { "epoch": 7, "playing": true, "rate_permille": 1000,
-  "anchor_cluster_ns": 123000000000, "anchor_show_ns": 42000000000, "loop_ns": null }
+  "anchor_cluster_ns": 123000000000, "anchor_show_ns": 42000000000, "loop_ns": null,
+  "active": true }
 ```
 
 From cluster time `anchor_cluster_ns` on:
@@ -100,6 +106,15 @@ show_ns = anchor_show_ns                                                        
 then: wrapped into 0..loop_ns if looping, else clamped at ≥ 0
 frame   = floor(show_ns × num / (den × 1e9))
 ```
+
+Every timeline has its own transport state and its own epochs. `welcome` and
+`cluster` carry the tasks' states in `tasks` (id → state); a task with no
+entry has never been started. `active: false` means the timeline is off
+stage: nothing of it is drawn (a paused timeline, by contrast, holds its
+picture). The main timeline is always active.
+
+A Runner's `health` also reports `monitors` (index, name, size, position),
+`gpu` and `outputs` (open windows).
 
 A receiver keeps the state it has until the new one's anchor is reached, and
 ignores any state whose `epoch` is not higher than the newest it knows (within
@@ -176,8 +191,15 @@ broadcasts them back. Other tools may ignore it.
       "url": "http://10.0.0.1:7403/stream/636c6970",
       "size": 594087, "width": 1920, "height": 1080, "duration_s": 12.0 }
   ],
+  "control_cues": [
+    { "id": "k1", "at_s": 30, "action": "pause", "target": "", "to_s": 0 },
+    { "id": "k2", "at_s": 10, "action": "play", "target": "sting" }
+  ],
+  "tasks": [
+    { "id": "sting", "name": "Sting", "duration_s": 8, "tracks": [ … ], "control_cues": [ … ] }
+  ],
   "tracks": [
-    { "id": "t1", "name": "Track 1", "cues": [
+    { "id": "t1", "name": "Track 1", "free_run": false, "cues": [
       { "id": "c1", "name": "clip.mp4",
         "source": { "type": "asset", "asset": "636c6970" },
         "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false,
@@ -195,6 +217,17 @@ broadcasts them back. Other tools may ignore it.
 * The first track is in front.
 * `runner` is a Runner's `--name`; empty means any Runner.
 * A Runner downloads `url` once and caches it under `id` + `size`.
+* `tasks` are auxiliary timelines: same shape as the main one (`tracks`,
+  `duration_s`, `control_cues`), each with its own transport, drawn in front
+  of the main timeline while active.
+* A control cue fires when its timeline, playing forward, reaches `at_s`.
+  `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
+  timeline acted on — empty for the cue's own, `"main"`, or a task id. The
+  Director schedules the resulting transport change for the exact cluster
+  instant of the cue, ahead of time.
+* `free_run` on a track: its video ignores the timeline's position and loops
+  on cluster time (`frame = floor(cluster_seconds × fps) mod length`); the
+  cues still decide when it is visible.
 
 ## 6. OSC (Director, UDP 7405)
 
@@ -205,6 +238,7 @@ broadcasts them back. Other tools may ignore it.
 | `/lcplay/seek` | seconds | jump |
 | `/lcplay/rate` | speed (1.0 = normal) | |
 | `/lcplay/loop` | seconds, 0 = off | |
+| `/lcplay/task/<id>/play`, `/pause`, `/stop`, `/seek` | as above | the same for task `<id>` |
 
 Numeric arguments may be float, double, int or long. For play/pause/stop a
 single argument of `0` is ignored (a control surface's button release).
@@ -218,7 +252,7 @@ Bundles are accepted; their time tags are ignored.
 | `POST /api/upload?name=<file name>` | body = the raw file; returns the item |
 | `DELETE /api/items/{id}` | removes the file |
 | `GET /stream/{id}` | the file, with `Range` support |
-| `GET /thumb/{id}` | small JPEG |
+| `GET /thumb/{id}` | small PNG |
 | `GET /transcode/{id}` | on-the-fly transcode for browser preview |
 
 `kind` is `video`, `image` or `audio`. By default browsers may use the

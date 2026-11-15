@@ -186,7 +186,7 @@ async fn rescan(state: &AppState) {
     let _ = tokio::task::spawn_blocking(move || library.rescan()).await;
 }
 
-/// `GET /thumb/{id}` — a small JPEG of the image, or of the video's first
+/// `GET /thumb/{id}` — a small PNG of the image, or of the video's first
 /// frame.
 pub async fn thumbnail(
     State(state): State<AppState>,
@@ -218,7 +218,10 @@ pub async fn thumbnail(
                 .arg(&item.abs_path)
                 .args(["-frames:v", "1", "-vf"])
                 .arg(format!("scale={THUMB_WIDTH}:-2"))
-                .args(["-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"])
+                // PNG rather than JPEG: recent ffmpeg versions refuse to
+                // encode MJPEG from ordinary (limited-range) video without
+                // extra flags, which made thumbnails fail silently.
+                .args(["-f", "image2pipe", "-c:v", "png", "pipe:1"])
                 .stdin(Stdio::null())
                 .output()
                 .await
@@ -241,7 +244,7 @@ pub async fn thumbnail(
     };
     Ok((
         [
-            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CONTENT_TYPE, "image/png"),
             (header::CACHE_CONTROL, "max-age=3600"),
         ],
         jpeg,

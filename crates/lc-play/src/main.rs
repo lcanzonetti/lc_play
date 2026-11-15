@@ -14,7 +14,7 @@
 //! |----------------|---------------|-----------------|
 //! | Asset Manager  | `lc-assets`   | HTTP 7403       |
 //! | Director       | `lc-director` | TCP 7401, UDP 7402, OSC UDP 7405 |
-//! | Producer       | `lc-producer` | HTTP 7404 (open this in a browser) |
+//! | Producer       | `lc-producer` | its own window (and HTTP 7404 for browsers) |
 //! | Runner         | `lc-runner`   | — (opens the output windows) |
 //!
 //! Nothing here is special-cased for the single-machine setup: the services
@@ -42,6 +42,10 @@ struct Args {
     /// Do not start a local Runner.
     #[arg(long)]
     no_runner: bool,
+    /// Do not open the Producer window; serve the interface for a browser
+    /// (http://localhost:7404) instead.
+    #[arg(long)]
+    browser: bool,
     /// Name of the local Runner (what a display's "Runner" field refers to).
     #[arg(long, default_value = "runner")]
     runner_name: String,
@@ -120,10 +124,11 @@ async fn main() -> anyhow::Result<()> {
         .arg(dir_arg(&args.dir, "director"));
     children.push(("director", Some(spawn("director", director)?)));
 
-    children.push((
-        "producer",
-        Some(spawn("producer", Command::new(sibling("lc-producer")?))?),
-    ));
+    let mut producer = Command::new(sibling("lc-producer")?);
+    if args.browser {
+        producer.arg("--browser");
+    }
+    children.push(("producer", Some(spawn("producer", producer)?)));
 
     if !args.no_runner {
         let mut runner = Command::new(sibling("lc-runner")?);
@@ -137,7 +142,12 @@ async fn main() -> anyhow::Result<()> {
 
     println!();
     println!("  LC Play is starting.");
-    println!("  Producer (open in a browser):  http://localhost:7404");
+    if args.browser {
+        println!("  Producer (open in a browser):  http://localhost:7404");
+    } else {
+        println!("  The Producer opens in its own window. Closing it stops everything.");
+        println!("  (It is also reachable from a browser at http://localhost:7404)");
+    }
     println!("  Media folder:                  {}", media.display());
     println!(
         "  OSC control:                   udp port 7405  (/lcplay/play, /pause, /stop, /seek)"
@@ -154,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     // Runner's window, or killed the Director to see what happens — is
     // reported and the others keep running: that independence is the point
     // of separate services, and this launcher must not undo it.
+    let mut window_closed = false;
     let mut poll = tokio::time::interval(std::time::Duration::from_millis(300));
     loop {
         tokio::select! {
@@ -165,9 +176,19 @@ async fn main() -> anyhow::Result<()> {
                         None => None,
                     };
                     if let Some(status) = exited {
-                        println!("[launcher] {name} exited ({status}). The other services keep running; restart `lc-play` to bring it back.");
                         *slot = None;
+                        // The Producer window *is* the application: closing
+                        // it ends the session, like closing any program.
+                        if *name == "producer" && !args.browser {
+                            println!("[launcher] the Producer window was closed.");
+                            window_closed = true;
+                        } else {
+                            println!("[launcher] {name} exited ({status}). The other services keep running; restart `lc-play` to bring it back.");
+                        }
                     }
+                }
+                if window_closed {
+                    break;
                 }
                 if children.iter().all(|(_, slot)| slot.is_none()) {
                     println!("[launcher] every service has exited.");

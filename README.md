@@ -26,10 +26,10 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 
 | Part | State |
 |---|---|
-| Director: cluster clock, transport, show distribution, persistence, restart adoption, OSC input | implemented, tested |
-| Runner: renders the Director's show live (edits appear while playing), images, colours, video, fades, warp, edge blend, local asset cache, holdover | implemented, tested |
+| Director: cluster clock, transport per timeline, control cues, show distribution, persistence, restart adoption, OSC input | implemented, tested |
+| Runner: renders the Director's show live (edits appear while playing), images, colours, video, fades, warp, edge blend, auxiliary timelines, free-running tracks, local asset cache, holdover | implemented, tested |
 | Asset Manager: upload, list, thumbnails, metadata, HTTP Range delivery | implemented |
-| Producer: stage, timeline, assets, inspector, transport, cluster health, undo, save/open | implemented (basic) |
+| Producer: stand-alone window with floating panels — stage with live content preview, timelines, tasks, runners, assets, inspector, undo, save/open | implemented (basic) |
 | One-command launcher for a single machine | implemented |
 
 **What "basic" means — read before testing:**
@@ -39,10 +39,16 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
   4K60 walls. No audio. Reverse playback of video is choppy.
 * **No keyframe animation.** A cue has one position, size, rotation and
   opacity, plus fade in/out.
+* **Control cues are executed by the Director.** They are frame-exact on all
+  Runners, but do not fire while the Director is down.
+* **Free-running tracks loop on the cluster clock**: all Runners agree on the
+  frame, but a clip does not necessarily start from its first frame.
 * **Warp is corner-pin only**, and is set as numbers in the show file — the
   Producer has fields for edge blend but no warp editor yet.
 * **MIDI, Art-Net and LTC are not implemented**; OSC is.
-* **The Producer's stage shows thumbnails**, not live video. The Runner's
+* **The Producer's stage preview is played by the web view**, not by the
+  Runner: it follows the timeline closely but is not frame-exact, and a
+  codec the web view cannot decode (ProRes, HAP) shows a still. The Runner's
   output is the real picture.
 * **No authentication anywhere.** Closed show networks only.
 * **Tested on Linux only**, on one machine with a software GPU, plus
@@ -64,27 +70,38 @@ target/release/lc-play
 ```
 
 (On Windows: `target\release\lc-play.exe`.) This starts the Asset Manager,
-the Director, the Producer and one Runner, and prints:
+the Director and one Runner, and opens the **Producer in its own window**.
+Closing that window stops everything. (`lc-play --browser` serves the
+interface at `http://localhost:7404` instead, and a second operator can
+always open that address in a browser.)
 
-```
-Producer (open in a browser):  http://localhost:7404
-```
+The Producer window needs the system web view: WebView2 on Windows (part of
+Windows 11 and of up-to-date Windows 10), WebKitGTK on Linux
+(`libwebkit2gtk-4.1`).
 
-Then, in the browser:
-
-1. **Upload** media (button, or drop files on the Assets panel). Files can
+1. **Upload** media (button, or drop files on the Assets window). Files can
    also be copied into `lcplay-data/media/`; they appear within seconds.
-2. **Double-click** an asset to add it at the playhead, or drag it onto a
-   track. A Runner window opens showing the stage.
+2. **Double-click** an asset to add it at the playhead of the open timeline,
+   or drag it onto a track. A Runner window opens showing the stage.
 3. **Play** (Space). Drag cues on the stage or the timeline while it plays:
    the output follows.
-4. Select nothing to edit the show and stage; click a display's name tab on
-   the stage to edit that display (area of the stage, window size, fullscreen
-   and monitor, edge blend).
+
+The interface is a desktop of floating windows — drag a title bar to move
+one, its bottom-right corner to resize it; the **Windows** menu shows, hides
+and resets them. The layout is remembered.
+
+| Window | What it is for |
+|---|---|
+| Stage | The canvas with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it. |
+| Timeline | One timeline at a time; the tabs switch between **Main** and the tasks. Drag cues, trim their ends, drag on the ruler to scrub. **+ Control cue** adds a pause / play / stop / jump at the playhead. The **∞** button on a track makes it free-running. |
+| Tasks | The auxiliary timelines: independent timelines with their own play / pause / stop, drawn in front of the main one. |
+| Runners | Each Runner: health, GPU, monitors, the displays it drives (fullscreen, monitor), and **Reload outputs**. |
+| Inspector | Properties of whatever is selected; with nothing selected, the show and stage. |
+| Assets | Media on the Asset Manager. |
 
 The default display is a 960×540 window showing a 1920×1080 stage — a
-preview. For a real output, select the display, tick **Fullscreen** and set
-the **Monitor #** (the Runner logs the monitor list when it starts).
+preview. For a real output, tick **full** for the display in the Runners
+window and choose the monitor.
 
 Things worth trying:
 
@@ -93,7 +110,9 @@ Things worth trying:
 * Restart `lc-play`: the show, its position and the Runner's media cache are
   restored from `lcplay-data/`.
 * Send OSC to UDP port 7405: `/lcplay/play`, `/lcplay/pause`, `/lcplay/stop`,
-  `/lcplay/seek <seconds>`, `/lcplay/rate <speed>`, `/lcplay/loop <seconds|0>`.
+  `/lcplay/seek <seconds>`, `/lcplay/rate <speed>`, `/lcplay/loop <seconds|0>`,
+  and `/lcplay/task/<id>/play` (`pause`, `stop`, `seek`) for a task — its id
+  is shown in the Inspector when the task is selected.
 * `target/release/lc-ctl status` — per Runner: on frame? sync error, RTT, drift.
 
 ### Several machines
@@ -104,7 +123,7 @@ Run the services by hand instead of `lc-play`:
 # on the server (use its LAN address where Runners must reach it)
 LCMS_BIND=0.0.0.0:7403 LCMS_MEDIA_DIR=/data/media target/release/lc-assets
 target/release/lc-director --state-dir /data/director
-target/release/lc-producer --assets http://10.0.0.1:7403
+target/release/lc-producer --browser --assets http://10.0.0.1:7403
 
 # on each render machine
 target/release/lc-runner --director 10.0.0.1:7401 --name left --cache-dir /data/runner

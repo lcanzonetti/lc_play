@@ -536,13 +536,14 @@ impl Gpu {
     }
 
     /// Acquire every output's surface, encode all of them into one command
-    /// buffer for show time `now`, and submit once. Call
+    /// buffer, and submit once. `times` gives each layer the time of the
+    /// timeline it belongs to (`None` = that timeline is off stage). Call
     /// [`PendingFrame::present`] afterwards to put the frame on screen.
     pub fn draw(
         &self,
         targets: &[(&OutputGpu, &Output)],
         show: &Show,
-        now: f64,
+        times: &[Option<f64>],
         contents: &[Box<dyn Content>],
         draw_order: &[usize],
     ) -> PendingFrame {
@@ -566,7 +567,7 @@ impl Gpu {
                         &out.res,
                         output,
                         show,
-                        now,
+                        times,
                         contents,
                         draw_order,
                     );
@@ -588,7 +589,7 @@ impl Gpu {
         out: &OutputResources,
         output: &Output,
         show: &Show,
-        now: f64,
+        times: &[Option<f64>],
         contents: &[Box<dyn Content>],
         draw_order: &[usize],
     ) {
@@ -597,7 +598,9 @@ impl Gpu {
             draw_order
                 .iter()
                 .copied()
-                .filter(|&i| show.layers[i].timing.visible_at(now))
+                // `times[i]` is layer i's own timeline time, `None` while
+                // that timeline is off stage.
+                .filter(|&i| times[i].is_some_and(|t| show.layers[i].timing.visible_at(t)))
         };
 
         // Per-layer uniforms for this output (staged; applied at submit).
@@ -606,7 +609,7 @@ impl Gpu {
             let u = SceneUniform {
                 mvp: (view_proj * t.model_matrix()).to_cols_array_2d(),
                 // The cue's own opacity times its fade in/out at this instant.
-                opacity: t.opacity * show.layers[i].timing.fade_at(now),
+                opacity: t.opacity * show.layers[i].timing.fade_at(times[i].unwrap_or(0.0)),
                 _pad: [0.0; 3],
             };
             self.queue
@@ -871,7 +874,11 @@ mod tests {
 
         let mut enc = gpu.device.create_command_encoder(&Default::default());
         let view = target.create_view(&Default::default());
-        gpu.encode_output(&mut enc, &view, &res, output, show, 0.0, &contents, &order);
+        // Every layer at show time 0, as on a single main timeline.
+        let times = vec![Some(0.0); show.layers.len()];
+        gpu.encode_output(
+            &mut enc, &view, &res, output, show, &times, &contents, &order,
+        );
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,

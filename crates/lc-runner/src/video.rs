@@ -293,13 +293,22 @@ impl VideoContent {
         (self.timing.media_in.max(0.0) * self.info.fps()).floor() as i64
     }
 
-    /// The frame of the file that belongs on screen at show time `t`.
+    /// The frame of the file that belongs on screen at time `t`.
+    ///
+    /// `t` is the layer's timeline time — or, for a free-running layer,
+    /// cluster time in seconds: the clip then loops on the cluster clock,
+    /// identically on every Runner, whatever the timeline does.
     fn frame_at(&self, t: f64) -> i64 {
         let first = self.first_frame();
-        let elapsed = ((t - self.timing.start).max(0.0) * self.info.fps()).floor() as i64;
+        let since = if self.timing.free_run {
+            t
+        } else {
+            t - self.timing.start
+        };
+        let elapsed = (since.max(0.0) * self.info.fps()).floor() as i64;
         match self.info.frames {
             Some(total) if total > first => {
-                if self.timing.media_loop {
+                if self.timing.media_loop || self.timing.free_run {
                     first + elapsed % (total - first)
                 } else {
                     // Past the end: hold the last frame.
@@ -370,7 +379,7 @@ impl Content for VideoContent {
         }
 
         // Approaching the loop point: get the next pass ready.
-        if self.timing.media_loop && self.standby.is_none() {
+        if (self.timing.media_loop || self.timing.free_run) && self.standby.is_none() {
             if let Some(total) = self.info.frames {
                 if total - want <= fps as i64 && total - self.first_frame() > (2.0 * fps) as i64 {
                     self.standby = self.start_decoder(self.first_frame());

@@ -60,9 +60,12 @@ async fn controller_drives_the_transport() {
         },
         Command::Play,
     ] {
-        conn.send(&ClientMessage::Command { command })
-            .await
-            .unwrap();
+        conn.send(&ClientMessage::Command {
+            command,
+            timeline: None,
+        })
+        .await
+        .unwrap();
     }
     // Both changes are broadcast back to us as transport states…
     let mut epochs = Vec::new();
@@ -80,6 +83,7 @@ async fn controller_drives_the_transport() {
     let asked_at = director.core().clock.now_ns();
     conn.send(&ClientMessage::Command {
         command: Command::Status,
+        timeline: None,
     })
     .await
     .unwrap();
@@ -116,6 +120,7 @@ async fn invalid_commands_are_refused_without_dropping_the_link() {
     for command in bad {
         conn.send(&ClientMessage::Command {
             command: command.clone(),
+            timeline: None,
         })
         .await
         .unwrap();
@@ -340,5 +345,154 @@ async fn shows_are_matched_by_id_not_by_revision() {
         ServerMessage::Pong,
         "nothing but the pong arrives"
     );
+    director.shutdown().await;
+}
+
+/// Load a show given as JSON into a fresh Director.
+async fn director_with_show(document: serde_json::Value) -> Director {
+    let director = start().await;
+    director
+        .core()
+        .command(Command::LoadShow { document })
+        .unwrap();
+    director
+}
+
+#[tokio::test]
+async fn auxiliary_timelines_have_their_own_transport() {
+    let director = director_with_show(serde_json::json!({
+        "tasks": [ { "id": "intro", "name": "Intro" } ]
+    }))
+    .await;
+    let core = director.core();
+
+    // A task that was never started is not even listed: it is off stage.
+    assert!(core.status().tasks.is_empty());
+
+    core.command_on(Command::Play, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let status = core.status();
+    let intro = status.tasks["intro"];
+    assert!(intro.active && intro.playing);
+    assert!(intro.show_time_at(status.cluster_ns) > 0);
+    assert!(!status.transport.playing, "the main timeline did not move");
+    assert_eq!(status.show_ns, 0);
+
+    // Stopping a task takes it off stage and rewinds it…
+    core.command_on(Command::Stop, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = core.status();
+    assert!(!status.tasks["intro"].active);
+    assert_eq!(status.tasks["intro"].show_time_at(status.cluster_ns), 0);
+
+    // …whereas stopping the main timeline only rewinds it.
+    core.command(Command::Seek {
+        show_ns: 5 * NANOS_PER_SEC,
+    })
+    .unwrap();
+    core.command(Command::Stop).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = core.status();
+    assert!(status.transport.active && !status.transport.playing);
+    assert_eq!(status.show_ns, 0);
+
+    assert!(core.command_on(Command::Play, Some("nope")).is_err());
+    // "main" is the main timeline by name.
+    core.command_on(Command::Play, Some("main")).unwrap();
+    assert!(core.transport().playing);
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pause_cue_stops_exactly_on_the_cue() {
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "hold", "at_s": 0.5, "action": "pause" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let status = core.status();
+    assert!(!status.transport.playing, "paused by the cue");
+    assert_eq!(
+        status.show_ns,
+        NANOS_PER_SEC / 2,
+        "on the cue to the nanosecond, not wherever the scheduler happened to look"
+    );
+
+    // Playing on from a pause cue must not trip over the same cue again.
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let status = core.status();
+    assert!(status.transport.playing);
+    assert!(status.show_ns > NANOS_PER_SEC / 2);
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn cues_can_start_a_task_and_jump() {
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [
+            { "id": "go",   "at_s": 0.3, "action": "play", "target": "sting" },
+            { "id": "back", "at_s": 0.6, "action": "jump", "to_s": 0.1 }
+        ],
+        "tasks": [ { "id": "sting" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(550)).await; // main is at ~0.45 s
+    let status = core.status();
+    assert!(
+        status
+            .tasks
+            .get("sting")
+            .is_some_and(|t| t.active && t.playing),
+        "the cue at 0.3 s started the task: {:?}",
+        status.tasks
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await; // ~0.9 s after play
+    let status = core.status();
+    assert!(status.transport.playing);
+    assert!(
+        status.show_ns < 600_000_000,
+        "jumped back at 0.6 s; now at {} ns",
+        status.show_ns
+    );
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_runner_action_reaches_the_runner_it_names() {
+    let director = start().await;
+    let url = lc_net::control_url(director.control_addr());
+    let runner = |name: &str| Hello {
+        role: Role::Runner,
+        name: name.into(),
+        runner: Some(RunnerHello::default()),
+        ..hello(PROTOCOL_VERSION)
+    };
+    let (mut left, _) = Connection::connect(&url, || runner("left")).await.unwrap();
+    let left_id = director.core().status().nodes[0].node_id.clone();
+
+    let reload = |runner: &str| Command::RunnerAction {
+        runner: runner.into(),
+        action: lc_proto::RunnerAction::ReloadOutputs,
+    };
+    assert!(director.core().command(reload("nobody")).is_err());
+    director.core().command(reload("left")).unwrap();
+    loop {
+        match left.recv_timeout(Duration::from_secs(3)).await.unwrap() {
+            ServerMessage::RunnerAction { node_id, action } => {
+                assert_eq!(node_id, left_id);
+                assert_eq!(action, lc_proto::RunnerAction::ReloadOutputs);
+                break;
+            }
+            _ => continue,
+        }
+    }
     director.shutdown().await;
 }

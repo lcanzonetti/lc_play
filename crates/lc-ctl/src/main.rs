@@ -7,6 +7,9 @@
 //! lc-ctl seek 12.5                jump to 12.5 s
 //! lc-ctl rate 0.5                 half speed
 //! lc-ctl loop 30 | loop off       loop the first 30 s / stop looping
+//! lc-ctl stop                     pause and rewind
+//! lc-ctl --timeline intro play    start the auxiliary timeline "intro"
+//! lc-ctl reload runner            make a Runner rebuild its outputs
 //! lc-ctl load show.json           distribute a show document
 //! lc-ctl watch                    live status, once a second
 //! ```
@@ -35,6 +38,10 @@ struct Args {
     /// Director control address (`host:port`). Default: discover it.
     #[arg(long, global = true)]
     director: Option<String>,
+    /// Auxiliary timeline (task id) the transport command is for. Default:
+    /// the main timeline.
+    #[arg(long, global = true)]
+    timeline: Option<String>,
     #[command(subcommand)]
     action: Action,
 }
@@ -57,6 +64,12 @@ enum Action {
     Watch,
     Play,
     Pause,
+    /// Main timeline: pause and rewind. A task: take it off stage.
+    Stop,
+    /// Ask a Runner (by name) to close and rebuild its outputs.
+    Reload {
+        runner: String,
+    },
     /// Jump to a show time in seconds.
     Seek {
         seconds: f64,
@@ -116,6 +129,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Action::Play => Command::Play,
         Action::Pause => Command::Pause,
+        Action::Stop => Command::Stop,
+        Action::Reload { runner } => Command::RunnerAction {
+            runner,
+            action: lc_proto::RunnerAction::ReloadOutputs,
+        },
         Action::Seek { seconds } => {
             if !(seconds.is_finite() && seconds >= 0.0) {
                 bail!("seek: the time must be zero or positive");
@@ -157,9 +175,16 @@ async fn main() -> anyhow::Result<()> {
     // Send the command, then ask for the status: the Director processes
     // messages of one connection in order, so the status reflects the command
     // (and an Error, if the command was refused, arrives before it).
-    let scheduled = !matches!(command, Command::LoadShow { .. });
+    let scheduled = !matches!(
+        command,
+        Command::LoadShow { .. } | Command::RunnerAction { .. }
+    );
     let (mut conn, welcome) = connect(args.director.as_deref()).await?;
-    conn.send(&ClientMessage::Command { command }).await?;
+    conn.send(&ClientMessage::Command {
+        command,
+        timeline: args.timeline,
+    })
+    .await?;
     let status = request_status(&mut conn).await?;
     if scheduled {
         // The status below is read immediately, i.e. *before* the change
@@ -211,6 +236,7 @@ async fn connect(director: Option<&str>) -> anyhow::Result<(Connection, lc_proto
 async fn request_status(conn: &mut Connection) -> anyhow::Result<ClusterStatus> {
     conn.send(&ClientMessage::Command {
         command: Command::Status,
+        timeline: None,
     })
     .await?;
     loop {
@@ -268,6 +294,18 @@ fn print_status(s: &ClusterStatus) {
         s.frame_rate.den,
         s.clock_id
     );
+    for (id, t) in &s.tasks {
+        println!(
+            "task       {id:<14} {}  {:.3} s  epoch {}",
+            match (t.active, t.playing) {
+                (false, _) => "stopped",
+                (true, true) => "PLAYING",
+                (true, false) => "paused ",
+            },
+            t.show_time_at(s.cluster_ns) as f64 / NANOS_PER_SEC as f64,
+            t.epoch,
+        );
+    }
     println!("nodes      {}", s.nodes.len());
     for n in &s.nodes {
         print!(

@@ -38,7 +38,70 @@ pub struct ShowDocument {
     /// "loop the show" wraps at).
     pub duration_s: f64,
     pub tracks: Vec<Track>,
+    /// Control cues of the main timeline.
+    pub control_cues: Vec<ControlCue>,
+    /// Auxiliary timelines ("tasks"): independent timelines with their own
+    /// transport, started and stopped separately from the main one — by the
+    /// operator, by show control, or by a control cue. They render in front
+    /// of the main timeline.
+    pub tasks: Vec<Timeline>,
 }
+
+/// An auxiliary timeline. (The main timeline is the show's own `tracks`,
+/// `duration_s` and `control_cues`.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Timeline {
+    pub id: String,
+    pub name: String,
+    pub duration_s: f64,
+    pub tracks: Vec<Track>,
+    pub control_cues: Vec<ControlCue>,
+}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Timeline {
+            id: String::new(),
+            name: String::new(),
+            duration_s: 30.0,
+            tracks: Vec::new(),
+            control_cues: Vec::new(),
+        }
+    }
+}
+
+/// What a control cue does when its timeline's playhead reaches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ControlAction {
+    #[default]
+    Pause,
+    Play,
+    Stop,
+    /// Move the target timeline to `to_s`.
+    Jump,
+}
+
+/// A point on a timeline that acts on a transport: "pause here", "start
+/// that task", "jump back to 10 s".
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlCue {
+    pub id: String,
+    pub name: String,
+    /// Timeline time at which it fires.
+    pub at_s: f64,
+    pub action: ControlAction,
+    /// The timeline acted on: empty = the timeline this cue is on, `"main"`
+    /// = the main timeline, otherwise an auxiliary timeline's id.
+    pub target: String,
+    /// `Jump`: where to.
+    pub to_s: f64,
+}
+
+/// Name by which a control cue refers to the main timeline.
+pub const MAIN_TIMELINE: &str = "main";
 
 impl Default for ShowDocument {
     fn default() -> Self {
@@ -48,6 +111,8 @@ impl Default for ShowDocument {
             assets: Vec::new(),
             duration_s: 60.0,
             tracks: Vec::new(),
+            control_cues: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 }
@@ -174,6 +239,15 @@ pub struct Track {
     pub id: String,
     pub name: String,
     pub cues: Vec<Cue>,
+    /// Free-running: video on this track loops on the cluster clock instead
+    /// of following the timeline's position. It keeps moving while the
+    /// timeline is paused and is unaffected by seeking — for backgrounds and
+    /// ambient loops. The cues still decide *when* it is visible.
+    ///
+    /// The loop's phase is tied to cluster time, not to the moment the cue
+    /// appeared: every Runner shows the same frame, but the clip does not
+    /// necessarily start from its first frame.
+    pub free_run: bool,
 }
 
 /// What a cue shows.
@@ -343,43 +417,86 @@ impl ShowDocument {
             }
         }
 
-        for track in &self.tracks {
-            for c in &track.cues {
-                let name = format!("cue '{}'", if c.name.is_empty() { &c.id } else { &c.name });
-                finite(
-                    &name,
-                    &[
-                        c.start_s,
-                        c.duration_s,
-                        c.in_s,
-                        c.fade_in_s,
-                        c.fade_out_s,
-                        c.x as f64,
-                        c.y as f64,
-                        c.w as f64,
-                        c.h as f64,
-                        c.rotation as f64,
-                        c.opacity as f64,
-                    ],
-                )?;
-                if c.duration_s <= 0.0 {
-                    return Err(format!("{name}: duration must be positive"));
-                }
-                if c.start_s < 0.0 || c.in_s < 0.0 || c.fade_in_s < 0.0 || c.fade_out_s < 0.0 {
+        // Every timeline: the main one and each task.
+        let main = (
+            MAIN_TIMELINE,
+            self.duration_s,
+            &self.tracks,
+            &self.control_cues,
+        );
+        let tasks = self
+            .tasks
+            .iter()
+            .map(|t| (t.id.as_str(), t.duration_s, &t.tracks, &t.control_cues));
+        let mut seen = std::collections::HashSet::new();
+        for task in &self.tasks {
+            if task.id.is_empty() || task.id == MAIN_TIMELINE {
+                return Err(format!(
+                    "task '{}': needs an id other than '' or 'main'",
+                    task.name
+                ));
+            }
+            if !seen.insert(task.id.as_str()) {
+                return Err(format!("task '{}': duplicate id '{}'", task.name, task.id));
+            }
+        }
+        for (timeline_id, duration_s, tracks, control_cues) in std::iter::once(main).chain(tasks) {
+            if !(duration_s.is_finite() && duration_s > 0.0) {
+                return Err(format!(
+                    "timeline '{timeline_id}': duration must be positive"
+                ));
+            }
+            for cc in control_cues {
+                let name = format!("control cue at {} s on '{timeline_id}'", cc.at_s);
+                finite(&name, &[cc.at_s, cc.to_s])?;
+                if cc.at_s < 0.0 || cc.to_s < 0.0 {
                     return Err(format!("{name}: times must not be negative"));
                 }
-                if !(c.w > 0.0 && c.h > 0.0) {
-                    return Err(format!("{name}: width and height must be positive"));
+                let known = cc.target.is_empty()
+                    || cc.target == MAIN_TIMELINE
+                    || self.tasks.iter().any(|t| t.id == cc.target);
+                if !known {
+                    return Err(format!("{name}: targets unknown timeline '{}'", cc.target));
                 }
-                match &c.source {
-                    CueSource::Asset { asset } => {
-                        if self.asset(asset).is_none() {
-                            return Err(format!(
-                                "{name}: refers to asset '{asset}', which is not in the show"
-                            ));
-                        }
+            }
+            for track in tracks {
+                for c in &track.cues {
+                    let name = format!("cue '{}'", if c.name.is_empty() { &c.id } else { &c.name });
+                    finite(
+                        &name,
+                        &[
+                            c.start_s,
+                            c.duration_s,
+                            c.in_s,
+                            c.fade_in_s,
+                            c.fade_out_s,
+                            c.x as f64,
+                            c.y as f64,
+                            c.w as f64,
+                            c.h as f64,
+                            c.rotation as f64,
+                            c.opacity as f64,
+                        ],
+                    )?;
+                    if c.duration_s <= 0.0 {
+                        return Err(format!("{name}: duration must be positive"));
                     }
-                    CueSource::Color { rgba } => finite(&name, &rgba.map(f64::from))?,
+                    if c.start_s < 0.0 || c.in_s < 0.0 || c.fade_in_s < 0.0 || c.fade_out_s < 0.0 {
+                        return Err(format!("{name}: times must not be negative"));
+                    }
+                    if !(c.w > 0.0 && c.h > 0.0) {
+                        return Err(format!("{name}: width and height must be positive"));
+                    }
+                    match &c.source {
+                        CueSource::Asset { asset } => {
+                            if self.asset(asset).is_none() {
+                                return Err(format!(
+                                    "{name}: refers to asset '{asset}', which is not in the show"
+                                ));
+                            }
+                        }
+                        CueSource::Color { rgba } => finite(&name, &rgba.map(f64::from))?,
+                    }
                 }
             }
         }

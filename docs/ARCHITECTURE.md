@@ -242,7 +242,8 @@ crates/
   lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
                 renderer (app, render, content, video, show)
   lc-assets     media HTTP server (library, Range streaming, upload, thumbnails)
-  lc-producer   serves the web interface (ui/: index.html, app.js, style.css)
+  lc-producer   the operator's application: serves the interface (ui/) and shows
+                it in a native window (system web view)
   lc-ctl        command-line controller, reference protocol client
   lc-play       launcher: all of the above on one machine
 docs/           this file, PROTOCOL.md
@@ -274,11 +275,42 @@ show (it is small) and renders the Displays assigned to it — simpler than
 per-Runner subsets, and any Runner can take over any Display.
 
 The document is defined in `lc-proto/src/show.rs` (wire form in
-[PROTOCOL.md](PROTOCOL.md) §5). `Timeline[]` and `ControlMap[]` above are the
-target shape; today a show has **one** timeline (`tracks` at the top level),
-cues have a static placement plus fades (no keyframes), there are no control
-cues, and external control is the fixed OSC address list rather than a
-per-show map.
+[PROTOCOL.md](PROTOCOL.md) §5). The diagram above is the target shape; today:
+
+* the main timeline is the document's own `tracks` / `control_cues`, and the
+  auxiliary timelines ("tasks") are in `tasks` — each with its own transport;
+* cues have a static placement plus fades (no keyframes);
+* control cues are pause / play / stop / jump, on their own or another
+  timeline;
+* external control is the fixed OSC address list rather than a per-show map.
+
+### Several timelines
+
+Each timeline has its own `TransportState`; everything in section 3 applies
+to each independently, on the one shared cluster clock. A task is *inactive*
+(off stage) until played and after being stopped; the Runner evaluates each
+layer against the transport of the timeline it belongs to and draws tasks in
+front of the main timeline.
+
+### Control cues
+
+The Director, not the Runners, executes control cues. A scheduler looks
+300 ms ahead on every playing timeline; a cue inside that window becomes a
+transport change anchored at the exact cluster instant the playhead reaches
+it, published before that instant. So a pause cue stops every output on the
+same frame (verified to the nanosecond in the Director's tests) — but while
+the Director is down, control cues do not fire and Runners play through
+them. Moving their execution into the Runners is possible (they are part of
+the show document) and is the way to remove that dependency.
+
+### Free-running tracks
+
+Video on a free-running track takes its position from cluster time instead
+of from its timeline: `frame = floor(cluster_seconds × fps) mod length`. It
+therefore keeps moving while the timeline is paused or scrubbed and needs no
+state, so every Runner — including one that just started — shows the same
+frame. The price is that the loop's phase is arbitrary: the clip does not
+start from its first frame when the cue appears.
 
 ### From document to pixels
 
@@ -345,7 +377,8 @@ Still to do, roughly in order of how much they limit real use:
 |---|---|
 | Playback performance | GPU-friendly decode (HAP, or hardware H.264/HEVC) instead of raw frames over a pipe; vblank-predicted sampling; audio. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
-| Authoring | Keyframes/tweens; control cues (pause, jump); multiple timelines; a warp editor; live video preview in the Producer; snapping. |
+| Authoring | Keyframes/tweens; a warp editor; snapping; free-running media that starts on its first frame; control cues executed by Runners (so they work without the Director). |
+| Packaging | An installer; a launcher without a console window; the Producer preview is the web view's own video playback, not frame-exact. |
 | External control | MIDI/MTC, Art-Net, LTC chase; per-show control mapping. |
 | Outputs | Freeform mesh warp; SDI and NDI outputs (NDI needs the proprietary NDI SDK and its licence); framelock integration. |
 | Resilience | Standby Director; arbitration between two Directors. |

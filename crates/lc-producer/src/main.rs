@@ -1,9 +1,16 @@
-//! `lc-producer` — serves the operator's interface.
+//! `lc-producer` — the operator's application.
 //!
-//! The Producer is a web application: open it in a browser on the operator's
-//! machine (or any machine on the show network). This binary only *serves*
-//! it — three static files embedded at build time, plus one small JSON
-//! document telling the page where the Director and the Asset Manager are.
+//! ```text
+//! lc-producer             open the Producer in its own window
+//! lc-producer --browser   only serve it; open http://<host>:7404 in a browser
+//! ```
+//!
+//! The interface itself is a web page (three files embedded at build time).
+//! This binary serves it over HTTP and — unless `--browser` is given — shows
+//! it in a native window of its own, using the operating system's web view
+//! (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux). The same
+//! page therefore works both as a stand-alone application and, for a second
+//! operator or a tablet, in any browser on the show network.
 //!
 //! All the work happens in the browser, which talks to the other services
 //! directly:
@@ -16,6 +23,8 @@
 //! That keeps this service stateless (the show lives in the Director) and
 //! means the Producer speaks exactly the protocol documented in
 //! `docs/PROTOCOL.md` — it has no private back door.
+
+mod window;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -42,6 +51,9 @@ struct Args {
     /// Default: port 7401 on the host the page was loaded from.
     #[arg(long)]
     director: Option<String>,
+    /// Do not open a window: only serve the interface, for use in a browser.
+    #[arg(long)]
+    browser: bool,
     /// Asset Manager base URL as browsers *and Runners* must reach it, e.g.
     /// `http://10.0.0.1:7403`. Default: port 7403 on the host the page was
     /// loaded from — fine on one machine; on a network, give the address
@@ -61,15 +73,40 @@ struct UiConfig {
     protocol: u32,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let args = Args::parse();
+    let browser_only = args.browser;
+    let port = args.port;
 
+    // The HTTP server runs on its own thread: on most platforms the window
+    // system insists on owning the main thread.
+    let runtime = tokio::runtime::Runtime::new()?;
+    let listener = runtime.block_on(tokio::net::TcpListener::bind(SocketAddr::new(
+        args.bind, args.port,
+    )))?;
+    tracing::info!("producer interface on http://{}", listener.local_addr()?);
+    let server = runtime.spawn(serve(listener, args));
+
+    if browser_only {
+        // Serve until Ctrl-C.
+        runtime.block_on(async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = server => {}
+            }
+        });
+        return Ok(());
+    }
+    window::run(&format!("http://127.0.0.1:{port}/"))
+}
+
+/// Serve the interface on `listener` forever.
+async fn serve(listener: tokio::net::TcpListener, args: Args) {
     let config = UiConfig {
         director: args.director,
         director_port: lc_proto::DEFAULT_CONTROL_PORT,
@@ -77,7 +114,6 @@ async fn main() -> anyhow::Result<()> {
         assets_port: 7403,
         protocol: lc_proto::PROTOCOL_VERSION,
     };
-
     let app = Router::new()
         .route(
             "/",
@@ -92,16 +128,9 @@ async fn main() -> anyhow::Result<()> {
             get(|| async { asset("text/css; charset=utf-8", STYLE_CSS) }),
         )
         .route("/config.json", get(move || async move { Json(config) }));
-
-    let addr = SocketAddr::new(args.bind, args.port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("producer interface on http://{}", listener.local_addr()?);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    Ok(())
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("producer server stopped: {e}");
+    }
 }
 
 /// A static file. `no-cache` so a rebuilt binary is picked up on reload

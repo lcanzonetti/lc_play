@@ -8,26 +8,29 @@
 </head>
 <body>
 <!--
-  Layout (CSS grid, see style.css):
+  A fixed top bar (main transport, cluster state, file and window menus) over
+  a "desktop" of floating windows. Every window has the same skeleton:
 
-    ┌──────────────── top bar: transport · time · cluster ────────────────┐
-    │ assets │              stage                         │   inspector   │
-    ├────────┴────────────────────────────────────────────┴───────────────┤
-    │                            timeline                                 │
-    └─────────────────────────────────────────────────────────────────────┘
+    <section class="win" id="win-NAME">
+      <header class="win-head"> title … close </header>   ← drag to move
+      <div class="win-body"> … </div>
+      <div class="win-grip"></div>                         ← drag to resize
+    </section>
 
-  All behaviour is in app.js; this file is only the skeleton it fills.
+  Position, size and visibility of each are remembered per browser (see the
+  window manager in app.js). All behaviour is in app.js; this file is only
+  the skeleton it fills.
 -->
 <header id="topbar">
   <div class="brand">LC&nbsp;Play</div>
   <div class="group">
-    <button id="btn-stop" title="Stop: pause and return to the start">⏮</button>
-    <button id="btn-play" class="primary" title="Play / pause (Space)">▶</button>
-    <div id="time" title="Show time">00:00:00.00</div>
+    <button id="btn-stop" title="Stop: pause the main timeline and return to the start">⏹</button>
+    <button id="btn-play" class="primary" title="Play / pause the main timeline (Space)">▶</button>
+    <div id="time" title="Main timeline">00:00:00.00</div>
     <div id="frame" class="dim"></div>
   </div>
   <div class="group">
-    <label title="Loop the whole timeline"><input type="checkbox" id="chk-loop"> loop</label>
+    <label title="Loop the main timeline"><input type="checkbox" id="chk-loop"> loop</label>
     <label>rate
       <select id="sel-rate">
         <option value="250">0.25×</option><option value="500">0.5×</option>
@@ -43,44 +46,86 @@
     <button id="btn-open">Open…</button>
     <button id="btn-save">Save…</button>
     <input type="file" id="file-open" accept=".json,application/json" hidden>
+    <details id="win-menu">
+      <summary>Windows</summary>
+      <div id="win-menu-list"></div>
+    </details>
   </div>
 </header>
 
-<aside id="assets">
-  <div class="panel-head">
-    <span>Assets</span>
-    <button id="btn-upload">Upload…</button>
-    <input type="file" id="file-upload" multiple hidden>
-  </div>
-  <div id="asset-list" class="scroll"></div>
-  <div class="panel-foot">
-    <button id="btn-color">+ Colour cue</button>
-    <span class="dim">Drag onto a track, or double-click to add at the playhead.</span>
-  </div>
-</aside>
+<div id="desktop">
 
-<main id="stage-wrap">
-  <canvas id="stage"></canvas>
-</main>
+  <section class="win" id="win-stage" data-title="Stage">
+    <header class="win-head"><span class="win-title">Stage</span><button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body" id="stage-wrap"><canvas id="stage"></canvas></div>
+    <div class="win-grip"></div>
+  </section>
 
-<aside id="inspector" class="scroll"></aside>
-
-<section id="timeline">
-  <div class="panel-head">
-    <span>Timeline</span>
-    <button id="btn-track">+ Track</button>
-    <label class="dim">zoom <input type="range" id="zoom" min="4" max="200" value="40"></label>
-  </div>
-  <div id="tl-scroll" class="scroll">
-    <div id="tl-body">
-      <div id="ruler"></div>
-      <div id="tracks"></div>
-      <div id="playhead"></div>
+  <section class="win" id="win-assets" data-title="Assets">
+    <header class="win-head"><span class="win-title">Assets</span>
+      <button id="btn-upload">Upload…</button>
+      <input type="file" id="file-upload" multiple hidden>
+      <button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body col">
+      <div id="asset-list" class="scroll grow"></div>
+      <div class="foot">
+        <button id="btn-color">+ Colour cue</button>
+        <span class="dim">Drag onto a track, or double-click to add at the playhead of the open timeline.</span>
+      </div>
     </div>
-  </div>
-</section>
+    <div class="win-grip"></div>
+  </section>
+
+  <section class="win" id="win-inspector" data-title="Inspector">
+    <header class="win-head"><span class="win-title">Inspector</span><button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body scroll pad" id="inspector"></div>
+    <div class="win-grip"></div>
+  </section>
+
+  <section class="win" id="win-timeline" data-title="Timeline">
+    <header class="win-head"><span class="win-title">Timeline</span>
+      <div id="tl-tabs"></div>
+      <button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body col">
+      <div class="toolbar">
+        <button id="tl-stop" title="Stop this timeline">⏹</button>
+        <button id="tl-play" title="Play / pause this timeline">▶</button>
+        <span id="tl-time" class="mono">0.00 s</span>
+        <span class="grow"></span>
+        <button id="btn-track">+ Track</button>
+        <button id="btn-control" title="Add a control cue (pause, play, stop, jump) at the playhead">+ Control cue</button>
+        <label class="dim">zoom <input type="range" id="zoom" min="4" max="200" value="40"></label>
+      </div>
+      <div id="tl-scroll" class="scroll grow">
+        <div id="tl-body">
+          <div id="ruler"></div>
+          <div id="cuerow" class="track"><div class="track-head"><span class="name dim">Control cues</span></div><div class="lane" id="cuelane"></div></div>
+          <div id="tracks"></div>
+          <div id="playhead"></div>
+        </div>
+      </div>
+    </div>
+    <div class="win-grip"></div>
+  </section>
+
+  <section class="win" id="win-tasks" data-title="Tasks">
+    <header class="win-head"><span class="win-title">Tasks</span>
+      <button id="btn-task">+ Task</button>
+      <button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body scroll pad" id="tasks"></div>
+    <div class="win-grip"></div>
+  </section>
+
+  <section class="win" id="win-runners" data-title="Runners">
+    <header class="win-head"><span class="win-title">Runners</span><button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body scroll pad" id="runners"></div>
+    <div class="win-grip"></div>
+  </section>
+
+</div>
 
 <div id="toast" hidden></div>
+<div id="modal" hidden><div class="box"><p id="modal-text"></p><div class="btns"><button id="modal-no">Cancel</button><button id="modal-yes" class="primary">OK</button></div></div></div>
 <script src="app.js"></script>
 </body>
 </html>

@@ -34,8 +34,8 @@ pub mod transport;
 
 pub use beacon::{Beacon, DISCOVERY_GROUP, DISCOVERY_PORT};
 pub use message::{
-    ClientMessage, ClusterStatus, Command, Health, Hello, NodeStatus, RunnerHello, ServerMessage,
-    SyncQuality, Welcome,
+    ClientMessage, ClusterStatus, Command, Health, Hello, MonitorInfo, NodeStatus, RunnerAction,
+    RunnerHello, ServerMessage, SyncQuality, Welcome,
 };
 pub use show::ShowDocument;
 pub use transport::{FrameRate, TransportState};
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped on any incompatible change to the messages in this crate. Peers
 /// exchange it in `Hello`/`Welcome` and in beacons, and refuse to pair on a
 /// mismatch rather than misinterpret each other mid-show.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default TCP port of the Director's control channel (WebSocket + HTTP status).
 pub const DEFAULT_CONTROL_PORT: u16 = 7401;

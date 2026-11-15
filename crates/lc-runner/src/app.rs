@@ -82,6 +82,8 @@ pub struct App {
     /// Cluster only: (show id, asset-cache generation) of what is applied.
     applied: Option<(String, u64)>,
     started: bool,
+    /// Reload requests (see `Playhead::request_reload`) acted on so far.
+    reloads_done: u64,
 }
 
 /// Logs the frame rate every few seconds so a show's performance is visible.
@@ -141,7 +143,55 @@ impl App {
             },
             applied: None,
             started: false,
+            reloads_done: 0,
         }
+    }
+
+    /// The operator asked for the outputs to be rebuilt: close every window,
+    /// drop every loaded texture and decoder, and build it all again from
+    /// the current show — what restarting the Runner would do, without
+    /// losing the cluster connection or the clock lock.
+    fn reload_if_requested(&mut self, event_loop: &ActiveEventLoop) {
+        let requested = self.playhead.reload_requests();
+        if requested == self.reloads_done {
+            return;
+        }
+        self.reloads_done = requested;
+        tracing::info!("reloading outputs");
+        self.contents.clear();
+        self.content_keys.clear();
+        self.windows.clear();
+        self.by_id.clear();
+        self.window_outputs.clear();
+        match &self.source {
+            ShowSource::Local(show) => {
+                let show = show.clone();
+                self.apply_show(event_loop, show);
+            }
+            // Forget what was applied: the next look at the Director's show
+            // rebuilds everything.
+            ShowSource::Cluster { .. } => self.applied = None,
+        }
+        self.report_monitors(event_loop);
+    }
+
+    /// Tell the cluster which monitors this machine has (they can change:
+    /// displays get plugged in after start-up).
+    fn report_monitors(&self, event_loop: &ActiveEventLoop) {
+        let monitors = event_loop
+            .available_monitors()
+            .enumerate()
+            .map(|(index, m)| lc_proto::MonitorInfo {
+                index,
+                name: m.name().unwrap_or_else(|| "unnamed".into()),
+                width: m.size().width,
+                height: m.size().height,
+                x: m.position().x,
+                y: m.position().y,
+                scale: m.scale_factor(),
+            })
+            .collect();
+        self.playhead.update_hardware(|h| h.monitors = monitors);
     }
 
     /// Cluster only: if the Director's show (or the set of downloaded
@@ -235,6 +285,7 @@ impl App {
             created.push(Arc::new(event_loop.create_window(attrs)?));
         }
         let Some(first) = created.first() else {
+            self.playhead.update_hardware(|h| h.outputs = 0);
             return Ok(()); // no outputs: nothing to draw on
         };
 
@@ -270,6 +321,11 @@ impl App {
             });
         }
         self.window_outputs = show.outputs.clone();
+        let (gpu_name, outputs) = (gpu.adapter_info(), self.windows.len() as u32);
+        self.playhead.update_hardware(|h| {
+            h.gpu = Some(gpu_name);
+            h.outputs = outputs;
+        });
         tracing::info!(outputs = self.windows.len(), "outputs ready");
         Ok(())
     }
@@ -350,27 +406,58 @@ impl App {
             }
             return;
         }
-        // One sample per frame, shared by every output.
+        // One sample of the cluster clock per frame, shared by every output
+        // and every timeline.
         let position = self.playhead.position();
         let now = position.show_seconds();
+        let cluster_s = position.cluster_ns as f64 / NANOS_PER_SEC as f64;
         let loop_s = position
             .transport
             .loop_ns
             .map(|ns| ns as f64 / NANOS_PER_SEC as f64);
-        for (layer, c) in self.show.layers.iter().zip(&mut self.contents) {
-            // Time until the layer appears, allowing for the show looping
-            // back to a cue at its beginning.
-            let mut until_start = layer.timing.start - now;
-            if let (true, Some(len)) = (until_start < 0.0, loop_s) {
+
+        // Each layer's time is that of the timeline it belongs to: the main
+        // timeline's, or its task's — `None` while that task is off stage.
+        let mut task_times: HashMap<&str, Option<f64>> = HashMap::new();
+        let times: Vec<Option<f64>> = self
+            .show
+            .layers
+            .iter()
+            .map(|layer| match layer.timeline.as_deref() {
+                None => Some(now),
+                Some(id) => *task_times
+                    .entry(id)
+                    .or_insert_with(|| self.playhead.task_seconds(id, position.cluster_ns)),
+            })
+            .collect();
+
+        for ((layer, c), time) in self.show.layers.iter().zip(&mut self.contents).zip(&times) {
+            let Some(t) = *time else {
+                c.idle(); // its timeline is off stage
+                continue;
+            };
+            // What the content is asked for: timeline time — or, for a
+            // free-running layer, cluster time (see `Timing::free_run`).
+            let media = |timeline_t: f64| {
+                if layer.timing.free_run {
+                    cluster_s
+                } else {
+                    timeline_t
+                }
+            };
+            // Time until the layer appears, allowing for the main timeline
+            // looping back to a cue at its beginning.
+            let mut until_start = layer.timing.start - t;
+            if let (true, Some(len), None) = (until_start < 0.0, loop_s, &layer.timeline) {
                 until_start += len;
             }
-            if layer.timing.visible_at(now) {
-                c.update(now, &gpu.queue);
+            if layer.timing.visible_at(t) {
+                c.update(media(t), &gpu.queue);
             } else if (0.0..=PREROLL_S).contains(&until_start) {
                 // About to appear: get its first frame decoded and into the
                 // texture now, so the cue starts on its first frame instead
                 // of on whatever the decoder manages a moment later.
-                c.update(layer.timing.start, &gpu.queue);
+                c.update(media(layer.timing.start), &gpu.queue);
             } else {
                 // Off screen: an invisible video cue must not keep a decoder
                 // (an ffmpeg process and several frames of memory) around.
@@ -383,7 +470,13 @@ impl App {
             .iter()
             .map(|rw| (&rw.gpu, &self.show.outputs[rw.output_idx]))
             .collect();
-        let frame = gpu.draw(&targets, &self.show, now, &self.contents, &self.draw_order);
+        let frame = gpu.draw(
+            &targets,
+            &self.show,
+            &times,
+            &self.contents,
+            &self.draw_order,
+        );
         for rw in &self.windows {
             rw.window.pre_present_notify();
         }
@@ -471,6 +564,7 @@ impl ApplicationHandler for App {
             );
         }
 
+        self.report_monitors(event_loop);
         match &self.source {
             ShowSource::Local(show) => {
                 let show = show.clone();
@@ -525,6 +619,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.reload_if_requested(event_loop);
         self.follow_cluster_show(event_loop);
 
         if self.windows.is_empty() {

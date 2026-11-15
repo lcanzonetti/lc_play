@@ -74,8 +74,19 @@ async fn status(State(app): State<AppState>) -> Json<ClusterStatus> {
     Json(app.core.status())
 }
 
-async fn command(State(app): State<AppState>, Json(command): Json<Command>) -> impl IntoResponse {
-    match app.core.command(command) {
+#[derive(serde::Deserialize)]
+struct CommandQuery {
+    /// Target timeline (`?timeline=<task id>`); absent = the main timeline.
+    #[serde(default)]
+    timeline: Option<String>,
+}
+
+async fn command(
+    State(app): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CommandQuery>,
+    Json(command): Json<Command>,
+) -> impl IntoResponse {
+    match app.core.command_on(command, query.timeline.as_deref()) {
         Ok(()) => (StatusCode::OK, Json(app.core.status())).into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
@@ -202,11 +213,14 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                     // Transport is state, not history: the current one is
                     // all it needs to be correct again.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let msg = ServerMessage::Transport {
-                            clock_id: core.clock.clock_id(),
-                            state: core.transport(),
-                        };
-                        send(&mut socket, &msg).await?;
+                        for (timeline, state) in core.transports() {
+                            let msg = ServerMessage::Transport {
+                                clock_id: core.clock.clock_id(),
+                                state,
+                                timeline,
+                            };
+                            send(&mut socket, &msg).await?;
+                        }
                         // The same goes for the show: one of the dropped
                         // messages may have been a new revision. Re-sending
                         // is rare (only after a lag) and idempotent.
@@ -238,9 +252,9 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                         Ok(Some(ClientMessage::Hello(_))) => {
                             send(&mut socket, &error("hello was already sent")).await?
                         }
-                        Ok(Some(ClientMessage::Command { command })) => {
+                        Ok(Some(ClientMessage::Command { command, timeline })) => {
                             let wants_reply = matches!(command, Command::Status);
-                            match core.command(command) {
+                            match core.command_on(command, timeline.as_deref()) {
                                 Ok(()) if wants_reply => {
                                     send(&mut socket, &ServerMessage::Cluster(core.status())).await?
                                 }

@@ -163,6 +163,11 @@ pub struct Layer {
     pub transform: Transform,
     #[serde(default)]
     pub timing: Timing,
+    /// The auxiliary timeline this layer belongs to; `None` = the main
+    /// timeline. Its `timing` is in that timeline's time, and it is drawn
+    /// only while that timeline is on stage.
+    #[serde(default)]
+    pub timeline: Option<String>,
 }
 
 /// Content source for a layer. Tagged by `"type"` in JSON.
@@ -243,6 +248,11 @@ pub struct Timing {
     /// Video: start over from `media_in` when the file ends.
     #[serde(default)]
     pub media_loop: bool,
+    /// Video: loop on the cluster clock instead of following the timeline
+    /// (see `lc_proto::show::Track::free_run`). `start`/`end` still decide
+    /// when the layer is visible.
+    #[serde(default)]
+    pub free_run: bool,
 }
 
 impl Timing {

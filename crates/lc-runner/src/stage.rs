@@ -70,58 +70,76 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
         })
         .collect();
 
-    let track_count = doc.tracks.len();
+    // Every timeline contributes layers: the main one, then each task. A
+    // task's layers carry its id, so the renderer evaluates them against
+    // that task's own transport (and skips them while it is off stage).
+    // Stacking: tasks in front of the main timeline, the first task
+    // front-most; within a timeline, the first track in front.
+    let main = (None, &doc.tracks, 0.0f32);
+    let task_count = doc.tasks.len();
+    let tasks = doc.tasks.iter().enumerate().map(|(k, task)| {
+        (
+            Some(task.id.clone()),
+            &task.tracks,
+            1000.0 * (task_count - k) as f32,
+        )
+    });
     let mut layers = Vec::new();
-    for (ti, track) in doc.tracks.iter().enumerate() {
-        for (ci, cue) in track.cues.iter().enumerate() {
-            let source = match &cue.source {
-                CueSource::Color { rgba } => Source::Color { rgba: *rgba },
-                CueSource::Asset { asset } => match doc.asset(asset) {
-                    None => Source::Missing {
-                        reason: format!("asset '{asset}' is not in the show"),
-                    },
-                    Some(a) => match assets.local_path(a) {
+    for (timeline, tracks, z_base) in std::iter::once(main).chain(tasks) {
+        let track_count = tracks.len();
+        for (ti, track) in tracks.iter().enumerate() {
+            for (ci, cue) in track.cues.iter().enumerate() {
+                let source = match &cue.source {
+                    CueSource::Color { rgba } => Source::Color { rgba: *rgba },
+                    CueSource::Asset { asset } => match doc.asset(asset) {
                         None => Source::Missing {
-                            reason: format!("asset '{}' is still downloading", a.name),
+                            reason: format!("asset '{asset}' is not in the show"),
                         },
-                        Some(path) => {
-                            let path = path.to_string_lossy().into_owned();
-                            match a.kind {
-                                AssetKind::Image => Source::Image { path },
-                                AssetKind::Video => Source::Video { path },
+                        Some(a) => match assets.local_path(a) {
+                            None => Source::Missing {
+                                reason: format!("asset '{}' is still downloading", a.name),
+                            },
+                            Some(path) => {
+                                let path = path.to_string_lossy().into_owned();
+                                match a.kind {
+                                    AssetKind::Image => Source::Image { path },
+                                    AssetKind::Video => Source::Video { path },
+                                }
                             }
-                        }
+                        },
                     },
-                },
-            };
-            layers.push(Layer {
-                id: if cue.id.is_empty() {
-                    format!("t{ti}c{ci}")
-                } else {
-                    cue.id.clone()
-                },
-                source,
-                transform: Transform {
-                    // The renderer positions a layer by its anchor (centre).
-                    position: [cue.x + cue.w / 2.0, cue.y + cue.h / 2.0],
-                    size: [cue.w, cue.h],
-                    anchor: [0.5, 0.5],
-                    scale: [1.0, 1.0],
-                    rotation: cue.rotation,
-                    opacity: cue.opacity.clamp(0.0, 1.0),
-                    // First track in front; within a track, later cues above
-                    // earlier ones (they normally do not overlap in time).
-                    z: (track_count - ti) as f32 + ci as f32 * 1e-4,
-                },
-                timing: Timing {
-                    start: cue.start_s,
-                    end: Some(cue.start_s + cue.duration_s),
-                    fade_in: cue.fade_in_s,
-                    fade_out: cue.fade_out_s,
-                    media_in: cue.in_s,
-                    media_loop: cue.looping,
-                },
-            });
+                };
+                layers.push(Layer {
+                    id: if cue.id.is_empty() {
+                        format!("{}t{ti}c{ci}", timeline.as_deref().unwrap_or(""))
+                    } else {
+                        cue.id.clone()
+                    },
+                    source,
+                    transform: Transform {
+                        // The renderer positions a layer by its anchor (centre).
+                        position: [cue.x + cue.w / 2.0, cue.y + cue.h / 2.0],
+                        size: [cue.w, cue.h],
+                        anchor: [0.5, 0.5],
+                        scale: [1.0, 1.0],
+                        rotation: cue.rotation,
+                        opacity: cue.opacity.clamp(0.0, 1.0),
+                        // Within a track, later cues above earlier ones (they
+                        // normally do not overlap in time).
+                        z: z_base + (track_count - ti) as f32 + ci as f32 * 1e-4,
+                    },
+                    timing: Timing {
+                        start: cue.start_s,
+                        end: Some(cue.start_s + cue.duration_s),
+                        fade_in: cue.fade_in_s,
+                        fade_out: cue.fade_out_s,
+                        media_in: cue.in_s,
+                        media_loop: cue.looping,
+                        free_run: track.free_run,
+                    },
+                    timeline: timeline.clone(),
+                });
+            }
         }
     }
 
@@ -189,6 +207,23 @@ mod tests {
             front.transform.z > show.layers[1].transform.z,
             "first track is in front"
         );
+    }
+
+    #[test]
+    fn task_layers_carry_their_timeline_and_sit_in_front() {
+        let mut d = doc();
+        d.tasks = serde_json::from_value(serde_json::json!([
+            { "id": "sting", "tracks": [ { "free_run": true, "cues": [
+                { "id": "overlay", "source": { "type": "color", "rgba": [0,1,0,1] } } ] } ] }
+        ]))
+        .unwrap();
+        let show = build(&d, "left", &cache());
+        let overlay = show.layers.iter().find(|l| l.id == "overlay").unwrap();
+        assert_eq!(overlay.timeline.as_deref(), Some("sting"));
+        assert!(overlay.timing.free_run);
+        let front_of_main = show.layers.iter().find(|l| l.id == "front").unwrap();
+        assert_eq!(front_of_main.timeline, None);
+        assert!(overlay.transform.z > front_of_main.transform.z);
     }
 
     #[test]

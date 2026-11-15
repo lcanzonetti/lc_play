@@ -29,6 +29,9 @@ pub struct Persisted {
     /// adopted after a restart.
     pub clock_id: ClockId,
     pub transport: TransportState,
+    /// Transport states of the auxiliary timelines, by timeline id.
+    #[serde(default)]
+    pub tasks: std::collections::BTreeMap<String, TransportState>,
     #[serde(default)]
     pub show: Option<ShowDoc>,
 }

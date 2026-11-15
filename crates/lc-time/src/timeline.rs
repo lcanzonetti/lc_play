@@ -81,6 +81,12 @@ pub enum TransportChange {
     SeekBy(i64),
     SetRate(i32),
     SetLoop(Option<i64>),
+    /// Stop: pause at zero. With `deactivate` the timeline also goes off
+    /// stage (an auxiliary timeline); without, it stays visible at its
+    /// first frame (the main timeline).
+    Stop {
+        deactivate: bool,
+    },
 }
 
 /// Derive the state that follows `base` when `change` takes effect at
@@ -102,7 +108,15 @@ pub fn next_state(
         ..*base
     };
     match change {
-        TransportChange::Play => next.playing = true,
+        TransportChange::Play => {
+            next.playing = true;
+            next.active = true; // playing a stopped task brings it on stage
+        }
+        TransportChange::Stop { deactivate } => {
+            next.playing = false;
+            next.anchor_show_ns = 0;
+            next.active = !deactivate;
+        }
         TransportChange::Pause => next.playing = false,
         TransportChange::Seek(show_ns) => next.anchor_show_ns = show_ns.max(0),
         TransportChange::SeekBy(delta) => {
@@ -167,6 +181,20 @@ mod tests {
 
         let back = next_state(&slow, TransportChange::SeekBy(-1000 * S), 9 * S);
         assert_eq!(back.anchor_show_ns, 0, "relative seek clamps at zero");
+    }
+
+    #[test]
+    fn stop_rewinds_and_optionally_leaves_the_stage() {
+        let playing = next_state(&TransportState::INACTIVE, TransportChange::Play, 0);
+        assert!(playing.active && playing.playing, "play activates a task");
+
+        let stopped = next_state(&playing, TransportChange::Stop { deactivate: true }, 5 * S);
+        assert!(!stopped.active && !stopped.playing);
+        assert_eq!(stopped.show_time_at(9 * S), 0);
+
+        let main = next_state(&playing, TransportChange::Stop { deactivate: false }, 5 * S);
+        assert!(main.active, "the main timeline stays on stage");
+        assert_eq!(main.show_time_at(9 * S), 0);
     }
 
     #[test]

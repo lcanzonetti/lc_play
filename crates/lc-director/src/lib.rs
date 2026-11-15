@@ -38,7 +38,7 @@ pub mod osc;
 pub mod server;
 mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -46,9 +46,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use lc_discovery::DiscoveryConfig;
+use lc_proto::show::{ControlAction, ControlCue, ShowDocument, MAIN_TIMELINE};
 use lc_proto::{
     Beacon, ClockId, ClusterStatus, Command, FrameRate, Health, Hello, NodeId, NodeStatus, Role,
-    RunnerHello, ServerMessage, TransportState, Welcome, PROTOCOL_VERSION,
+    RunnerHello, ServerMessage, TransportState, Welcome, NANOS_PER_SEC, PROTOCOL_VERSION,
 };
 use lc_time::{
     next_state, LocalClock, MasterClock, MonotonicClock, TransportChange, TransportTimeline,
@@ -58,6 +59,39 @@ use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
 
 pub use store::{Persisted, ShowDoc};
+
+/// How far ahead of a control cue the Director schedules it. Must exceed the
+/// scheduler period plus the time a message needs to reach every Runner.
+const CONTROL_LOOKAHEAD_NS: i64 = 300_000_000;
+/// How often the control-cue scheduler runs.
+const CONTROL_PERIOD: Duration = Duration::from_millis(50);
+
+/// Cluster time at which `state` (in force, playing forward, currently at
+/// `position`) reaches `cue` — or `None` if it will not (the cue is behind
+/// the playhead and the timeline does not loop).
+fn cue_fire_time(state: &TransportState, position: i64, cue: &ControlCue, now: i64) -> Option<i64> {
+    let at_show = (cue.at_s * NANOS_PER_SEC as f64).round() as i64;
+    let mut ahead = at_show - position;
+    match state.loop_ns {
+        // Looping: a cue behind the playhead comes round again — unless it
+        // lies beyond the loop length and is never reached.
+        Some(len) if len > 0 => {
+            if at_show >= len {
+                return None;
+            }
+            if ahead <= 0 {
+                ahead += len;
+            }
+        }
+        // A cue exactly at the playhead has just been executed (that is how
+        // a pause cue leaves things); only cues strictly ahead count.
+        _ if ahead <= 0 => return None,
+        _ => {}
+    }
+    // Show time advances at `rate`; convert the distance to cluster time.
+    let cluster = (ahead as i128 * 1000 / state.rate_permille as i128) as i64;
+    Some(now + cluster)
+}
 
 /// Fastest/slowest playback rate accepted (±16×).
 const MAX_RATE_PERMILLE: u32 = 16_000;
@@ -115,8 +149,20 @@ pub struct Core {
 }
 
 struct State {
+    /// Transport of the main timeline.
     timeline: TransportTimeline,
+    /// Transports of the auxiliary timelines ("tasks"), by timeline id. An
+    /// entry appears when a task is first commanded; a task without one is
+    /// inactive.
+    tasks: BTreeMap<String, TransportTimeline>,
     show: Option<ShowDoc>,
+    /// The show, parsed: the timelines and control cues the Director itself
+    /// needs to know about.
+    parsed: Option<Arc<ShowDocument>>,
+    /// Control cues already scheduled: (timeline, cue id) → the cluster time
+    /// they were scheduled for. Keeps a cue from firing on every scheduler
+    /// pass while its moment approaches.
+    fired: HashMap<(String, String), i64>,
     /// Connected nodes by connection id (a node may briefly have two
     /// connections while it reconnects).
     nodes: BTreeMap<u64, NodeStatus>,
@@ -129,6 +175,7 @@ struct State {
     /// The transport exactly as it was saved, anchors and all. Meaningless
     /// in a new timebase, but valid again if `previous_clock` is adopted.
     saved_transport: Option<TransportState>,
+    saved_tasks: BTreeMap<String, TransportState>,
 }
 
 impl Core {
@@ -138,6 +185,28 @@ impl Core {
         let clock = Arc::new(MasterClock::new(cfg.local_clock.clone(), clock_id));
 
         let saved_transport = persisted.as_ref().map(|p| p.transport);
+        let saved_tasks = persisted
+            .as_ref()
+            .map(|p| p.tasks.clone())
+            .unwrap_or_default();
+        let parsed = persisted
+            .as_ref()
+            .and_then(|p| p.show.as_ref())
+            .and_then(|s| serde_json::from_value(s.document.clone()).ok())
+            .map(Arc::new);
+        // Like the main transport below: paused where they were, in the new
+        // timebase, unless a Runner hands the old one back.
+        let restored_tasks = saved_tasks
+            .iter()
+            .map(|(id, t)| {
+                let paused = TransportState {
+                    playing: false,
+                    anchor_cluster_ns: clock.now_ns(),
+                    ..*t
+                };
+                (id.clone(), TransportTimeline::new(paused))
+            })
+            .collect();
         let (id, transport, show, previous_clock) = match persisted {
             Some(p) => {
                 // The saved anchors refer to a clock that no longer exists.
@@ -164,12 +233,16 @@ impl Core {
             sync_port,
             state: Mutex::new(State {
                 timeline: TransportTimeline::new(transport),
+                tasks: restored_tasks,
                 show,
+                parsed,
+                fired: HashMap::new(),
                 nodes: BTreeMap::new(),
                 next_conn: 0,
                 anchored: false,
                 previous_clock,
                 saved_transport,
+                saved_tasks,
             }),
             events: broadcast::channel(64).0,
             dirty: Notify::new(),
@@ -223,6 +296,7 @@ impl Core {
                         self.publish(ServerMessage::Transport {
                             clock_id: self.clock.clock_id(),
                             state,
+                            timeline: None,
                         });
                         self.dirty.notify_one();
                     }
@@ -257,6 +331,11 @@ impl Core {
             // The newest state, even if it has not taken effect yet: the
             // client's own timeline will switch to it at the anchor.
             transport: st.timeline.latest(),
+            tasks: st
+                .tasks
+                .iter()
+                .map(|(id, tl)| (id.clone(), tl.latest()))
+                .collect(),
             show_revision: st.show.as_ref().map(|s| s.revision),
         };
         st.timeline.prune(now);
@@ -316,6 +395,26 @@ impl Core {
                 st.timeline.replace(own);
             }
         }
+        // The auxiliary timelines continue the same way: for each, the newer
+        // of what the Runner is executing and what we saved.
+        let own_tasks = if st.previous_clock == Some(clock_id) {
+            st.saved_tasks.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let ids: Vec<&String> = runner.tasks.keys().chain(own_tasks.keys()).collect();
+        let mut tasks = BTreeMap::new();
+        for id in ids {
+            let newest = [runner.tasks.get(id), own_tasks.get(id)]
+                .into_iter()
+                .flatten()
+                .max_by_key(|t| t.epoch);
+            if let Some(state) = newest {
+                tasks.insert(id.clone(), TransportTimeline::new(*state));
+            }
+        }
+        st.tasks = tasks;
+
         tracing::info!(
             "adopted timebase {clock_id:#x} from runner '{runner_name}' (transport epoch {})",
             st.timeline.latest().epoch
@@ -323,7 +422,15 @@ impl Core {
         self.publish(ServerMessage::Transport {
             clock_id,
             state: st.timeline.latest(),
+            timeline: None,
         });
+        for (id, tl) in &st.tasks {
+            self.publish(ServerMessage::Transport {
+                clock_id,
+                state: tl.latest(),
+                timeline: Some(id.clone()),
+            });
+        }
         self.dirty.notify_one();
     }
 
@@ -353,12 +460,28 @@ impl Core {
         }
     }
 
-    /// Execute an operator command. This is the single entry point for every
-    /// control surface (WebSocket, HTTP, and later OSC/MIDI/Art-Net/timecode).
+    /// Execute an operator command on the main timeline. See
+    /// [`command_on`](Self::command_on).
     pub fn command(&self, command: Command) -> Result<(), String> {
+        self.command_on(command, None)
+    }
+
+    /// Execute an operator command. This is the single entry point for every
+    /// control surface (WebSocket, HTTP, OSC, control cues).
+    ///
+    /// `timeline` selects which transport a transport command acts on:
+    /// `None` or `"main"` is the main timeline, anything else the id of an
+    /// auxiliary timeline of the current show.
+    pub fn command_on(&self, command: Command, timeline: Option<&str>) -> Result<(), String> {
+        let timeline = timeline.filter(|t| !t.is_empty() && *t != MAIN_TIMELINE);
         let change = match command {
             Command::Play => TransportChange::Play,
             Command::Pause => TransportChange::Pause,
+            // Stopping the main timeline rewinds it; stopping a task also
+            // takes it off stage.
+            Command::Stop => TransportChange::Stop {
+                deactivate: timeline.is_some(),
+            },
             Command::Seek { show_ns } if show_ns >= 0 => TransportChange::Seek(show_ns),
             Command::Seek { .. } => return Err("seek: show time must not be negative".into()),
             Command::SetRate { rate_permille }
@@ -373,31 +496,169 @@ impl Core {
             }
             Command::SetLoop { loop_ns } => TransportChange::SetLoop(loop_ns),
             Command::LoadShow { document } => return self.load_show(document),
+            Command::RunnerAction { runner, action } => return self.runner_action(&runner, action),
             // Answered by the connection that asked; nothing to change here.
             Command::Status => return Ok(()),
         };
 
         let mut st = self.state();
-        let now = self.clock.now_ns();
         // Anchor in the future so every Runner holds the new state before it
-        // applies. Derive it from the state that will be in force *then*, so
-        // two commands issued within one lead time compose correctly.
-        let at = now + self.lead_ns;
-        let base = st.timeline.state_at(at);
+        // applies.
+        let at = self.clock.now_ns() + self.lead_ns;
+        self.apply(&mut st, timeline, change, at)?;
+        st.anchored = true;
+        Ok(())
+    }
+
+    /// Give `timeline` a new transport state: `change`, taking effect at
+    /// cluster time `at`. Publishes it and returns it.
+    fn apply(
+        &self,
+        st: &mut State,
+        timeline: Option<&str>,
+        change: TransportChange,
+        at: i64,
+    ) -> Result<TransportState, String> {
+        let now = self.clock.now_ns();
+        let tl = match timeline {
+            None => &mut st.timeline,
+            Some(id) => {
+                let known = st
+                    .parsed
+                    .as_ref()
+                    .is_some_and(|doc| doc.tasks.iter().any(|t| t.id == id));
+                if !known {
+                    return Err(format!("unknown timeline '{id}'"));
+                }
+                // A task's transport comes into being the first time it is
+                // commanded; until then it is simply inactive.
+                st.tasks
+                    .entry(id.to_string())
+                    .or_insert_with(|| TransportTimeline::new(TransportState::INACTIVE))
+            }
+        };
+        // Derive from the state that will be in force *then*, so two commands
+        // issued within one lead time compose correctly.
+        let base = tl.state_at(at);
         let mut next = next_state(&base, change, at);
         // Epochs must increase across *all* known states, not just from `base`.
-        next.epoch = st.timeline.latest().epoch + 1;
-        st.timeline.push(next);
-        st.timeline.prune(now);
-        st.anchored = true;
-        drop(st);
+        next.epoch = tl.latest().epoch + 1;
+        tl.push(next);
+        tl.prune(now);
 
         self.publish(ServerMessage::Transport {
             clock_id: self.clock.clock_id(),
             state: next,
+            timeline: timeline.map(str::to_string),
         });
         self.dirty.notify_one();
+        Ok(next)
+    }
+
+    /// Forward an action to the Runner called (or identified as) `runner`.
+    fn runner_action(&self, runner: &str, action: lc_proto::RunnerAction) -> Result<(), String> {
+        let targets: Vec<NodeId> = self
+            .state()
+            .nodes
+            .values()
+            .filter(|n| n.role == Role::Runner && (n.name == runner || n.node_id.0 == runner))
+            .map(|n| n.node_id.clone())
+            .collect();
+        if targets.is_empty() {
+            return Err(format!("no connected runner is called '{runner}'"));
+        }
+        for node_id in targets {
+            self.publish(ServerMessage::RunnerAction { node_id, action });
+        }
         Ok(())
+    }
+
+    /// Fire the control cues that are about to be reached.
+    ///
+    /// Called a few times a second. For every playing timeline it looks a
+    /// short way ahead; a control cue inside that window is turned into a
+    /// transport change anchored at the **exact** cluster instant the
+    /// playhead will reach the cue. Because the change is published before
+    /// that instant, every Runner executes it on the same frame — a "pause"
+    /// cue stops all outputs precisely on the cue, not roughly near it.
+    ///
+    /// Control cues are executed here, by the Director. While it is down
+    /// they do not fire: Runners keep playing through them.
+    pub fn run_control_cues(&self) {
+        let mut st = self.state();
+        let Some(doc) = st.parsed.clone() else {
+            return;
+        };
+        let now = self.clock.now_ns();
+        st.fired.retain(|_, at| *at > now - NANOS_PER_SEC);
+
+        let main = (None, &doc.control_cues);
+        let tasks = doc
+            .tasks
+            .iter()
+            .map(|t| (Some(t.id.as_str()), &t.control_cues));
+        for (timeline, cues) in std::iter::once(main).chain(tasks) {
+            let state = match timeline {
+                None => st.timeline.latest(),
+                Some(id) => match st.tasks.get(id) {
+                    Some(tl) => tl.latest(),
+                    None => continue,
+                },
+            };
+            // Only a state that is in force, playing forward, has a future
+            // to look into. (A pending state is looked at once it applies.)
+            if !state.active
+                || !state.playing
+                || state.rate_permille <= 0
+                || state.anchor_cluster_ns > now
+            {
+                continue;
+            }
+            let position = state.show_time_at(now);
+            for cue in cues {
+                let Some(at) = cue_fire_time(&state, position, cue, now) else {
+                    continue;
+                };
+                if at - now > CONTROL_LOOKAHEAD_NS {
+                    continue;
+                }
+                let key = (
+                    timeline.unwrap_or(MAIN_TIMELINE).to_string(),
+                    cue.id.clone(),
+                );
+                if st.fired.contains_key(&key) {
+                    continue;
+                }
+                st.fired.insert(key, at);
+
+                // Which timeline the cue acts on.
+                let target = match cue.target.as_str() {
+                    "" => timeline,
+                    MAIN_TIMELINE => None,
+                    other => Some(other),
+                };
+                let change = match cue.action {
+                    ControlAction::Play => TransportChange::Play,
+                    ControlAction::Pause => TransportChange::Pause,
+                    ControlAction::Stop => TransportChange::Stop {
+                        deactivate: target.is_some(),
+                    },
+                    ControlAction::Jump => {
+                        TransportChange::Seek((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
+                    }
+                };
+                match self.apply(&mut st, target, change, at) {
+                    Ok(_) => tracing::info!(
+                        "control cue: {:?} {} (at {:.2} s on {})",
+                        cue.action,
+                        target.unwrap_or(MAIN_TIMELINE),
+                        cue.at_s,
+                        timeline.unwrap_or(MAIN_TIMELINE),
+                    ),
+                    Err(e) => tracing::warn!("control cue at {:.2} s: {e}", cue.at_s),
+                }
+            }
+        }
     }
 
     fn load_show(&self, document: serde_json::Value) -> Result<(), String> {
@@ -408,11 +669,14 @@ impl Core {
         // operator — instead of distributing it and failing on every node.
         // (Unknown fields are allowed and preserved: the document is stored
         // and forwarded as received.)
-        serde_json::from_value::<lc_proto::ShowDocument>(document.clone())
-            .map_err(|e| format!("load_show: {e}"))?
-            .validate()
-            .map_err(|e| format!("load_show: {e}"))?;
+        let parsed: ShowDocument =
+            serde_json::from_value(document.clone()).map_err(|e| format!("load_show: {e}"))?;
+        parsed.validate().map_err(|e| format!("load_show: {e}"))?;
         let mut st = self.state();
+        // A task that no longer exists has no transport either.
+        st.tasks
+            .retain(|id, _| parsed.tasks.iter().any(|t| &t.id == id));
+        st.parsed = Some(Arc::new(parsed));
         let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
         // A fresh id per load: unlike the revision counter it can never
         // collide with a show some Runner cached from an earlier life of
@@ -443,11 +707,29 @@ impl Core {
             cluster_ns: now,
             frame_rate: self.frame_rate,
             transport: st.timeline.state_at(now),
+            tasks: st
+                .tasks
+                .iter()
+                .map(|(id, tl)| (id.clone(), tl.state_at(now)))
+                .collect(),
             show_ns,
             frame: self.frame_rate.frame_at(show_ns),
             show_revision: st.show.as_ref().map(|s| s.revision),
             nodes: st.nodes.values().cloned().collect(),
         }
+    }
+
+    /// The latest state of every timeline: the main one (`None`) first, then
+    /// each task by id.
+    pub fn transports(&self) -> Vec<(Option<String>, TransportState)> {
+        let st = self.state();
+        std::iter::once((None, st.timeline.latest()))
+            .chain(
+                st.tasks
+                    .iter()
+                    .map(|(id, tl)| (Some(id.clone()), tl.latest())),
+            )
+            .collect()
     }
 
     /// The latest transport state (in force or pending).
@@ -468,18 +750,26 @@ impl Core {
         // cluster that kept running. Do not overwrite it with the
         // provisional clock id and paused transport of a start that no
         // Runner ever reached.
-        let (clock_id, transport) = if st.anchored {
-            (self.clock.clock_id(), st.timeline.latest())
+        let live_tasks = || {
+            st.tasks
+                .iter()
+                .map(|(id, tl)| (id.clone(), tl.latest()))
+                .collect()
+        };
+        let (clock_id, transport, tasks) = if st.anchored {
+            (self.clock.clock_id(), st.timeline.latest(), live_tasks())
         } else {
             (
                 st.previous_clock.unwrap_or_else(|| self.clock.clock_id()),
                 st.saved_transport.unwrap_or_else(|| st.timeline.latest()),
+                st.saved_tasks.clone(),
             )
         };
         Persisted {
             node_id: self.id.clone(),
             clock_id,
             transport,
+            tasks,
             show: st.show.clone(),
         }
     }
@@ -572,6 +862,17 @@ impl Director {
                     "OSC control is off: cannot bind udp://{addr}: {e} (choose another --osc-port)"
                 ),
             }
+        }
+
+        {
+            let core = core.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(CONTROL_PERIOD);
+                loop {
+                    tick.tick().await;
+                    core.run_control_cues();
+                }
+            }));
         }
 
         let server = tokio::spawn(server::serve(listener, core.clone(), shutdown_rx));
