@@ -34,6 +34,9 @@ pub struct Persisted {
     pub tasks: std::collections::BTreeMap<String, TransportState>,
     #[serde(default)]
     pub show: Option<ShowDoc>,
+    /// Runners seen so far (for listing them while offline, and waking them).
+    #[serde(default)]
+    pub known_runners: Vec<lc_proto::KnownRunner>,
 }
 
 /// Load the saved state. A missing file is a normal first start; a corrupt

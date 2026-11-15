@@ -33,6 +33,15 @@ pub enum ClientMessage {
     /// Application-level keepalive; answered with `Pong`. Lets a client detect
     /// a dead link faster than TCP would.
     Ping,
+    /// A Runner's recent log, sent when asked (`RunnerAction::SendLogs`).
+    Logs {
+        lines: Vec<String>,
+    },
+    /// Small pictures of a Runner's outputs, sent when asked
+    /// (`RunnerAction::SendPreview`).
+    Preview {
+        outputs: Vec<OutputPreview>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +117,23 @@ pub enum Command {
         runner: String,
         action: RunnerAction,
     },
+    /// Switch on a Runner's computer with a Wake-on-LAN packet. Works for a
+    /// Runner that has been connected before (its network card's address is
+    /// remembered) and whose computer allows it (BIOS / network settings).
+    WakeRunner {
+        runner: String,
+    },
+}
+
+/// One output picture of a Runner, for the operator to see what is on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputPreview {
+    /// The display's name.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// PNG, base64-encoded.
+    pub png_base64: String,
 }
 
 /// What a Runner can be asked to do.
@@ -117,6 +143,23 @@ pub enum RunnerAction {
     /// Close and rebuild all outputs and reload all media — the remedy when
     /// a display was re-plugged or an output came up wrong.
     ReloadOutputs,
+    /// Restart the Runner program.
+    Restart,
+    /// Stop the Runner program.
+    Quit,
+    /// Close the outputs but stay connected (screens go to the desktop or
+    /// dark), until `Resume`.
+    Standby,
+    Resume,
+    /// Restart the computer. Only if the Runner was started with
+    /// `--allow-power`.
+    Reboot,
+    /// Shut the computer down. Only with `--allow-power`.
+    PowerOff,
+    /// Reply with the recent log (`ClientMessage::Logs`).
+    SendLogs,
+    /// Reply with pictures of the outputs (`ClientMessage::Preview`).
+    SendPreview,
 }
 
 /// One monitor attached to a Runner, as its window system reports it.
@@ -160,6 +203,31 @@ pub struct Health {
     /// Number of output windows currently open.
     #[serde(default)]
     pub outputs: u32,
+    /// The machine, for the operator and for Wake-on-LAN.
+    #[serde(default)]
+    pub machine: Option<MachineInfo>,
+    /// Outputs closed by `Standby`.
+    #[serde(default)]
+    pub standby: bool,
+}
+
+/// Facts about a Runner's computer.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MachineInfo {
+    pub hostname: String,
+    /// `windows`, `linux`, `macos`.
+    pub os: String,
+    /// LC Play version.
+    pub version: String,
+    /// IP address the Runner reaches the Director from.
+    pub ip: String,
+    /// Hardware address of that network interface (for Wake-on-LAN).
+    #[serde(default)]
+    pub mac: Option<String>,
+    /// Whether it accepts `Reboot` / `PowerOff`.
+    pub allow_power: bool,
+    /// Whether a supervisor restarts it (`Restart` brings it back).
+    pub supervised: bool,
 }
 
 /// How well a Runner's clock is locked to the Director's.
@@ -199,6 +267,18 @@ pub enum ServerMessage {
     RunnerAction {
         node_id: NodeId,
         action: RunnerAction,
+    },
+    /// A Runner's log, forwarded to Producers and controllers.
+    RunnerLogs {
+        node_id: NodeId,
+        name: String,
+        lines: Vec<String>,
+    },
+    /// A Runner's output pictures, forwarded to Producers and controllers.
+    RunnerPreview {
+        node_id: NodeId,
+        name: String,
+        outputs: Vec<OutputPreview>,
     },
     /// The show document. Sent to a Runner whose cached revision differs, and
     /// to everyone when a new show is loaded.
@@ -256,6 +336,20 @@ pub struct ClusterStatus {
     #[serde(default)]
     pub show_revision: Option<u64>,
     pub nodes: Vec<NodeStatus>,
+    /// Every Runner that has ever connected, connected or not — so that an
+    /// offline one can still be listed and woken.
+    #[serde(default)]
+    pub known_runners: Vec<KnownRunner>,
+}
+
+/// A Runner the Director remembers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KnownRunner {
+    pub name: String,
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub machine: Option<MachineInfo>,
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

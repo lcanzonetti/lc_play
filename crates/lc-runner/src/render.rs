@@ -690,28 +690,124 @@ impl Gpu {
         }
 
         // --- warp + blend pass ---
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("warp-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
+        self.encode_warp(encoder, frame_view, out);
+    }
+
+    /// The final pass of an output: its rendered canvas slice, through the
+    /// warp mesh and the blend mask, into `target`.
+    fn encode_warp(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        out: &OutputResources,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("warp-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.warp_pipeline);
+        pass.set_bind_group(0, &out.blend_bg, &[]);
+        pass.set_bind_group(1, &out.scene_bg, &[]);
+        pass.set_vertex_buffer(0, out.warp_vbo.slice(..));
+        pass.set_index_buffer(out.warp_ibo.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..out.warp_index_count, 0, 0..1);
+    }
+
+    /// Start capturing a small picture of what `out` shows — after warp and
+    /// blend, i.e. what reaches the display — for the operator's preview.
+    /// Uses the canvas slice rendered in the last frame. The result is read
+    /// with [`Capture::take`] once the GPU has finished.
+    pub fn capture_output(&self, out: &OutputGpu, name: &str, max_width: u32) -> Capture {
+        let (ow, oh) = (out.config.width.max(1), out.config.height.max(1));
+        let width = ow.min(max_width).max(1);
+        let height = ((oh as u64 * width as u64 / ow as u64) as u32).max(1);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // Buffer rows must be multiples of 256 bytes.
+        let padded = (width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview-readback"),
+            size: (padded * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview"),
             });
-            pass.set_pipeline(&self.warp_pipeline);
-            pass.set_bind_group(0, &out.blend_bg, &[]);
-            pass.set_bind_group(1, &out.scene_bg, &[]);
-            pass.set_vertex_buffer(0, out.warp_vbo.slice(..));
-            pass.set_index_buffer(out.warp_ibo.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..out.warp_index_count, 0, 0..1);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.encode_warp(&mut encoder, &view, &out.res);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ready.clone();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            });
+        Capture {
+            name: name.to_string(),
+            buffer,
+            width,
+            height,
+            padded,
+            bgra: matches!(
+                self.surface_format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            ),
+            ready,
         }
+    }
+
+    /// Let the GPU run completion callbacks (captures) without waiting.
+    pub fn poll(&self) {
+        self.device.poll(wgpu::Maintain::Poll);
     }
 
     /// Expose the adapter name for logging.
@@ -807,6 +903,44 @@ fn warp_mesh(output: &Output) -> (Vec<WarpVertex>, Vec<u32>) {
         }
     }
     (verts, indices)
+}
+
+/// A picture of an output on its way back from the GPU.
+pub struct Capture {
+    pub name: String,
+    buffer: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    padded: u32,
+    bgra: bool,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Capture {
+    /// Whether the GPU has delivered the picture.
+    pub fn take_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// RGBA pixels, once the GPU has delivered them.
+    pub fn take(&self) -> Option<Vec<u8>> {
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let data = self.buffer.slice(..).get_mapped_range();
+        let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
+        for row in data.chunks(self.padded as usize) {
+            rgba.extend_from_slice(&row[..(self.width * 4) as usize]);
+        }
+        drop(data);
+        self.buffer.unmap();
+        if self.bgra {
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        Some(rgba)
+    }
 }
 
 /// The bind-group entries for three texture planes and a sampler, in the

@@ -193,7 +193,11 @@ mod tests {
     fn a_runner_gets_its_own_displays_and_the_unassigned_ones() {
         let show = build(&doc(), "left", &cache());
         let names: Vec<&str> = show.outputs.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, ["Left", "Any"], "not Right's, and not the invalid one");
+        assert_eq!(
+            names,
+            ["Left", "Any"],
+            "not Right's, and not the invalid one"
+        );
         // Outputs are identified by the display's id, which survives renaming.
         assert_eq!(show.outputs[0].id, "a");
         assert_eq!(build(&doc(), "nobody", &cache()).outputs.len(), 1);

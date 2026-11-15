@@ -28,8 +28,8 @@ use std::time::Duration;
 use lc_discovery::DiscoveryConfig;
 use lc_net::Connection;
 use lc_proto::{
-    Beacon, ClientMessage, FrameRate, Health, Hello, NodeId, Role, RunnerHello, ServerMessage,
-    TransportState, Welcome, PROTOCOL_VERSION,
+    Beacon, ClientMessage, FrameRate, Health, Hello, NodeId, Role, RunnerAction, RunnerHello,
+    ServerMessage, TransportState, Welcome, PROTOCOL_VERSION,
 };
 use lc_time::{ClusterClock, LocalClock, MonotonicClock};
 use tokio::sync::watch;
@@ -79,6 +79,14 @@ pub struct AgentConfig {
     /// Transport used when there is nothing cached and no Director yet.
     pub initial_transport: TransportState,
     pub frame_rate: FrameRate,
+    /// A renderer is running in this process (it carries out restart,
+    /// standby and preview requests). Without one, the agent handles
+    /// restart and quit itself.
+    pub renderer: bool,
+    /// Accept `Reboot` / `PowerOff` from the operator.
+    pub allow_power: bool,
+    /// A supervisor started this process and restarts it on request.
+    pub supervised: bool,
 }
 
 impl AgentConfig {
@@ -91,6 +99,9 @@ impl AgentConfig {
             local_clock: Arc::new(MonotonicClock::new()),
             initial_transport: TransportState::STOPPED,
             frame_rate: FrameRate::default(),
+            renderer: false,
+            allow_power: false,
+            supervised: false,
         }
     }
 }
@@ -166,6 +177,9 @@ impl Agent {
         }
 
         let link = Link {
+            renderer: cfg.renderer,
+            allow_power: cfg.allow_power,
+            supervised: cfg.supervised,
             node_id: node_id.clone(),
             name: cfg.name,
             director: cfg.director,
@@ -196,6 +210,9 @@ impl Agent {
 
 /// The control-connection task and what it needs.
 struct Link {
+    renderer: bool,
+    allow_power: bool,
+    supervised: bool,
     node_id: NodeId,
     name: String,
     director: DirectorAddr,
@@ -319,6 +336,11 @@ impl Link {
         report.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_heard = Instant::now();
         let connected_at = Instant::now();
+        let local_ip = conn.local_addr().map(|a| a.ip());
+        let machine = crate::machine::describe(local_ip, self.allow_power, self.supervised);
+        // Pictures the renderer captured are passed on promptly.
+        let mut outbox = interval(Duration::from_millis(200));
+        outbox.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut warned_no_sync = false;
 
         loop {
@@ -333,11 +355,8 @@ impl Link {
                         ServerMessage::RunnerAction { node_id, action } => {
                             // Broadcast to everybody; only the addressee acts.
                             if node_id == self.node_id {
-                                tracing::info!("operator request: {action:?}");
-                                match action {
-                                    lc_proto::RunnerAction::ReloadOutputs => {
-                                        playhead.request_reload()
-                                    }
+                                if let Err(e) = self.act(action, &mut conn).await {
+                                    return e;
                                 }
                             }
                         }
@@ -366,7 +385,19 @@ impl Link {
                         ServerMessage::Error { message } => {
                             tracing::warn!("director reported: {message}");
                         }
-                        ServerMessage::Pong | ServerMessage::Cluster(_) | ServerMessage::Welcome(_) => {}
+                        ServerMessage::Pong
+                        | ServerMessage::Cluster(_)
+                        | ServerMessage::Welcome(_)
+                        | ServerMessage::RunnerLogs { .. }
+                        | ServerMessage::RunnerPreview { .. } => {}
+                    }
+                }
+
+                _ = outbox.tick() => {
+                    if let Some(outputs) = playhead.take_previews() {
+                        if let Err(e) = conn.send(&ClientMessage::Preview { outputs }).await {
+                            return e.to_string();
+                        }
                     }
                 }
 
@@ -385,7 +416,7 @@ impl Link {
                             welcome.sync_port
                         );
                     }
-                    let health = ClientMessage::Health(self.health());
+                    let health = ClientMessage::Health(self.health(&machine));
                     // Ping makes the Director answer, which is how *we*
                     // notice a dead link (see DIRECTOR_SILENCE).
                     for msg in [health, ClientMessage::Ping] {
@@ -402,7 +433,43 @@ impl Link {
         }
     }
 
-    fn health(&self) -> Health {
+    /// Carry out an operator action addressed to this Runner. An error is
+    /// the reason to end the session.
+    async fn act(&self, action: RunnerAction, conn: &mut Connection) -> Result<(), String> {
+        tracing::info!("operator request: {action:?}");
+        match action {
+            RunnerAction::SendLogs => {
+                let lines = crate::machine::recent_log();
+                conn.send(&ClientMessage::Logs { lines })
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            RunnerAction::Reboot | RunnerAction::PowerOff if !self.allow_power => {
+                tracing::warn!(
+                    "{action:?} refused: start the runner with --allow-power to allow it"
+                );
+            }
+            RunnerAction::Reboot | RunnerAction::PowerOff => {
+                let reboot = action == RunnerAction::Reboot;
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::machine::power(reboot) {
+                        tracing::error!("{e:#}");
+                    }
+                });
+            }
+            // Without a renderer, quitting and restarting are ours to do.
+            RunnerAction::Quit if !self.renderer => std::process::exit(0),
+            RunnerAction::Restart if !self.renderer => {
+                std::process::exit(crate::machine::RESTART_EXIT_CODE)
+            }
+            RunnerAction::ReloadOutputs => self.playhead.request_reload(),
+            // Everything else concerns the outputs: the renderer's job.
+            other => self.playhead.request(other),
+        }
+        Ok(())
+    }
+
+    fn health(&self, machine: &lc_proto::MachineInfo) -> Health {
         let pos = self.playhead.position();
         let hardware = self.playhead.hardware();
         Health {
@@ -416,6 +483,8 @@ impl Link {
             monitors: hardware.monitors,
             gpu: hardware.gpu,
             outputs: hardware.outputs,
+            machine: Some(machine.clone()),
+            standby: self.playhead.standby(),
         }
     }
 

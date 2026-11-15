@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use lc_proto::{ClockId, FrameRate, MonitorInfo, TransportState, NANOS_PER_SEC};
+use lc_proto::{
+    ClockId, FrameRate, MonitorInfo, OutputPreview, RunnerAction, TransportState, NANOS_PER_SEC,
+};
 use lc_time::{next_state, ClusterClock, TransportChange, TransportTimeline};
 
 /// A show document as distributed by the Director.
@@ -58,6 +60,12 @@ pub struct Playhead {
     /// Incremented each time the operator asks this Runner to rebuild its
     /// outputs; the renderer acts when it sees the number change.
     reload_requests: AtomicU64,
+    /// Operator actions for the renderer (restart, standby, preview …).
+    requests: Mutex<Vec<RunnerAction>>,
+    /// Output pictures captured by the renderer, waiting to be sent.
+    previews: Mutex<Option<Vec<OutputPreview>>>,
+    /// Outputs closed on request.
+    standby: AtomicBool,
     /// What the renderer knows about its hardware, for the health report.
     hardware: Mutex<Hardware>,
 }
@@ -101,6 +109,9 @@ impl Playhead {
             connected: AtomicBool::new(false),
             fps_bits: AtomicU32::new(0),
             reload_requests: AtomicU64::new(0),
+            requests: Mutex::new(Vec::new()),
+            previews: Mutex::new(None),
+            standby: AtomicBool::new(false),
             hardware: Mutex::new(Hardware::default()),
         }
     }
@@ -268,6 +279,39 @@ impl Playhead {
     /// number it has acted on.
     pub fn reload_requests(&self) -> u64 {
         self.reload_requests.load(Ordering::Relaxed)
+    }
+
+    /// Queue an operator action for the renderer.
+    pub fn request(&self, action: RunnerAction) {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(action);
+    }
+
+    /// The queued operator actions (renderer side).
+    pub fn take_requests(&self) -> Vec<RunnerAction> {
+        std::mem::take(&mut *self.requests.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Hand captured output pictures to the agent.
+    pub fn put_previews(&self, previews: Vec<OutputPreview>) {
+        *self.previews.lock().unwrap_or_else(|e| e.into_inner()) = Some(previews);
+    }
+
+    pub fn take_previews(&self) -> Option<Vec<OutputPreview>> {
+        self.previews
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    pub fn set_standby(&self, standby: bool) {
+        self.standby.store(standby, Ordering::Relaxed);
+    }
+
+    pub fn standby(&self) -> bool {
+        self.standby.load(Ordering::Relaxed)
     }
 
     pub fn hardware(&self) -> Hardware {

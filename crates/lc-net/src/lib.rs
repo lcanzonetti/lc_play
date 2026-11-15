@@ -111,6 +111,15 @@ impl Connection {
             .map_err(|_| NetError::Timeout)?
     }
 
+    /// This end's address: the network interface the Director is reached
+    /// through.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self.ws.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp.local_addr().ok(),
+            _ => None,
+        }
+    }
+
     /// Close politely. Errors are ignored: the peer may already be gone.
     pub async fn close(mut self) {
         let _ = self.ws.close(None).await;

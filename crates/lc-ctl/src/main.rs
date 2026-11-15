@@ -70,6 +70,16 @@ enum Action {
     Reload {
         runner: String,
     },
+    /// Act on a Runner (by name): restart, quit, standby, resume, reboot,
+    /// poweroff.
+    Runner {
+        runner: String,
+        action: String,
+    },
+    /// Switch a Runner's computer on (Wake-on-LAN).
+    Wake {
+        runner: String,
+    },
     /// Jump to a show time in seconds.
     Seek {
         seconds: f64,
@@ -134,6 +144,23 @@ async fn main() -> anyhow::Result<()> {
             runner,
             action: lc_proto::RunnerAction::ReloadOutputs,
         },
+        Action::Runner { runner, action } => {
+            use lc_proto::RunnerAction as A;
+            let action = match action.as_str() {
+                "restart" => A::Restart,
+                "quit" => A::Quit,
+                "standby" => A::Standby,
+                "resume" => A::Resume,
+                "reboot" => A::Reboot,
+                "poweroff" => A::PowerOff,
+                "reload" => A::ReloadOutputs,
+                other => bail!(
+                    "unknown runner action '{other}' (restart, quit, standby, resume, reboot, poweroff, reload)"
+                ),
+            };
+            Command::RunnerAction { runner, action }
+        }
+        Action::Wake { runner } => Command::WakeRunner { runner },
         Action::Seek { seconds } => {
             if !(seconds.is_finite() && seconds >= 0.0) {
                 bail!("seek: the time must be zero or positive");
@@ -177,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
     // (and an Error, if the command was refused, arrives before it).
     let scheduled = !matches!(
         command,
-        Command::LoadShow { .. } | Command::RunnerAction { .. }
+        Command::LoadShow { .. } | Command::RunnerAction { .. } | Command::WakeRunner { .. }
     );
     let (mut conn, welcome) = connect(args.director.as_deref()).await?;
     conn.send(&ClientMessage::Command {

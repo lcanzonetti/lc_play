@@ -208,6 +208,10 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                 }
 
                 event = events.recv() => match event {
+                    // Logs and pictures from Runners are for the operator,
+                    // not for the other Runners.
+                    Ok(ServerMessage::RunnerLogs { .. } | ServerMessage::RunnerPreview { .. })
+                        if hello.role == Role::Runner => {}
                     Ok(msg) => send(&mut socket, &msg).await?,
                     // This client fell more than a channel's worth behind.
                     // Transport is state, not history: the current one is
@@ -249,6 +253,8 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                         Err(ReadError::Link(e)) => return Err(e),
                         Ok(Some(ClientMessage::Ping)) => send(&mut socket, &ServerMessage::Pong).await?,
                         Ok(Some(ClientMessage::Health(health))) => core.health(conn, health),
+                        Ok(Some(ClientMessage::Logs { lines })) => core.runner_logs(conn, lines),
+                        Ok(Some(ClientMessage::Preview { outputs })) => core.runner_preview(conn, outputs),
                         Ok(Some(ClientMessage::Hello(_))) => {
                             send(&mut socket, &error("hello was already sent")).await?
                         }

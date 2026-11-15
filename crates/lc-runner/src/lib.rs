@@ -24,6 +24,7 @@ pub mod app;
 pub mod assets;
 pub mod content;
 pub mod hap;
+pub mod machine;
 pub mod mov;
 pub mod playhead;
 pub mod render;

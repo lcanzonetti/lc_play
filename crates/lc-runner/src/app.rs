@@ -30,15 +30,18 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use lc_proto::NANOS_PER_SEC;
+use lc_proto::{RunnerAction, NANOS_PER_SEC};
 use lc_time::TransportChange;
 
 use crate::assets::AssetCache;
 use crate::content::{self, Content};
 use crate::playhead::Playhead;
-use crate::render::{Gpu, OutputGpu};
+use crate::render::{Capture, Gpu, OutputGpu};
 use crate::show::{Canvas, Output, Playback, Show};
 use crate::stage;
+
+/// Width of the output pictures sent to the operator, in pixels.
+const PREVIEW_WIDTH: u32 = 480;
 
 /// How long before a layer appears its content starts preparing (seconds).
 const PREROLL_S: f64 = 1.0;
@@ -86,6 +89,13 @@ pub struct App {
     started: bool,
     /// Reload requests (see `Playhead::request_reload`) acted on so far.
     reloads_done: u64,
+    /// Outputs closed on the operator's request.
+    standby: bool,
+    /// Output pictures on their way back from the GPU.
+    captures: Vec<Capture>,
+    /// How the process should end when the event loop stops: 0 to quit,
+    /// `RESTART_EXIT_CODE` to be started again by the supervisor.
+    pub exit_code: i32,
 }
 
 /// Logs the frame rate every few seconds so a show's performance is visible.
@@ -146,6 +156,9 @@ impl App {
             applied: None,
             started: false,
             reloads_done: 0,
+            standby: false,
+            captures: Vec::new(),
+            exit_code: 0,
         }
     }
 
@@ -153,6 +166,111 @@ impl App {
     /// drop every loaded texture and decoder, and build it all again from
     /// the current show — what restarting the Runner would do, without
     /// losing the cluster connection or the clock lock.
+    /// Carry out the operator's requests queued by the agent.
+    fn handle_requests(&mut self, event_loop: &ActiveEventLoop) {
+        for action in self.playhead.take_requests() {
+            match action {
+                RunnerAction::Quit => {
+                    tracing::info!("quitting on the operator's request");
+                    self.exit_code = 0;
+                    event_loop.exit();
+                }
+                RunnerAction::Restart => {
+                    tracing::info!("restarting on the operator's request");
+                    self.exit_code = crate::machine::RESTART_EXIT_CODE;
+                    event_loop.exit();
+                }
+                RunnerAction::Standby if !self.standby => {
+                    tracing::info!("standby: closing the outputs");
+                    self.standby = true;
+                    self.playhead.set_standby(true);
+                    self.windows.clear();
+                    self.by_id.clear();
+                    self.window_outputs.clear();
+                    self.playhead.update_hardware(|h| h.outputs = 0);
+                }
+                RunnerAction::Resume if self.standby => {
+                    tracing::info!("resuming: opening the outputs");
+                    self.standby = false;
+                    self.playhead.set_standby(false);
+                    let show = std::mem::replace(&mut self.show, empty_show());
+                    self.apply_show(event_loop, show);
+                }
+                RunnerAction::SendPreview => {
+                    if let Some(gpu) = &self.gpu {
+                        self.captures = self
+                            .windows
+                            .iter()
+                            .map(|rw| {
+                                let name = if rw.output.name.is_empty() {
+                                    &rw.output.id
+                                } else {
+                                    &rw.output.name
+                                };
+                                gpu.capture_output(&rw.gpu, name, PREVIEW_WIDTH)
+                            })
+                            .collect();
+                    }
+                    if self.captures.is_empty() {
+                        // Nothing to show: answer anyway, so the operator
+                        // sees that there are no outputs.
+                        self.playhead.put_previews(Vec::new());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.finish_captures();
+    }
+
+    /// Hand finished output pictures to the agent (encoded off this thread).
+    fn finish_captures(&mut self) {
+        if self.captures.is_empty() {
+            return;
+        }
+        if let Some(gpu) = &self.gpu {
+            gpu.poll();
+        }
+        if !self.captures.iter().all(|c| c.take_ready()) {
+            return;
+        }
+        let pictures: Vec<(String, u32, u32, Vec<u8>)> = self
+            .captures
+            .drain(..)
+            .filter_map(|c| {
+                c.take()
+                    .map(|rgba| (c.name.clone(), c.width, c.height, rgba))
+            })
+            .collect();
+        let playhead = self.playhead.clone();
+        std::thread::spawn(move || {
+            let outputs = pictures
+                .into_iter()
+                .filter_map(|(name, width, height, rgba)| {
+                    let mut png = Vec::new();
+                    image::ImageEncoder::write_image(
+                        image::codecs::png::PngEncoder::new(&mut png),
+                        &rgba,
+                        width,
+                        height,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .ok()?;
+                    Some(lc_proto::OutputPreview {
+                        name,
+                        width,
+                        height,
+                        png_base64: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            png,
+                        ),
+                    })
+                })
+                .collect();
+            playhead.put_previews(outputs);
+        });
+    }
+
     fn reload_if_requested(&mut self, event_loop: &ActiveEventLoop) {
         let requested = self.playhead.reload_requests();
         if requested == self.reloads_done {
@@ -247,8 +365,10 @@ impl App {
     fn apply_show(&mut self, event_loop: &ActiveEventLoop, show: Show) {
         // Windows are expensive and visible: touch them only if the displays
         // changed. Moving a cue must not make every output blink.
-        if show.outputs != self.window_outputs {
-            if let Err(e) = self.sync_windows(event_loop, &show) {
+        // In standby the outputs stay closed, whatever the show says.
+        let wanted: &[Output] = if self.standby { &[] } else { &show.outputs };
+        if wanted != self.window_outputs.as_slice() {
+            if let Err(e) = self.sync_windows(event_loop, wanted, show.layers.len()) {
                 tracing::error!("cannot set up the outputs: {e:#}");
                 self.windows.clear();
                 self.by_id.clear();
@@ -283,7 +403,12 @@ impl App {
     /// output each time a display was nudged in the Producer made them
     /// flicker and stall.) Only new displays get new windows, and removed
     /// ones are closed.
-    fn sync_windows(&mut self, event_loop: &ActiveEventLoop, show: &Show) -> anyhow::Result<()> {
+    fn sync_windows(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        outputs: &[Output],
+        layer_count: usize,
+    ) -> anyhow::Result<()> {
         let mut existing: HashMap<String, RenderWindow> = self
             .windows
             .drain(..)
@@ -292,7 +417,7 @@ impl App {
         self.by_id.clear();
         self.window_outputs.clear();
 
-        for (idx, output) in show.outputs.iter().enumerate() {
+        for (idx, output) in outputs.iter().enumerate() {
             let rw = match existing.remove(&output.id) {
                 Some(mut rw) => {
                     if rw.output.window != output.window {
@@ -313,7 +438,7 @@ impl App {
                     rw.output_idx = idx;
                     rw
                 }
-                None => self.open_window(event_loop, output, idx, show.layers.len())?,
+                None => self.open_window(event_loop, output, idx, layer_count)?,
             };
             self.by_id.insert(rw.window.id(), self.windows.len());
             self.windows.push(rw);
@@ -322,7 +447,7 @@ impl App {
         // closes those windows.
         drop(existing);
 
-        self.window_outputs = show.outputs.clone();
+        self.window_outputs = outputs.to_vec();
         if let Some(gpu) = &self.gpu {
             let (gpu_name, outputs) = (gpu.adapter_info(), self.windows.len() as u32);
             self.playhead.update_hardware(|h| {
@@ -690,6 +815,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.handle_requests(event_loop);
         self.reload_if_requested(event_loop);
         self.follow_cluster_show(event_loop);
 

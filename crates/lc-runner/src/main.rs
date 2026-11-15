@@ -59,6 +59,17 @@ struct Args {
     /// IPv4 address of the network interface used for discovery.
     #[arg(long, default_value = "0.0.0.0")]
     interface: Ipv4Addr,
+    /// Let the operator restart and shut down this computer from the
+    /// Producer. Off by default: anyone on the show network could do it.
+    #[arg(long)]
+    allow_power: bool,
+    /// Run without a supervisor: no automatic restart after a crash, and
+    /// "Restart" from the Producer only stops the Runner.
+    #[arg(long)]
+    no_supervise: bool,
+    /// Internal: this process was started by the supervisor.
+    #[arg(long, hide = true)]
+    worker: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -67,8 +78,18 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,wgpu_core=warn,wgpu_hal=warn,naga=warn".into()),
         )
+        // Also kept in memory, for the operator to read from the Producer.
+        .with_writer(lc_runner::machine::LogWriter)
         .init();
     let args = Args::parse();
+
+    if !args.worker && !args.no_supervise {
+        return supervise();
+    }
+    if args.worker {
+        exit_with_supervisor();
+    }
+    let supervised = args.worker;
 
     let discovery = DiscoveryConfig {
         interface: args.interface,
@@ -85,6 +106,8 @@ fn main() -> anyhow::Result<()> {
         let mut cfg = AgentConfig::new(args.name, director);
         cfg.cache_dir = args.cache_dir;
         cfg.announce = Some(discovery);
+        cfg.allow_power = args.allow_power;
+        cfg.supervised = supervised;
         return tokio::runtime::Runtime::new()?.block_on(headless(cfg));
     }
 
@@ -143,6 +166,9 @@ fn main() -> anyhow::Result<()> {
             cfg.announce = Some(discovery);
             cfg.local_clock = local_clock;
             cfg.initial_transport = initial;
+            cfg.renderer = true;
+            cfg.allow_power = args.allow_power;
+            cfg.supervised = supervised;
             let agent = runtime.block_on(async { Agent::spawn(cfg) });
             (Some(runtime), agent.playhead.clone())
         }
@@ -163,7 +189,82 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = App::new(source, playhead);
     event_loop.run_app(&mut app)?;
+    if app.exit_code != 0 {
+        std::process::exit(app.exit_code);
+    }
     Ok(())
+}
+
+/// Run the Runner as a child process and keep it running.
+///
+/// The supervisor is this same program, doing nothing but starting the real
+/// Runner (with `--worker`) and watching it:
+///
+/// * exits normally (the operator chose Quit, or closed a window with Esc):
+///   the supervisor ends too;
+/// * asks to be restarted (the operator chose Restart): started again at
+///   once;
+/// * crashes (a GPU driver reset, a bug): started again after a pause that
+///   grows if it keeps crashing, so a broken setup does not spin.
+///
+/// The child is tied to the supervisor through its stdin: if the supervisor
+/// is killed, the pipe closes and the child exits (see
+/// [`exit_with_supervisor`]). That works the same on Windows, where killing
+/// a process does not kill its children.
+fn supervise() -> anyhow::Result<()> {
+    use lc_runner::machine::RESTART_EXIT_CODE;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locating this program")?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let started = std::time::Instant::now();
+        let mut child = Command::new(&exe)
+            .args(&args)
+            .arg("--worker")
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("starting the runner")?;
+        // Keep the write end open for as long as we live.
+        let _tie = child.stdin.take();
+        let status = child.wait().context("waiting for the runner")?;
+        match status.code() {
+            Some(0) => return Ok(()),
+            Some(RESTART_EXIT_CODE) => {
+                tracing::info!("supervisor: restarting the runner");
+                backoff = Duration::from_secs(1);
+            }
+            _ => {
+                // A runner that ran for a while and then died gets restarted
+                // quickly; one that dies at once, more and more slowly.
+                if started.elapsed() > Duration::from_secs(60) {
+                    backoff = Duration::from_secs(1);
+                }
+                tracing::error!(
+                    "supervisor: the runner stopped unexpectedly ({status}); restarting in {} s",
+                    backoff.as_secs()
+                );
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// In a supervised Runner: exit when the supervisor goes away (its end of
+/// our stdin closes).
+fn exit_with_supervisor() {
+    std::thread::spawn(|| {
+        let mut buf = [0u8; 64];
+        let mut stdin = std::io::stdin();
+        loop {
+            match std::io::Read::read(&mut stdin, &mut buf) {
+                Ok(0) | Err(_) => std::process::exit(0),
+                Ok(_) => {}
+            }
+        }
+    });
 }
 
 /// Read and validate a local show file.

@@ -37,6 +37,7 @@
 pub mod osc;
 pub mod server;
 mod store;
+mod wol;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -48,8 +49,9 @@ use anyhow::Context as _;
 use lc_discovery::DiscoveryConfig;
 use lc_proto::show::{ControlAction, ControlCue, ShowDocument, MAIN_TIMELINE};
 use lc_proto::{
-    Beacon, ClockId, ClusterStatus, Command, FrameRate, Health, Hello, NodeId, NodeStatus, Role,
-    RunnerHello, ServerMessage, TransportState, Welcome, NANOS_PER_SEC, PROTOCOL_VERSION,
+    Beacon, ClockId, ClusterStatus, Command, FrameRate, Health, Hello, KnownRunner, NodeId,
+    NodeStatus, OutputPreview, Role, RunnerHello, ServerMessage, TransportState, Welcome,
+    NANOS_PER_SEC, PROTOCOL_VERSION,
 };
 use lc_time::{
     next_state, LocalClock, MasterClock, MonotonicClock, TransportChange, TransportTimeline,
@@ -216,6 +218,9 @@ struct State {
     /// in a new timebase, but valid again if `previous_clock` is adopted.
     saved_transport: Option<TransportState>,
     saved_tasks: BTreeMap<String, TransportState>,
+    /// Every Runner seen, by name: its identity and machine, for listing it
+    /// while offline and for Wake-on-LAN.
+    known_runners: BTreeMap<String, KnownRunner>,
 }
 
 impl Core {
@@ -225,6 +230,23 @@ impl Core {
         let clock = Arc::new(MasterClock::new(cfg.local_clock.clone(), clock_id));
 
         let saved_transport = persisted.as_ref().map(|p| p.transport);
+        let known_runners = persisted
+            .as_ref()
+            .map(|p| {
+                p.known_runners
+                    .iter()
+                    .map(|k| {
+                        (
+                            k.name.clone(),
+                            KnownRunner {
+                                online: false,
+                                ..k.clone()
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let saved_tasks = persisted
             .as_ref()
             .map(|p| p.tasks.clone())
@@ -283,6 +305,7 @@ impl Core {
                 previous_clock,
                 saved_transport,
                 saved_tasks,
+                known_runners,
             }),
             events: broadcast::channel(64).0,
             dirty: Notify::new(),
@@ -362,6 +385,20 @@ impl Core {
                     }
                 }
             }
+        }
+
+        if hello.role == Role::Runner {
+            let entry = st
+                .known_runners
+                .entry(hello.name.clone())
+                .or_insert_with(|| KnownRunner {
+                    name: hello.name.clone(),
+                    node_id: hello.node_id.clone(),
+                    machine: None,
+                    online: true,
+                });
+            entry.node_id = hello.node_id.clone();
+            self.dirty.notify_one();
         }
 
         let conn = st.next_conn;
@@ -513,11 +550,64 @@ impl Core {
                     .frame_at(expected.show_time_at(health.cluster_ns)),
             )
         });
-        if let Some(node) = st.nodes.get_mut(&conn) {
-            node.clock_skew_ns = Some(skew);
-            node.frame_error = frame_error;
-            node.health = Some(health);
+        let Some(node) = st.nodes.get_mut(&conn) else {
+            return;
+        };
+        node.clock_skew_ns = Some(skew);
+        node.frame_error = frame_error;
+        let (name, machine) = (node.name.clone(), health.machine.clone());
+        node.health = Some(health);
+        // Remember the machine (its network address wakes it later).
+        if let (Some(known), Some(machine)) = (st.known_runners.get_mut(&name), machine) {
+            if known.machine.as_ref() != Some(&machine) {
+                known.machine = Some(machine);
+                self.dirty.notify_one();
+            }
         }
+    }
+
+    /// Forward a Runner's log to the Producers.
+    pub fn runner_logs(&self, conn: u64, lines: Vec<String>) {
+        let node = self.state().nodes.get(&conn).cloned();
+        if let Some(node) = node {
+            self.publish(ServerMessage::RunnerLogs {
+                node_id: node.node_id,
+                name: node.name,
+                lines,
+            });
+        }
+    }
+
+    /// Forward a Runner's output pictures to the Producers.
+    pub fn runner_preview(&self, conn: u64, outputs: Vec<OutputPreview>) {
+        let node = self.state().nodes.get(&conn).cloned();
+        if let Some(node) = node {
+            self.publish(ServerMessage::RunnerPreview {
+                node_id: node.node_id,
+                name: node.name,
+                outputs,
+            });
+        }
+    }
+
+    /// Send a Wake-on-LAN packet to a Runner's computer.
+    fn wake_runner(&self, runner: &str) -> Result<(), String> {
+        let st = self.state();
+        let known = st
+            .known_runners
+            .values()
+            .find(|k| k.name == runner || k.node_id.0 == runner)
+            .ok_or_else(|| format!("no runner called '{runner}' has ever connected"))?;
+        let machine = known.machine.as_ref().ok_or_else(|| {
+            format!("the network address of '{runner}' is not known yet (it has not reported it)")
+        })?;
+        let mac = machine
+            .mac
+            .as_deref()
+            .ok_or_else(|| format!("'{runner}' did not report a network card address"))?;
+        wol::wake(mac, &machine.ip).map_err(|e| format!("wake '{runner}': {e}"))?;
+        tracing::info!("sent Wake-on-LAN to '{runner}' ({mac})");
+        Ok(())
     }
 
     /// Execute an operator command on the main timeline. See
@@ -557,6 +647,7 @@ impl Core {
             Command::SetLoop { loop_ns } => TransportChange::SetLoop(loop_ns),
             Command::LoadShow { document } => return self.load_show(document),
             Command::RunnerAction { runner, action } => return self.runner_action(&runner, action),
+            Command::WakeRunner { runner } => return self.wake_runner(&runner),
             // Answered by the connection that asked; nothing to change here.
             Command::Status => return Ok(()),
         };
@@ -827,6 +918,17 @@ impl Core {
             frame: self.frame_rate.frame_at(show_ns),
             show_revision: st.show.as_ref().map(|s| s.revision),
             nodes: st.nodes.values().cloned().collect(),
+            known_runners: st
+                .known_runners
+                .values()
+                .map(|k| KnownRunner {
+                    online: st
+                        .nodes
+                        .values()
+                        .any(|n| n.role == Role::Runner && n.name == k.name),
+                    ..k.clone()
+                })
+                .collect(),
         }
     }
 
@@ -882,6 +984,7 @@ impl Core {
             transport,
             tasks,
             show: st.show.clone(),
+            known_runners: st.known_runners.values().cloned().collect(),
         }
     }
 

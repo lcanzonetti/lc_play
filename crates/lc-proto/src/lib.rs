@@ -34,8 +34,8 @@ pub mod transport;
 
 pub use beacon::{Beacon, DISCOVERY_GROUP, DISCOVERY_PORT};
 pub use message::{
-    ClientMessage, ClusterStatus, Command, Health, Hello, MonitorInfo, NodeStatus, RunnerAction,
-    RunnerHello, ServerMessage, SyncQuality, Welcome,
+    ClientMessage, ClusterStatus, Command, Health, Hello, KnownRunner, MachineInfo, MonitorInfo,
+    NodeStatus, OutputPreview, RunnerAction, RunnerHello, ServerMessage, SyncQuality, Welcome,
 };
 pub use show::ShowDocument;
 pub use transport::{FrameRate, TransportState};
