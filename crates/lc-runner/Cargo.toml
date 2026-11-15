@@ -38,6 +38,7 @@ clap.workspace = true
 # Asset download (blocking, in a background thread). Plain HTTP only: the
 # Asset Manager lives on the show network.
 ureq = { version = "2", default-features = false }
+snap = "1.1.2"
 
 [dev-dependencies]
 # Integration tests run a real Director in-process next to several agents.

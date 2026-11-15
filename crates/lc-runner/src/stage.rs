@@ -30,11 +30,14 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
         .iter()
         .filter(|d| d.runner.is_empty() || d.runner == runner_name)
         .map(|d| Output {
-            id: if d.name.is_empty() {
-                d.id.clone()
-            } else {
+            // Matched by id across edits, so a display keeps its window
+            // when it is renamed.
+            id: if d.id.is_empty() {
                 d.name.clone()
+            } else {
+                d.id.clone()
             },
+            name: d.name.clone(),
             canvas_rect: Rect {
                 x: d.canvas_rect.x,
                 y: d.canvas_rect.y,
@@ -189,8 +192,10 @@ mod tests {
     #[test]
     fn a_runner_gets_its_own_displays_and_the_unassigned_ones() {
         let show = build(&doc(), "left", &cache());
-        let ids: Vec<&str> = show.outputs.iter().map(|o| o.id.as_str()).collect();
-        assert_eq!(ids, ["Left", "Any"], "not Right's, and not the invalid one");
+        let names: Vec<&str> = show.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Left", "Any"], "not Right's, and not the invalid one");
+        // Outputs are identified by the display's id, which survives renaming.
+        assert_eq!(show.outputs[0].id, "a");
         assert_eq!(build(&doc(), "nobody", &cache()).outputs.len(), 1);
     }
 

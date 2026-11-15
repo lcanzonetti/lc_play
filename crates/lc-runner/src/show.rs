@@ -36,6 +36,9 @@ pub struct Canvas {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Output {
     pub id: String,
+    /// Name shown to people (window title); the id if empty.
+    #[serde(default)]
+    pub name: String,
     /// The region of the canvas this output renders.
     pub canvas_rect: Rect,
     /// Window placement on the host machine.

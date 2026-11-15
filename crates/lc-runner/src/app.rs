@@ -34,7 +34,7 @@ use lc_proto::NANOS_PER_SEC;
 use lc_time::TransportChange;
 
 use crate::assets::AssetCache;
-use crate::content::{self, Content, TextureFactory};
+use crate::content::{self, Content};
 use crate::playhead::Playhead;
 use crate::render::{Gpu, OutputGpu};
 use crate::show::{Canvas, Output, Playback, Show};
@@ -60,6 +60,8 @@ struct RenderWindow {
     gpu: OutputGpu,
     /// Index into `show.outputs`.
     output_idx: usize,
+    /// The output as it was last applied to this window.
+    output: Output,
 }
 
 pub struct App {
@@ -246,7 +248,7 @@ impl App {
         // Windows are expensive and visible: touch them only if the displays
         // changed. Moving a cue must not make every output blink.
         if show.outputs != self.window_outputs {
-            if let Err(e) = self.rebuild_windows(event_loop, &show) {
+            if let Err(e) = self.sync_windows(event_loop, &show) {
                 tracing::error!("cannot set up the outputs: {e:#}");
                 self.windows.clear();
                 self.by_id.clear();
@@ -272,62 +274,102 @@ impl App {
         }
     }
 
-    /// Create one window (and its GPU state) per output of `show`.
-    fn rebuild_windows(&mut self, event_loop: &ActiveEventLoop, show: &Show) -> anyhow::Result<()> {
-        // Surfaces first, then their windows.
-        self.windows.clear();
+    /// Bring the windows in line with the outputs of `show`.
+    ///
+    /// A display that already has a window keeps it: a changed position,
+    /// size, fullscreen state or monitor is applied to the window, and a
+    /// changed warp, blend or rotation to its GPU state — the window is
+    /// never closed and reopened for an edit. (Closing and reopening every
+    /// output each time a display was nudged in the Producer made them
+    /// flicker and stall.) Only new displays get new windows, and removed
+    /// ones are closed.
+    fn sync_windows(&mut self, event_loop: &ActiveEventLoop, show: &Show) -> anyhow::Result<()> {
+        let mut existing: HashMap<String, RenderWindow> = self
+            .windows
+            .drain(..)
+            .map(|rw| (rw.output.id.clone(), rw))
+            .collect();
         self.by_id.clear();
         self.window_outputs.clear();
 
-        let mut created: Vec<Arc<Window>> = Vec::with_capacity(show.outputs.len());
-        for output in &show.outputs {
-            let attrs = window_attributes(output, event_loop);
-            created.push(Arc::new(event_loop.create_window(attrs)?));
-        }
-        let Some(first) = created.first() else {
-            self.playhead.update_hardware(|h| h.outputs = 0);
-            return Ok(()); // no outputs: nothing to draw on
-        };
-
-        // The GPU device is created once, against the first window ever
-        // opened, and then kept for the lifetime of the process.
-        let mut first_surface = None;
-        if self.gpu.is_none() {
-            let (gpu, surface) = Gpu::new(first.clone())?;
-            tracing::info!("GPU: {}", gpu.adapter_info());
-            self.gpu = Some(gpu);
-            first_surface = Some(surface);
-        }
-        let gpu = self.gpu.as_ref().expect("gpu was just ensured");
-
-        for (idx, window) in created.into_iter().enumerate() {
-            let surface = match first_surface.take() {
-                Some(s) => s, // reuse the surface created with the device
-                None => gpu.create_surface(window.clone())?,
+        for (idx, output) in show.outputs.iter().enumerate() {
+            let rw = match existing.remove(&output.id) {
+                Some(mut rw) => {
+                    if rw.output.window != output.window {
+                        apply_placement(&rw.window, output, event_loop);
+                    }
+                    if rw.output.name != output.name {
+                        rw.window.set_title(&window_title(output));
+                    }
+                    let geometry_changed = rw.output.warp != output.warp
+                        || rw.output.blend != output.blend
+                        || rw.output.rotation_degrees != output.rotation_degrees;
+                    if geometry_changed {
+                        if let Some(gpu) = &self.gpu {
+                            gpu.update_output(&mut rw.gpu, output);
+                        }
+                    }
+                    rw.output = output.clone();
+                    rw.output_idx = idx;
+                    rw
+                }
+                None => self.open_window(event_loop, output, idx, show.layers.len())?,
             };
-            let phys = window.inner_size();
-            let out_gpu = gpu.build_output(
-                surface,
-                phys.width,
-                phys.height,
-                &show.outputs[idx],
-                show.layers.len(),
-            );
-            self.by_id.insert(window.id(), self.windows.len());
-            self.windows.push(RenderWindow {
-                window,
-                gpu: out_gpu,
-                output_idx: idx,
+            self.by_id.insert(rw.window.id(), self.windows.len());
+            self.windows.push(rw);
+        }
+        // What is left in `existing` belongs to removed displays: dropping it
+        // closes those windows.
+        drop(existing);
+
+        self.window_outputs = show.outputs.clone();
+        if let Some(gpu) = &self.gpu {
+            let (gpu_name, outputs) = (gpu.adapter_info(), self.windows.len() as u32);
+            self.playhead.update_hardware(|h| {
+                h.gpu = Some(gpu_name);
+                h.outputs = outputs;
             });
         }
-        self.window_outputs = show.outputs.clone();
-        let (gpu_name, outputs) = (gpu.adapter_info(), self.windows.len() as u32);
-        self.playhead.update_hardware(|h| {
-            h.gpu = Some(gpu_name);
-            h.outputs = outputs;
-        });
         tracing::info!(outputs = self.windows.len(), "outputs ready");
         Ok(())
+    }
+
+    /// Open the window for one output, and its GPU state (bringing up the
+    /// GPU itself with the first window ever opened).
+    fn open_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        output: &Output,
+        idx: usize,
+        layer_count: usize,
+    ) -> anyhow::Result<RenderWindow> {
+        let window = Arc::new(event_loop.create_window(window_attributes(output, event_loop))?);
+        let surface = match &self.gpu {
+            Some(gpu) => gpu.create_surface(window.clone())?,
+            None => {
+                let (gpu, surface) = Gpu::new(window.clone())?;
+                tracing::info!(
+                    "GPU: {}{}",
+                    gpu.adapter_info(),
+                    if gpu.supports_bc() {
+                        ""
+                    } else {
+                        " — no BC texture support: HAP will be decoded in software"
+                    }
+                );
+                self.gpu = Some(gpu);
+                surface
+            }
+        };
+        let gpu = self.gpu.as_ref().expect("gpu was just ensured");
+        let phys = window.inner_size();
+        let out_gpu = gpu.build_output(surface, phys.width, phys.height, output, layer_count);
+        Ok(RenderWindow {
+            window,
+            gpu: out_gpu,
+            output_idx: idx,
+            output: output.clone(),
+        })
     }
 
     /// Load the content of every layer of `self.show`, keeping what was
@@ -342,13 +384,7 @@ impl App {
             self.content_keys.clear();
             return;
         };
-        let factory = TextureFactory {
-            device: &gpu.device,
-            queue: &gpu.queue,
-            layout: &gpu.texture_bgl,
-            sampler: &gpu.sampler,
-            max_dimension: gpu.max_texture_dimension(),
-        };
+        let factory = gpu.factory();
 
         // What is loaded now, by identity.
         let mut loaded: HashMap<String, Vec<Box<dyn Content>>> = HashMap::new();
@@ -431,6 +467,7 @@ impl App {
             })
             .collect();
 
+        let factory = gpu.factory();
         for ((layer, c), time) in self.show.layers.iter().zip(&mut self.contents).zip(&times) {
             let Some(t) = *time else {
                 c.idle(); // its timeline is off stage
@@ -452,12 +489,12 @@ impl App {
                 until_start += len;
             }
             if layer.timing.visible_at(t) {
-                c.update(media(t), &gpu.queue);
+                c.update(media(t), &factory);
             } else if (0.0..=PREROLL_S).contains(&until_start) {
                 // About to appear: get its first frame decoded and into the
                 // texture now, so the cue starts on its first frame instead
                 // of on whatever the decoder manages a moment later.
-                c.update(media(layer.timing.start), &gpu.queue);
+                c.update(media(layer.timing.start), &factory);
             } else {
                 // Off screen: an invisible video cue must not keep a decoder
                 // (an ffmpeg process and several frames of memory) around.
@@ -512,35 +549,69 @@ impl App {
 
 /// Build the winit window attributes for one output.
 fn window_attributes(
-    output: &crate::show::Output,
+    output: &Output,
     event_loop: &ActiveEventLoop,
 ) -> winit::window::WindowAttributes {
-    // Window geometry: explicit window size, else the canvas-rect size.
-    let size = output.window.size.unwrap_or([
-        output.canvas_rect.w.max(1.0) as u32,
-        output.canvas_rect.h.max(1.0) as u32,
-    ]);
+    let [w, h] = window_size(output);
     let mut attrs = Window::default_attributes()
-        .with_title(format!("lc-runner · {}", output.id))
-        .with_inner_size(PhysicalSize::new(size[0], size[1]));
-
+        .with_title(window_title(output))
+        .with_inner_size(PhysicalSize::new(w, h));
     if let Some([x, y]) = output.window.position {
         attrs = attrs.with_position(PhysicalPosition::new(x, y));
     }
-    if output.window.fullscreen {
-        let monitor = match output.window.monitor {
-            Some(i) => event_loop.available_monitors().nth(i).or_else(|| {
-                tracing::warn!(
-                    "output '{}': monitor {i} not found; using the primary monitor",
-                    output.id
-                );
-                event_loop.primary_monitor()
-            }),
-            None => event_loop.primary_monitor(),
-        };
-        attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(monitor)));
+    attrs.with_fullscreen(fullscreen_target(output, event_loop))
+}
+
+fn window_title(output: &Output) -> String {
+    let name = if output.name.is_empty() {
+        &output.id
+    } else {
+        &output.name
+    };
+    format!("LC Play · {name}")
+}
+
+/// Window size: the explicit one, else the size of the canvas area shown.
+fn window_size(output: &Output) -> [u32; 2] {
+    output.window.size.unwrap_or([
+        output.canvas_rect.w.max(1.0) as u32,
+        output.canvas_rect.h.max(1.0) as u32,
+    ])
+}
+
+/// Borderless fullscreen on the configured monitor, or `None` (windowed).
+fn fullscreen_target(output: &Output, event_loop: &ActiveEventLoop) -> Option<Fullscreen> {
+    if !output.window.fullscreen {
+        return None;
     }
-    attrs
+    let monitor = match output.window.monitor {
+        Some(i) => event_loop.available_monitors().nth(i).or_else(|| {
+            tracing::warn!(
+                "display '{}': monitor {i} not found (this machine has {}); using the primary monitor",
+                output.id,
+                event_loop.available_monitors().count()
+            );
+            event_loop.primary_monitor()
+        }),
+        None => event_loop.primary_monitor(),
+    };
+    Some(Fullscreen::Borderless(monitor))
+}
+
+/// Apply a changed window placement to an open window.
+fn apply_placement(window: &Window, output: &Output, event_loop: &ActiveEventLoop) {
+    let fullscreen = fullscreen_target(output, event_loop);
+    let going_windowed = fullscreen.is_none() && window.fullscreen().is_some();
+    window.set_fullscreen(fullscreen);
+    if !output.window.fullscreen {
+        let [w, h] = window_size(output);
+        let _ = window.request_inner_size(PhysicalSize::new(w, h));
+        if let Some([x, y]) = output.window.position {
+            window.set_outer_position(PhysicalPosition::new(x, y));
+        } else if going_windowed {
+            window.set_outer_position(PhysicalPosition::new(60, 60));
+        }
+    }
 }
 
 impl ApplicationHandler for App {

@@ -24,7 +24,7 @@ use glam::{Mat3, Vec2, Vec3};
 use wgpu::util::DeviceExt as _;
 use winit::window::Window;
 
-use crate::content::Content;
+use crate::content::{Content, TextureFactory};
 use crate::show::{Output, Show};
 
 /// Offscreen "canvas slice" format. sRGB so shader math stays in linear space.
@@ -39,7 +39,9 @@ const WARP_GRID: u32 = 16;
 struct SceneUniform {
     mvp: [[f32; 4]; 4],
     opacity: f32,
-    _pad: [f32; 3],
+    /// How the layer's texture(s) encode its pixels; see `Sampling`.
+    mode: u32,
+    uv_scale: [f32; 2],
 }
 
 #[repr(C)]
@@ -117,15 +119,27 @@ pub struct Gpu {
 impl Gpu {
     /// Create the device from a first surface and build all pipelines.
     pub fn new(first_window: Arc<Window>) -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(first_window)?;
-
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter found"))?;
+        // Try the preferred graphics API first, then any.
+        let mut found = None;
+        for backends in [preferred_backends(), wgpu::Backends::all()] {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends,
+                ..Default::default()
+            });
+            let surface = instance.create_surface(first_window.clone())?;
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                }));
+            if let Some(adapter) = adapter {
+                found = Some((instance, surface, adapter));
+                break;
+            }
+        }
+        let (instance, surface, adapter) =
+            found.ok_or_else(|| anyhow::anyhow!("no suitable GPU adapter found"))?;
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -157,10 +171,14 @@ impl Gpu {
         // Request the adapter's real limits rather than the conservative
         // defaults (8192px max texture): canvas-spanning content such as a
         // 3×4K panorama needs the full size the GPU supports.
+        // Block-compressed textures (BC1/BC3/BC7) are what HAP video is made
+        // of: with them the GPU decodes HAP itself. Every desktop GPU has
+        // them; without, HAP falls back to the (slow) ffmpeg path.
+        let features = adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("lc-runner-device"),
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
             },
@@ -185,25 +203,30 @@ impl Gpu {
             label: Some("blend-bgl"),
             entries: &[uniform_entry(wgpu::ShaderStages::FRAGMENT)],
         });
+        // Up to three texture planes (RGBA uses the first; YUV all three)
+        // and a sampler. Single-plane content binds its texture three times.
+        let plane = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                plane(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                plane(2),
+                plane(3),
             ],
         });
 
@@ -384,29 +407,7 @@ impl Gpu {
 
         // Warp mesh + blend uniform for this output.
         let (warp_vbo, warp_ibo, warp_index_count) = self.make_warp_mesh(output);
-        let blend = BlendUniform {
-            left: output.blend.left,
-            right: output.blend.right,
-            top: output.blend.top,
-            bottom: output.blend.bottom,
-            gamma_exp: 2.2 / output.blend.gamma,
-            _pad: [0.0; 3],
-        };
-        let blend_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blend-uniform"),
-                contents: bytemuck::bytes_of(&blend),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let blend_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blend-bg"),
-            layout: &self.blend_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: blend_buf.as_entire_binding(),
-            }],
-        });
+        let (blend_buf, blend_bg) = self.make_blend(output);
 
         OutputResources {
             rotated,
@@ -420,6 +421,52 @@ impl Gpu {
             warp_index_count,
             _blend_buf: blend_buf,
             blend_bg,
+        }
+    }
+
+    fn make_blend(&self, output: &Output) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let blend = BlendUniform {
+            left: output.blend.left,
+            right: output.blend.right,
+            top: output.blend.top,
+            bottom: output.blend.bottom,
+            gamma_exp: 2.2 / output.blend.gamma,
+            _pad: [0.0; 3],
+        };
+        let buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blend-uniform"),
+                contents: bytemuck::bytes_of(&blend),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blend-bg"),
+            layout: &self.blend_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        });
+        (buf, bg)
+    }
+
+    /// Apply an edited output's geometry — warp, blend, rotation — to its GPU
+    /// state in place. (Which part of the canvas it shows is read every
+    /// frame anyway.) Far cheaper, and invisible, compared with closing and
+    /// reopening its window.
+    pub fn update_output(&self, out: &mut OutputGpu, output: &Output) {
+        let res = &mut out.res;
+        (res.warp_vbo, res.warp_ibo, res.warp_index_count) = self.make_warp_mesh(output);
+        (res._blend_buf, res.blend_bg) = self.make_blend(output);
+        let rotated = matches!(output.rotation_degrees, 90 | 270);
+        if rotated != res.rotated {
+            res.rotated = rotated;
+            let (tex, view, bg) =
+                self.make_scene_target(out.config.width, out.config.height, rotated);
+            res._scene_tex = tex;
+            res.scene_view = view;
+            res.scene_bg = bg;
         }
     }
 
@@ -486,16 +533,7 @@ impl Gpu {
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene-slice-bg"),
             layout: &self.texture_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
+            entries: &plane_entries([&view, &view, &view], &self.sampler),
         });
         (tex, view, bg)
     }
@@ -606,11 +644,13 @@ impl Gpu {
         // Per-layer uniforms for this output (staged; applied at submit).
         for i in visible() {
             let t = &show.layers[i].transform;
+            let sampling = contents[i].sampling();
             let u = SceneUniform {
                 mvp: (view_proj * t.model_matrix()).to_cols_array_2d(),
                 // The cue's own opacity times its fade in/out at this instant.
                 opacity: t.opacity * show.layers[i].timing.fade_at(times[i].unwrap_or(0.0)),
-                _pad: [0.0; 3],
+                mode: sampling.mode as u32,
+                uv_scale: sampling.uv_scale,
             };
             self.queue
                 .write_buffer(&out.layer_uniforms[i], 0, bytemuck::bytes_of(&u));
@@ -680,6 +720,26 @@ impl Gpu {
         format!("{} ({:?})", info.name, info.backend)
     }
 
+    /// What content needs to create and fill its textures.
+    pub fn factory(&self) -> TextureFactory<'_> {
+        TextureFactory {
+            device: &self.device,
+            queue: &self.queue,
+            layout: &self.texture_bgl,
+            sampler: &self.sampler,
+            max_dimension: self.max_texture_dimension(),
+            supports_bc: self.supports_bc(),
+        }
+    }
+
+    /// Whether the GPU samples block-compressed (BCn) textures — the
+    /// precondition for GPU-decoded HAP.
+    pub fn supports_bc(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+    }
+
     /// Largest texture edge this device accepts.
     pub fn max_texture_dimension(&self) -> u32 {
         self.device.limits().max_texture_dimension_2d
@@ -747,6 +807,52 @@ fn warp_mesh(output: &Output) -> (Vec<WarpVertex>, Vec<u32>) {
         }
     }
     (verts, indices)
+}
+
+/// The bind-group entries for three texture planes and a sampler, in the
+/// order of `texture_bgl`.
+pub fn plane_entries<'a>(
+    planes: [&'a wgpu::TextureView; 3],
+    sampler: &'a wgpu::Sampler,
+) -> [wgpu::BindGroupEntry<'a>; 4] {
+    [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(planes[0]),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::Sampler(sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::TextureView(planes[1]),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::TextureView(planes[2]),
+        },
+    ]
+}
+
+/// The graphics APIs tried first. On Windows that is Direct3D 12: it is the
+/// native path for presenting to windows there, and copes with laptops whose
+/// screen is wired to the integrated GPU while rendering happens on the
+/// discrete one (NVIDIA Optimus) better than Vulkan does. Elsewhere: Vulkan
+/// or Metal. `LCPLAY_BACKEND` (dx12, vulkan, metal, gl) overrides.
+fn preferred_backends() -> wgpu::Backends {
+    match std::env::var("LCPLAY_BACKEND")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "dx12" => wgpu::Backends::DX12,
+        "vulkan" => wgpu::Backends::VULKAN,
+        "metal" => wgpu::Backends::METAL,
+        "gl" => wgpu::Backends::GL,
+        _ if cfg!(windows) => wgpu::Backends::DX12,
+        _ => wgpu::Backends::PRIMARY,
+    }
 }
 
 /// Per-output GPU state: the window surface plus its render resources.
@@ -820,7 +926,7 @@ mod tests {
     // the pixels back. They need a GPU adapter; a software one (Mesa lavapipe)
     // is enough. Without any adapter they skip rather than fail.
 
-    use crate::content::{self, srgb_to_linear, TextureFactory};
+    use crate::content::{self, srgb_to_linear};
 
     fn gpu_or_skip() -> Option<Gpu> {
         let gpu = Gpu::headless();
@@ -834,18 +940,24 @@ mod tests {
     /// return its pixels as linear RGB. `w` must be a multiple of 64 (row
     /// alignment for the readback copy).
     fn render_offscreen(gpu: &Gpu, show: &Show, idx: usize, w: u32, h: u32) -> Vec<[f32; 3]> {
-        let factory = TextureFactory {
-            device: &gpu.device,
-            queue: &gpu.queue,
-            layout: &gpu.texture_bgl,
-            sampler: &gpu.sampler,
-            max_dimension: gpu.max_texture_dimension(),
-        };
+        let factory = gpu.factory();
         let contents: Vec<_> = show
             .layers
             .iter()
             .map(|l| content::build(l, &factory).unwrap())
             .collect();
+        render_contents(gpu, show, idx, w, h, &contents)
+    }
+
+    /// Render one output of `show` with the given (already built) contents.
+    fn render_contents(
+        gpu: &Gpu,
+        show: &Show,
+        idx: usize,
+        w: u32,
+        h: u32,
+        contents: &[Box<dyn Content>],
+    ) -> Vec<[f32; 3]> {
         let order: Vec<usize> = (0..show.layers.len()).collect();
         let output = &show.outputs[idx];
         let res = gpu.build_resources(w, h, output, show.layers.len());
@@ -877,7 +989,7 @@ mod tests {
         // Every layer at show time 0, as on a single main timeline.
         let times = vec![Some(0.0); show.layers.len()];
         gpu.encode_output(
-            &mut enc, &view, &res, output, show, &times, &contents, &order,
+            &mut enc, &view, &res, output, show, &times, contents, &order,
         );
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -910,6 +1022,103 @@ mod tests {
             .iter()
             .map(|p| [lin(p[0]), lin(p[1]), lin(p[2])])
             .collect()
+    }
+
+    /// A 64×64 canvas with one full-canvas video layer showing `path`.
+    fn video_show(path: &str) -> Show {
+        let json = serde_json::json!({
+            "canvas": { "width": 64, "height": 64 },
+            "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 64, "h": 64 } } ],
+            "layers": [ { "id": "v", "source": { "type": "video", "path": path },
+                          "transform": { "position": [32, 32], "size": [64, 64] } } ]
+        });
+        Show::from_json(&json.to_string()).unwrap()
+    }
+
+    /// Encode a 2 s solid-colour clip with ffmpeg; `None` if that fails.
+    fn solid_clip(
+        dir: &std::path::Path,
+        name: &str,
+        colour: &str,
+        codec: &[&str],
+    ) -> Option<String> {
+        let path = dir.join(name);
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("color={colour}:s=64x64:r=10:d=2"))
+            .args(codec)
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then(|| path.to_string_lossy().into_owned())
+    }
+
+    /// Render until the centre pixel stops being black (content loads and
+    /// decodes asynchronously), or give up after a few seconds.
+    fn render_when_loaded(gpu: &Gpu, show: &Show) -> [f32; 3] {
+        let factory = gpu.factory();
+        let mut contents: Vec<_> = show
+            .layers
+            .iter()
+            .map(|l| content::build(l, &factory).unwrap())
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            for c in &mut contents {
+                c.update(0.5, &factory);
+            }
+            let px = render_contents(gpu, show, 0, 64, 64, &contents)[32 * 64 + 32];
+            if px.iter().any(|&v| v > 0.01) || std::time::Instant::now() > deadline {
+                return px;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn assert_close(got: [f32; 3], want_srgb: [u8; 3], tolerance: f32, what: &str) {
+        let want = want_srgb.map(|b| srgb_to_linear(b as f32 / 255.0));
+        let ok = got
+            .iter()
+            .zip(&want)
+            .all(|(g, w)| (g - w).abs() <= tolerance);
+        assert!(ok, "{what}: got linear {got:?}, expected about {want:?}");
+    }
+
+    /// The whole GPU video path, end to end: a file → decoder → textures →
+    /// the scene shader's conversion → the right colour on the output.
+    #[test]
+    fn video_frames_reach_the_output_in_the_right_colours() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        let dir = std::env::temp_dir().join(format!("lcplay-gpu-video-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An orange: different in every channel, mid-range in all.
+        let (colour, srgb) = ("0xE08030", [0xE0, 0x80, 0x30]);
+
+        // YUV through ffmpeg (H.264). Video is limited-range 8-bit YUV, so a
+        // little rounding is expected.
+        let Some(h264) = solid_clip(&dir, "c.mp4", colour, &["-pix_fmt", "yuv420p"]) else {
+            eprintln!("SKIPPED: ffmpeg not available");
+            return;
+        };
+        let px = render_when_loaded(&gpu, &video_show(&h264));
+        assert_close(px, srgb, 0.03, "H.264 via YUV planes");
+
+        // HAP decoded by the GPU (BC textures), if this GPU samples them.
+        if !gpu.supports_bc() {
+            eprintln!("SKIPPED (HAP part): no BC texture support on this adapter");
+            return;
+        }
+        for (format, tolerance) in [("hap", 0.04), ("hap_alpha", 0.04), ("hap_q", 0.04)] {
+            let name = format!("{format}.mov");
+            let codec = ["-c:v", "hap", "-format", format];
+            let Some(path) = solid_clip(&dir, &name, colour, &codec) else {
+                eprintln!("SKIPPED (HAP part): no HAP encoder");
+                return;
+            };
+            let px = render_when_loaded(&gpu, &video_show(&path));
+            assert_close(px, srgb, tolerance, format);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

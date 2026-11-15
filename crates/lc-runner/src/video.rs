@@ -1,16 +1,28 @@
-//! Video playback: an `ffmpeg` child process decodes, this module keeps its
-//! output in step with the show clock.
+//! Video playback for everything that is not GPU-native HAP: an `ffmpeg`
+//! child process decodes, this module keeps its output in step with the
+//! show clock.
 //!
 //! ## Why a child process
 //!
 //! `ffmpeg` on the `PATH` is the one decoder that exists on every platform,
 //! reads every format an operator will throw at it, and needs no native
-//! libraries at build time. It writes raw RGBA frames to a pipe; we read
-//! them. The cost is a memory copy per frame (about 8 MB at 1080p), which is
-//! fine for a first working system and the wrong answer for a 4K60 wall — a
-//! GPU-decoded codec (HAP, or hardware H.264/HEVC) replaces [`Decoder`]
-//! without touching anything else. *This is a correctness-first
-//! implementation, not a performance one.*
+//! libraries at build time.
+//!
+//! ## Keeping it fast
+//!
+//! * **Hardware decoding.** ffmpeg is started with `-hwaccel auto`: H.264,
+//!   HEVC, VP9, AV1 … are decoded by the GPU's video engine (NVDEC, Quick
+//!   Sync, D3D11VA, VideoToolbox) where the machine has one, and in software
+//!   otherwise. `LCPLAY_HWACCEL=none` turns it off.
+//! * **YUV, not RGB.** Video is stored as YUV 4:2:0; converting it to RGBA on
+//!   the CPU is expensive and makes every frame 2.7× larger. Frames therefore
+//!   leave ffmpeg as three YUV planes (1.5 bytes per pixel) and the GPU
+//!   converts them while drawing (see `shaders/scene.wgsl`). Only video with
+//!   an alpha channel travels as RGBA.
+//!
+//! What remains is one copy per frame through a pipe and into a texture —
+//! fine for a few HD or 4K layers. For very large canvases, HAP
+//! ([`crate::hap`]) is the format to use.
 //!
 //! ## How it stays in sync
 //!
@@ -18,21 +30,19 @@
 //! says what show time it is; that maps to an exact frame number in the file
 //! (`frame = floor(media_time × fps)`), and the decoder's sequential output
 //! is advanced until that frame comes out. Frames the show clock has already
-//! passed are dropped; if the wanted frame is not decoded yet, the previous
-//! one stays up. Two Runners given the same show time therefore show the
-//! same frame of the same file, however differently their decoders are
-//! scheduled.
+//! passed are skipped; if the wanted frame is not decoded yet, the newest one
+//! available is shown. Two Runners given the same show time therefore show
+//! the same frame of the same file, as long as their decoders keep up.
 //!
 //! A jump (seek, loop, scrubbing) restarts `ffmpeg` at the new position.
 
 use std::io::Read;
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 
 use anyhow::Context as _;
 
-use crate::content::{Content, StaticContent, TextureFactory};
+use crate::content::{Content, Encoding, Sampling, TextureFactory};
 use crate::show::Timing;
 
 /// Shortest time between two decoder restarts of one layer.
@@ -50,6 +60,46 @@ fn ffprobe_bin() -> String {
     std::env::var("LCPLAY_FFPROBE").unwrap_or_else(|_| "ffprobe".into())
 }
 
+/// A command that does not open a console window on Windows (the Runner is
+/// a windowed program; every ffmpeg it starts would otherwise flash one).
+fn quiet_command(program: String) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// The frame of a file that belongs on screen at time `t`.
+///
+/// `t` is the layer's timeline time — or, for a free-running layer, cluster
+/// time in seconds: the clip then loops on the cluster clock, identically on
+/// every Runner, whatever the timeline does. `frames` is the file's length
+/// in frames, if known.
+pub(crate) fn media_frame(timing: &Timing, fps: f64, frames: Option<i64>, t: f64) -> i64 {
+    let first = (timing.media_in.max(0.0) * fps).floor() as i64;
+    let since = if timing.free_run { t } else { t - timing.start };
+    let elapsed = (since.max(0.0) * fps).floor() as i64;
+    match frames {
+        Some(total) if total > first => {
+            if timing.media_loop || timing.free_run {
+                first + elapsed % (total - first)
+            } else {
+                // Past the end: hold the last frame.
+                (first + elapsed).min(total - 1)
+            }
+        }
+        // Length unknown: a free-running clip cannot be looped (cluster time
+        // is far beyond any file), so it holds its first frame.
+        _ if timing.free_run => first,
+        _ => first + elapsed,
+    }
+}
+
 /// What we need to know about a file before decoding it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoInfo {
@@ -62,6 +112,8 @@ pub struct VideoInfo {
     pub frames: Option<i64>,
     /// The pixel format has an alpha channel.
     pub has_alpha: bool,
+    /// Colour matrix: BT.601 (standard definition) rather than BT.709.
+    pub bt601: bool,
 }
 
 impl VideoInfo {
@@ -71,11 +123,11 @@ impl VideoInfo {
 
     /// Ask `ffprobe` about the first video stream of `path`.
     pub fn probe(path: &str) -> anyhow::Result<VideoInfo> {
-        let out = Command::new(ffprobe_bin())
+        let out = quiet_command(ffprobe_bin())
             .args(["-v", "error", "-select_streams", "v:0"])
             .args([
                 "-show_entries",
-                "stream=width,height,r_frame_rate,pix_fmt:format=duration",
+                "stream=width,height,r_frame_rate,pix_fmt,color_space:format=duration",
             ])
             .args(["-of", "json", path])
             .stdin(Stdio::null())
@@ -110,17 +162,51 @@ impl VideoInfo {
             .and_then(|d| d.parse().ok())
             .filter(|d: &f64| d.is_finite() && *d > 0.0);
         let pix_fmt = stream["pix_fmt"].as_str().unwrap_or("");
+        let height = dim("height")?;
+        // Tagged colour space if there is one, else the convention: HD and
+        // above is BT.709, standard definition BT.601.
+        let bt601 = match stream["color_space"].as_str().unwrap_or("") {
+            "bt709" => false,
+            "smpte170m" | "bt470bg" => true,
+            _ => height < 720,
+        };
         Ok(VideoInfo {
             width: dim("width")?,
-            height: dim("height")?,
+            height,
             fps_num,
             fps_den,
             frames: duration
                 .map(|d| (d * fps_num as f64 / fps_den as f64).round() as i64)
                 .filter(|&f| f > 0),
             // yuva420p, rgba, bgra, argb, gbrap, ya8 …
-            has_alpha: pix_fmt.contains('a') && !pix_fmt.starts_with("gray"),
+            has_alpha: matches!(
+                pix_fmt,
+                "rgba" | "bgra" | "argb" | "abgr" | "ya8" | "ya16le" | "ya16be"
+            ) || pix_fmt.starts_with("yuva")
+                || pix_fmt.starts_with("gbrap")
+                || pix_fmt.starts_with("rgba64")
+                || pix_fmt.starts_with("bgra64"),
+            bt601,
         })
+    }
+}
+
+/// How decoded frames are laid out in the pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// RGBA, premultiplied, 4 bytes per pixel.
+    Rgba,
+    /// Planar YUV 4:2:0: Y (w×h), U and V (⌈w/2⌉×⌈h/2⌉ each).
+    Yuv420,
+}
+
+impl Layout {
+    fn frame_len(self, w: u32, h: u32) -> usize {
+        let (w, h) = (w as usize, h as usize);
+        match self {
+            Layout::Rgba => w * h * 4,
+            Layout::Yuv420 => w * h + 2 * w.div_ceil(2) * h.div_ceil(2),
+        }
     }
 }
 
@@ -136,36 +222,49 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Start decoding `path` at frame `start_frame`, scaled to
-    /// `width × height` (the texture size).
+    /// Start decoding `path` at frame `start_frame`, at `width × height`.
     pub fn start(
         path: &str,
         info: &VideoInfo,
+        layout: Layout,
         width: u32,
         height: u32,
         start_frame: i64,
     ) -> anyhow::Result<Decoder> {
         let start_s = start_frame as f64 * info.fps_den as f64 / info.fps_num as f64;
         // `fps=` makes the output strictly constant-rate, so "the n-th frame
-        // out of the pipe" is a well-defined point in time. Renderer textures
-        // are premultiplied; files with alpha are straight.
-        let mut filter = format!(
-            "fps={}/{},scale={width}:{height}",
-            info.fps_num, info.fps_den
-        );
-        if info.has_alpha {
-            filter.push_str(",format=rgba,premultiply=inplace=1");
+        // out of the pipe" is a well-defined point in time.
+        let mut filter = format!("fps={}/{}", info.fps_num, info.fps_den);
+        if (width, height) != (info.width, info.height) {
+            filter.push_str(&format!(",scale={width}:{height}"));
         }
-        let mut child = Command::new(ffmpeg_bin())
-            // No auto-rotation: ffprobe reports the stored size, and the
-            // frames must come out at exactly that size (phone footage with
-            // a rotation flag would otherwise be squashed).
-            .args(["-v", "error", "-nostdin", "-noautorotate"])
+        let pix_fmt = match layout {
+            // Renderer textures are premultiplied; files with alpha are
+            // straight.
+            Layout::Rgba => {
+                filter.push_str(",format=rgba,premultiply=inplace=1");
+                "rgba"
+            }
+            Layout::Yuv420 => {
+                filter.push_str(",format=yuv420p");
+                "yuv420p"
+            }
+        };
+        let mut command = quiet_command(ffmpeg_bin());
+        // No auto-rotation: ffprobe reports the stored size, and the frames
+        // must come out at exactly that size.
+        command.args(["-v", "error", "-nostdin", "-noautorotate"]);
+        if std::env::var("LCPLAY_HWACCEL").map_or(true, |v| v != "none") {
+            // Decode on the GPU's video engine where there is one; ffmpeg
+            // falls back to software by itself when there is not.
+            command.args(["-hwaccel", "auto"]);
+        }
+        let mut child = command
             // Before `-i`: seek in the input. ffmpeg then decodes from the
             // preceding keyframe and discards up to the exact position.
             .args(["-ss", &format!("{start_s:.6}"), "-i", path])
             .args(["-an", "-sn", "-vf", &filter])
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+            .args(["-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -173,7 +272,7 @@ impl Decoder {
             .context("starting ffmpeg (is it installed and on the PATH?)")?;
         let mut stdout = child.stdout.take().expect("stdout was piped");
 
-        let frame_len = width as usize * height as usize * 4;
+        let frame_len = layout.frame_len(width, height);
         let (tx, frames) = sync_channel::<Vec<u8>>(QUEUE_FRAMES);
         let (recycle, recycled) = sync_channel::<Vec<u8>>(QUEUE_FRAMES + 2);
         std::thread::Builder::new()
@@ -230,13 +329,17 @@ impl Drop for Decoder {
     }
 }
 
-/// A video layer's content: a texture that follows the show clock.
+/// A video layer played through ffmpeg.
 pub struct VideoContent {
     path: String,
     info: VideoInfo,
-    /// Texture size (the file's size, scaled down if the GPU needs it).
+    layout: Layout,
+    /// Decoded size (the file's, scaled down if the GPU needs it).
     size: (u32, u32),
-    target: StaticContent,
+    /// One texture (RGBA) or three (Y, U, V).
+    planes: Vec<wgpu::Texture>,
+    bind_group: wgpu::BindGroup,
+    sampling: Sampling,
     timing: Timing,
     decoder: Option<Decoder>,
     /// A second decoder started shortly before a loop point, already
@@ -250,81 +353,95 @@ pub struct VideoContent {
 }
 
 impl VideoContent {
-    pub fn open(path: &str, timing: &Timing, factory: &TextureFactory) -> anyhow::Result<Self> {
-        if !Path::new(path).is_file() {
-            anyhow::bail!("video file '{path}' not found");
-        }
-        let info = VideoInfo::probe(path)?;
+    /// Set up textures for a probed file. Fast: decoding starts on the first
+    /// `update`.
+    pub fn new(path: &str, info: VideoInfo, timing: &Timing, gpu: &TextureFactory) -> Self {
         // Stay within the GPU's texture limit, keeping the aspect.
-        let max = factory.max_dimension as f64;
+        let max = gpu.max_dimension as f64;
         let k = (max / info.width as f64)
             .min(max / info.height as f64)
             .min(1.0);
-        let size = (
-            ((info.width as f64 * k) as u32).max(1),
-            ((info.height as f64 * k) as u32).max(1),
+        let even = |v: f64| (((v as u32) / 2) * 2).max(2);
+        let size = if k < 1.0 {
+            (even(info.width as f64 * k), even(info.height as f64 * k))
+        } else {
+            (info.width, info.height)
+        };
+        let layout = if info.has_alpha {
+            Layout::Rgba
+        } else {
+            Layout::Yuv420
+        };
+        let (w, h) = size;
+        let (planes, sampling) = match layout {
+            Layout::Rgba => (
+                vec![gpu.texture(path, w, h, wgpu::TextureFormat::Rgba8UnormSrgb)],
+                Sampling::default(),
+            ),
+            Layout::Yuv420 => {
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let r8 = wgpu::TextureFormat::R8Unorm;
+                (
+                    vec![
+                        gpu.texture(path, w, h, r8),
+                        gpu.texture(path, cw, ch, r8),
+                        gpu.texture(path, cw, ch, r8),
+                    ],
+                    Sampling {
+                        mode: if info.bt601 {
+                            Encoding::Yuv601
+                        } else {
+                            Encoding::Yuv709
+                        },
+                        uv_scale: [1.0, 1.0],
+                    },
+                )
+            }
+        };
+        let bind_group = gpu.bind(
+            path,
+            [
+                &planes[0],
+                &planes[planes.len().min(2) - 1],
+                &planes[planes.len() - 1],
+            ],
         );
-        // Black until the first frame arrives.
-        let black = vec![0u8; size.0 as usize * size.1 as usize * 4];
-        let target = factory.upload_rgba8(path, size.0, size.1, &black);
         tracing::info!(
-            "video '{path}': {}x{} at {:.3} fps{}",
+            "video '{path}': {}x{} at {:.3} fps, {} — decoded by ffmpeg",
             info.width,
             info.height,
             info.fps(),
-            if info.has_alpha { ", with alpha" } else { "" }
+            if info.has_alpha {
+                "with alpha (RGBA)"
+            } else {
+                "YUV 4:2:0"
+            }
         );
-        Ok(VideoContent {
+        VideoContent {
             path: path.to_string(),
             info,
+            layout,
             size,
-            target,
+            planes,
+            bind_group,
+            sampling,
             timing: timing.clone(),
             decoder: None,
             standby: None,
             shown: None,
             last_start: None,
             failed: false,
-        })
+        }
     }
 
-    /// First frame of the cue (its in-point), as a frame index.
     fn first_frame(&self) -> i64 {
         (self.timing.media_in.max(0.0) * self.info.fps()).floor() as i64
     }
 
-    /// The frame of the file that belongs on screen at time `t`.
-    ///
-    /// `t` is the layer's timeline time — or, for a free-running layer,
-    /// cluster time in seconds: the clip then loops on the cluster clock,
-    /// identically on every Runner, whatever the timeline does.
-    fn frame_at(&self, t: f64) -> i64 {
-        let first = self.first_frame();
-        let since = if self.timing.free_run {
-            t
-        } else {
-            t - self.timing.start
-        };
-        let elapsed = (since.max(0.0) * self.info.fps()).floor() as i64;
-        match self.info.frames {
-            Some(total) if total > first => {
-                if self.timing.media_loop || self.timing.free_run {
-                    first + elapsed % (total - first)
-                } else {
-                    // Past the end: hold the last frame.
-                    (first + elapsed).min(total - 1)
-                }
-            }
-            // Length unknown: a free-running clip cannot be looped (cluster
-            // time is far beyond any file), so it holds its first frame.
-            _ if self.timing.free_run => first,
-            _ => first + elapsed,
-        }
-    }
-
     fn start_decoder(&mut self, frame: i64) -> Option<Decoder> {
         self.last_start = Some(std::time::Instant::now());
-        match Decoder::start(&self.path, &self.info, self.size.0, self.size.1, frame) {
+        let (w, h) = self.size;
+        match Decoder::start(&self.path, &self.info, self.layout, w, h, frame) {
             Ok(d) => Some(d),
             Err(e) => {
                 // Report once; retrying 60 times a second would not help.
@@ -334,14 +451,57 @@ impl VideoContent {
             }
         }
     }
+
+    /// Copy one decoded frame into the texture plane(s).
+    fn upload(&self, frame: &[u8], queue: &wgpu::Queue) {
+        let (w, h) = self.size;
+        let write =
+            |texture: &wgpu::Texture, data: &[u8], bytes_per_pixel: u32, pw: u32, ph: u32| {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(pw * bytes_per_pixel),
+                        rows_per_image: Some(ph),
+                    },
+                    wgpu::Extent3d {
+                        width: pw,
+                        height: ph,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            };
+        match self.layout {
+            Layout::Rgba => write(&self.planes[0], frame, 4, w, h),
+            Layout::Yuv420 => {
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                let (y_len, c_len) = ((w * h) as usize, (cw * ch) as usize);
+                write(&self.planes[0], &frame[..y_len], 1, w, h);
+                write(&self.planes[1], &frame[y_len..y_len + c_len], 1, cw, ch);
+                write(
+                    &self.planes[2],
+                    &frame[y_len + c_len..y_len + 2 * c_len],
+                    1,
+                    cw,
+                    ch,
+                );
+            }
+        }
+    }
 }
 
 impl Content for VideoContent {
-    fn update(&mut self, t: f64, queue: &wgpu::Queue) {
+    fn update(&mut self, t: f64, gpu: &TextureFactory) {
         if self.failed {
             return;
         }
-        let want = self.frame_at(t);
+        let want = media_frame(&self.timing, self.info.fps(), self.info.frames, t);
         if self.shown == Some(want) {
             return;
         }
@@ -412,27 +572,11 @@ impl Content for VideoContent {
             }
         }
         if let Some((index, frame)) = chosen {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.target.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &frame,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.size.0 * 4),
-                    rows_per_image: Some(self.size.1),
-                },
-                wgpu::Extent3d {
-                    width: self.size.0,
-                    height: self.size.1,
-                    depth_or_array_layers: 1,
-                },
-            );
+            self.upload(&frame, gpu.queue);
             self.shown = Some(index);
-            decoder.give_back(frame);
+            if let Some(decoder) = self.decoder.as_ref() {
+                decoder.give_back(frame);
+            }
         }
     }
 
@@ -450,13 +594,22 @@ impl Content for VideoContent {
     }
 
     fn bind_group(&self) -> &wgpu::BindGroup {
-        &self.target.bind_group
+        &self.bind_group
+    }
+
+    fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    fn ready(&self) -> bool {
+        self.shown.is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// A 2 s, 10 fps, 64×48 test clip whose frames differ measurably: a black
     /// field with a white box that moves 4 px per frame.
@@ -464,7 +617,7 @@ mod tests {
         let path = dir.join("clip.mp4");
         let ok = Command::new(ffmpeg_bin())
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-            .arg("color=black:s=64x48:r=10:d=2,drawbox=x=4*n:y=0:w=4:h=48:color=white:t=fill")
+            .arg(r"color=black:s=64x48:r=10:d=2,format=yuv420p,geq=lum='if(between(X\,4*N\,4*N+3)\,255\,0)':cb=128:cr=128")
             .args(["-pix_fmt", "yuv420p", "-g", "5"])
             .arg(&path)
             .status()
@@ -473,11 +626,10 @@ mod tests {
         ok.then(|| path.to_string_lossy().into_owned())
     }
 
-    /// x position of the white box in a frame (None if there is none).
+    /// x position of the white box in a YUV frame: the first bright pixel
+    /// of row 24 of the Y plane.
     fn box_x(frame: &[u8]) -> Option<usize> {
-        // Row 24, RGBA: find the first bright pixel.
-        let row = &frame[24 * 64 * 4..25 * 64 * 4];
-        row.chunks(4).position(|px| px[0] > 128)
+        frame[24 * 64..25 * 64].iter().position(|&y| y > 128)
     }
 
     #[test]
@@ -494,23 +646,50 @@ mod tests {
         assert_eq!((info.fps_num, info.fps_den), (10, 1));
         assert_eq!(info.frames, Some(20));
         assert!(!info.has_alpha);
+        assert!(info.bt601, "untagged and below 720 lines: BT.601");
 
         // From the start: frames 0, 1, 2 with the box at 0, 4, 8.
-        let mut d = Decoder::start(&path, &info, 64, 48, 0).unwrap();
+        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0).unwrap();
         for expect in 0..3 {
             let (index, frame) = d.next_blocking().unwrap();
             assert_eq!(index, expect);
-            assert_eq!(frame.len(), 64 * 48 * 4);
+            assert_eq!(frame.len(), 64 * 48 + 2 * 32 * 24, "Y + U + V");
             assert_eq!(box_x(&frame), Some(4 * expect as usize), "frame {index}");
         }
 
         // Seek to frame 7 — not a keyframe (they are every 5): still exact.
-        let mut d = Decoder::start(&path, &info, 64, 48, 7).unwrap();
+        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 7).unwrap();
         let (index, frame) = d.next_blocking().unwrap();
         assert_eq!((index, box_x(&frame)), (7, Some(28)));
         let (index, frame) = d.next_blocking().unwrap();
         assert_eq!((index, box_x(&frame)), (8, Some(32)));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_frame_handles_loops_holds_and_free_run() {
+        let timing = Timing {
+            start: 10.0,
+            end: Some(30.0),
+            ..Default::default()
+        };
+        assert_eq!(media_frame(&timing, 10.0, Some(50), 12.0), 20);
+        assert_eq!(
+            media_frame(&timing, 10.0, Some(50), 25.0),
+            49,
+            "holds the last frame"
+        );
+        let looping = Timing {
+            media_loop: true,
+            ..timing.clone()
+        };
+        assert_eq!(media_frame(&looping, 10.0, Some(50), 16.0), 10);
+        let free = Timing {
+            free_run: true,
+            ..timing
+        };
+        assert_eq!(media_frame(&free, 10.0, Some(50), 1003.0), 30030 % 50);
+        assert_eq!(media_frame(&free, 10.0, None, 1003.0), 0);
     }
 }
