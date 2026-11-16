@@ -50,8 +50,8 @@ use lc_discovery::DiscoveryConfig;
 use lc_proto::show::{ControlAction, ControlCue, ShowDocument, MAIN_TIMELINE};
 use lc_proto::{
     Beacon, ClockId, ClusterStatus, Command, FrameRate, Health, Hello, KnownRunner, NodeId,
-    NodeStatus, OutputPreview, Role, RunnerHello, ServerMessage, TransportState, Welcome,
-    NANOS_PER_SEC, PROTOCOL_VERSION,
+    NodeStatus, OutputPreview, Role, RunnerHello, ServerMessage, TransportState, VblankGrid,
+    Welcome, NANOS_PER_SEC, PROTOCOL_VERSION,
 };
 use lc_time::{
     next_state, LocalClock, MasterClock, MonotonicClock, TransportChange, TransportTimeline,
@@ -221,7 +221,29 @@ struct State {
     /// Every Runner seen, by node id (two Runners may share a name): its
     /// name and machine, for listing it while offline and for Wake-on-LAN.
     known_runners: BTreeMap<String, KnownRunner>,
+    /// The refresh grid published to the Runners (see `lc_proto::vblank`).
+    grid: Option<PublishedGrid>,
 }
+
+/// The refresh grid as published, and where it came from.
+#[derive(Debug, Clone)]
+struct PublishedGrid {
+    grid: VblankGrid,
+    /// Node id of the Runner it was measured on.
+    source: NodeId,
+    /// Cluster time it was published.
+    at: i64,
+}
+
+/// A grid is re-measured when the reference Runner's refreshes have moved
+/// this far from it (clock drift between the house sync and the Director's
+/// clock accumulates slowly)…
+const GRID_MAX_OFFSET_NS: i64 = 200_000;
+/// …or its period by this much…
+const GRID_MAX_PERIOD_PPM: f64 = 2.0;
+/// …but not more often than this: each new grid is a (tiny) step in every
+/// Runner's timing.
+const GRID_MIN_INTERVAL_NS: i64 = 10 * NANOS_PER_SEC;
 
 impl Core {
     fn new(cfg: &DirectorConfig, sync_port: u16, persisted: Option<Persisted>) -> Self {
@@ -306,6 +328,7 @@ impl Core {
                 saved_transport,
                 saved_tasks,
                 known_runners,
+                grid: None,
             }),
             events: broadcast::channel(64).0,
             dirty: Notify::new(),
@@ -556,7 +579,11 @@ impl Core {
         node.clock_skew_ns = Some(skew);
         node.frame_error = frame_error;
         let (key, machine) = (node.node_id.0.clone(), health.machine.clone());
+        let reporter = node.node_id.clone();
         node.health = Some(health);
+        if let Some(grid) = self.update_grid(&mut st, &reporter) {
+            self.publish(ServerMessage::Grid { grid });
+        }
         // Remember the machine (its network address wakes it later).
         if let (Some(known), Some(machine)) = (st.known_runners.get_mut(&key), machine) {
             if known.machine.as_ref() != Some(&machine) {
@@ -564,6 +591,72 @@ impl Core {
                 self.dirty.notify_one();
             }
         }
+    }
+
+    /// The refresh grid in force, if any (sent to Runners as they connect).
+    pub fn grid(&self) -> Option<VblankGrid> {
+        self.state().grid.as_ref().map(|g| g.grid)
+    }
+
+    /// Keep the refresh grid in line with the reference Runner — the first
+    /// connected Runner, by node id, that reports its refresh, preferring one
+    /// that measures it from the driver's statistics. Called on every health
+    /// report; returns a grid to publish when one is due.
+    ///
+    /// A new grid takes effect `2 × lead` from now, on a grid line every
+    /// Runner identifies the same way (see `GridSchedule::snap`).
+    fn update_grid(&self, st: &mut State, reporter: &NodeId) -> Option<VblankGrid> {
+        let reference = st
+            .nodes
+            .values()
+            .filter(|n| n.role == Role::Runner)
+            .filter_map(|n| Some((n, n.health.as_ref()?.vblank?)))
+            .min_by_key(|(n, v)| (!v.exact, n.node_id.0.clone()))?;
+        if &reference.0.node_id != reporter {
+            return None;
+        }
+        let (source, report) = (reference.0.node_id.clone(), reference.1);
+        if report.period_ps <= 0 {
+            return None;
+        }
+        let now = self.clock.now_ns();
+        let due = match &st.grid {
+            None => true,
+            Some(p) if p.source != source => true,
+            Some(p) => {
+                let g = p.grid;
+                let off = report
+                    .vblank_ns
+                    .saturating_sub(g.instant(g.line_near(report.vblank_ns)));
+                let ppm = (report.period_ps - g.period_ps) as f64 / g.period_ps as f64 * 1e6;
+                (off.abs() > GRID_MAX_OFFSET_NS || ppm.abs() > GRID_MAX_PERIOD_PPM)
+                    && now.saturating_sub(p.at) >= GRID_MIN_INTERVAL_NS
+            }
+        };
+        if !due {
+            return None;
+        }
+        let grid = VblankGrid {
+            origin_ns: report.vblank_ns,
+            period_ps: report.period_ps,
+            valid_from_ns: now.saturating_add(2 * self.lead_ns),
+            generation: st.grid.as_ref().map_or(1, |p| p.grid.generation + 1),
+        };
+        if !grid.is_valid() {
+            return None;
+        }
+        tracing::info!(
+            source = %source.0,
+            hz = 1e12 / grid.period_ps as f64,
+            generation = grid.generation,
+            "refresh grid"
+        );
+        st.grid = Some(PublishedGrid {
+            grid,
+            source,
+            at: now,
+        });
+        Some(grid)
     }
 
     /// Forward a Runner's log to the Producers.
@@ -946,6 +1039,8 @@ impl Core {
             show_ns,
             frame: self.frame_rate.frame_at(show_ns),
             show_revision: st.show.as_ref().map(|s| s.revision),
+            grid: st.grid.as_ref().map(|g| g.grid),
+            grid_source: st.grid.as_ref().map(|g| g.source.clone()),
             nodes: st.nodes.values().cloned().collect(),
             known_runners: st
                 .known_runners

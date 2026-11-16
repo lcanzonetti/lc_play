@@ -145,15 +145,65 @@ Because there are no per-frame messages, there is nothing to lose: holdover
 needs no special mode, it is simply the same formula evaluated without new
 input.
 
-### 3.3 Presentation
+### 3.3 Presentation: render for the refresh the frame will appear on
 
-The renderer samples the playhead once per frame and draws every output from
-that one sample, in one GPU submission. `Playhead::position_at_local(t)`
-exists so the sample can be taken for the *predicted time of the next vertical
-blank* instead of "now". **Not yet used**: the renderer currently samples at
-render time, so it shows content up to one refresh period late — equally on
-all Runners, hence invisible as a sync error, but it is latency. Using vblank
-prediction is still to do.
+Frame lock (Quadro Sync) makes every display refresh at the same instants.
+Which *content* frame each Runner puts in front of that refresh is decided
+in software, and three things used to make Runners disagree by one frame:
+sampling the show clock when rendering starts rather than when the picture
+appears; a queue between the two whose depth depends on the machine; and
+rounding a slightly different instant on each Runner to a frame number right
+at a frame boundary. The renderer now works per refresh:
+
+1. **Refresh timing per output** (`vsync.rs`). A `RefreshClock` fits the
+   display's refresh train (`t(n) = phase + n × period`). On Windows/D3D12 the
+   observations are the driver's own (`GetFrameStatistics`: refresh counter
+   and the QPC time of a refresh) through LC Play's own DXGI swap chain
+   (`dxgi.rs`); elsewhere they are the moments the swap chain released the
+   render loop.
+2. **The target refresh.** After waiting for the swap chain, the frame will
+   reach refresh `next + latency − 1 + correction`, where `latency` is the
+   number of frames queued (`LCPLAY_FRAME_LATENCY`, default 2) and
+   `correction` is learnt from the driver's report of which refresh each
+   present actually reached (`PresentTracker`). Frames that land later than
+   that are counted as **missed**.
+3. **The refresh grid** (`lc_proto::vblank`). The Director publishes one
+   reference refresh instant and the refresh period (in picoseconds), measured
+   on one Runner (the first by node id, preferring driver-measured ones). Each
+   Runner rounds its target instant to the nearest grid line and uses *the
+   grid instant* — the same integer on every Runner — as the time the frame
+   is for. From there show time and frame index are integer arithmetic, so
+   frame-locked Runners compute exactly the same frame, whatever their clock
+   or measurement error (it only has to be under a quarter period). A Runner
+   whose refreshes are not on the grid (no frame lock, another refresh rate)
+   uses its own estimate. The Director re-measures the grid when the
+   reference drifts from it by 200 µs or 2 ppm (at most every 10 s); a new
+   grid takes effect on a grid line every Runner identifies identically.
+4. **NVIDIA present barrier.** Each output's swap chain joins NVIDIA's
+   present barrier when the GPU and driver support it (`nvapi.rs`, NVAPI
+   loaded from the driver at run time): the outputs of a machine — and with
+   frame lock, of every machine — flip on the same refresh, so a late
+   machine delays everyone by one refresh instead of showing a different
+   frame. Effective only in a borderless full-screen window without desktop
+   scaling or taskbar composition; its state (`client`, `system`, `cluster`)
+   is reported per output.
+5. **One device per graphics card.** Each output is rendered by the card its
+   monitor is connected to (matched through DXGI), so Windows never copies a
+   picture from one card to another (a frame of latency on that output only,
+   and no barrier). Contents are loaded per card, and a card only decodes
+   the layers that fall on its outputs. Laptops whose screens hang off the
+   integrated GPU keep rendering on the discrete one.
+
+Escape hatches, for a driver that misbehaves: `LCPLAY_SWAPCHAIN=wgpu` (wgpu's
+own presentation, no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0`.
+
+**[Not yet verified on frame-locked hardware.]** The pieces are unit-tested
+(grid arithmetic, refresh fitting, present tracking, the Director's grid
+selection) and run end to end on Linux, but the D3D12/NVAPI path has only
+been compiled, not run: it needs the show machines. The `sync_test` cue
+source and the per-output health (presenter, refresh rate, barrier state,
+grid offset, missed presents, late decodes, frame-lock counter) are there to
+verify it.
 
 ### 3.4 Measured, and not measured
 
@@ -445,7 +495,8 @@ Still to do, roughly in order of how much they limit real use:
 
 | Area | Missing |
 |---|---|
-| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); vblank-predicted sampling; audio. |
+| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); decoding shared between cards (today a layer spanning two cards is decoded on each); audio. |
+| Sync | Verification of §3.3 on frame-locked hardware; Vulkan present barrier (`VK_NV_present_barrier`) for non-D3D12 Runners. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
 | Authoring | Keyframes/tweens; a warp editor; control cues executed by Runners (so they work without the Director). |
 | Packaging | An installer; a launcher without a console window; the Producer preview is the web view's own video playback, not frame-exact. |

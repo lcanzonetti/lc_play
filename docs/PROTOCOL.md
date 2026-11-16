@@ -42,7 +42,12 @@ least every 6 s (`ping` or `health`), or it is dropped.
 { "type": "health", "cluster_ns": 0, "show_ns": 0, "frame": 0, "transport_epoch": 2,
   "show_revision": 3, "fps": 59.9,
   "sync": { "locked": true, "samples": 64, "offset_ns": 0, "drift_ppm": -3.1,
-            "rtt_ns": 180000, "error_ns": 21000, "holdover_ns": 400000000 } }
+            "rtt_ns": 180000, "error_ns": 21000, "holdover_ns": 400000000 },
+  "vblank": { "vblank_ns": 98765000000, "period_ps": 16683333333, "exact": true },
+  "output_health": [ { "id": "d1", "gpu": "NVIDIA RTX A5000 (Dx12)", "presenter": "dxgi",
+      "refresh_hz": 59.94, "presents": 35964, "missed": 0, "late_decodes": 0,
+      "latency_frames": 2, "barrier": "cluster", "grid_offset_ns": -42000,
+      "frame_counter": 1234567 } ] }
 { "type": "ping" }
 { "type": "logs", "lines": [ "…" ] }
 { "type": "preview", "outputs": [ { "name": "Left", "width": 480, "height": 270, "png_base64": "…" } ] }
@@ -98,11 +103,21 @@ timeline, otherwise the id of an auxiliary timeline (task) of the show.
   "transport": { … }, "show_ns": 0, "frame": 0, "show_revision": 3,
   "nodes": [ { "node_id": "…", "role": "runner", "name": "left", "addr": "10.0.0.11:51000",
                "health": { … }, "clock_skew_ns": -350000, "frame_error": 0 } ] }
+{ "type": "grid", "grid": { "origin_ns": 1000000000000, "period_ps": 16683333333,
+                             "valid_from_ns": 1000200000000, "generation": 3 } }
 { "type": "error", "message": "seek: show time must not be negative" }
 { "type": "pong" }
 ```
 
-`cluster` is pushed every second to non-Runner clients, and on `status`.
+`cluster` is pushed every second to non-Runner clients, and on `status`. It
+also carries `grid` and `grid_source` (the node id of the reference Runner).
+
+`grid` is the refresh grid (see ARCHITECTURE §3.3), sent to everyone when it
+changes and to a Runner right after its `welcome`. A Runner renders the frame
+for refresh instant `t` as the frame for
+`origin_ns + floor(k × period_ps / 1000)`, with `k` the grid line nearest to
+`t`, when `t` is within a quarter period of it; lines at or after
+`valid_from_ns` (decided on the previous grid's instants) use the new grid.
 
 ### Transport state
 
@@ -128,7 +143,11 @@ stage: nothing of it is drawn (a paused timeline, by contrast, holds its
 picture). The main timeline is always active.
 
 A Runner's `health` also reports `monitors` (index, name, size, position),
-`gpu`, `outputs` (open windows), `standby`, and `machine`: `hostname`, `os`,
+`gpu`, `outputs` (open windows), `standby`, `output_health` (per output:
+presenter, refresh rate, presents, missed presents, late decodes, frames
+queued, NVIDIA present-barrier state, distance from the refresh grid,
+frame-lock counter), `vblank` (the first output's refresh, which the Director
+builds the grid from), and `machine`: `hostname`, `os`,
 `version`, `ip`, `mac`, `allow_power`, `supervised`. `cluster` carries
 `known_runners`: every Runner the Director has seen (`name`, `node_id`,
 `machine`, `online`), so offline ones can be listed and woken.
@@ -234,8 +253,11 @@ broadcasts them back. Other tools may ignore it.
   are informational: the Producer sets them to the displays' bottom-right
   extent. `x, y, w, h` is the cue's
   rectangle; `rotation` is degrees clockwise about its centre.
-* `source` is `{ "type": "asset", "asset": <id> }` or
-  `{ "type": "color", "rgba": [r, g, b, a] }` (linear 0..1).
+* `source` is `{ "type": "asset", "asset": <id> }`,
+  `{ "type": "color", "rgba": [r, g, b, a] }` (linear 0..1), or
+  `{ "type": "sync_test", "fps": 60 }` — a test pattern drawn by the Runner:
+  frame number in digits and 16 binary cells, a marker stepping one place per
+  frame, and a white flash on the first frame of each second.
 * The first track is in front.
 * `runner` is a Runner's `--name`; empty means any Runner.
 * A Runner downloads `url` once and caches it under `id` + `size`.

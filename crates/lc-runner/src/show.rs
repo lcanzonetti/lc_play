@@ -181,6 +181,9 @@ pub enum Source {
     Image { path: String },
     /// Solid color (linear RGBA 0..1) — handy for testing a layout with no assets.
     Color { rgba: [f32; 4] },
+    /// The synchronisation test pattern, at `fps` frames per second.
+    #[serde(rename = "sync_test")]
+    SyncTest { fps: f64 },
     /// Pre-recorded video, decoded by an `ffmpeg` child process.
     Video { path: String },
     /// Live input such as a capture card or NDI stream (not implemented).

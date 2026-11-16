@@ -68,6 +68,8 @@ pub struct Playhead {
     standby: AtomicBool,
     /// What the renderer knows about its hardware, for the health report.
     hardware: Mutex<Hardware>,
+    /// The refresh grid from the Director (see `lc_proto::vblank`).
+    grid: Mutex<lc_proto::GridSchedule>,
 }
 
 /// Facts about the machine, filled in by the renderer.
@@ -77,6 +79,10 @@ pub struct Hardware {
     pub gpu: Option<String>,
     /// Output windows currently open.
     pub outputs: u32,
+    /// Presentation health of each output.
+    pub output_health: Vec<lc_proto::OutputHealth>,
+    /// The first output's refresh, for the Director's grid.
+    pub vblank: Option<lc_proto::VblankReport>,
 }
 
 struct Inner {
@@ -113,6 +119,7 @@ impl Playhead {
             previews: Mutex::new(None),
             standby: AtomicBool::new(false),
             hardware: Mutex::new(Hardware::default()),
+            grid: Mutex::new(Default::default()),
         }
     }
 
@@ -130,7 +137,10 @@ impl Playhead {
     /// next vertical blank to render the frame that will be due when it is
     /// actually displayed.
     pub fn position_at_local(&self, local_ns: i64) -> Position {
-        let reading = self.clock.read(local_ns);
+        self.position_from(self.clock.read(local_ns))
+    }
+
+    fn position_from(&self, reading: lc_time::ClockReading) -> Position {
         let mut inner = self.lock();
         let transport = inner.timeline.state_at(reading.cluster_ns);
 
@@ -155,6 +165,45 @@ impl Playhead {
             frame: inner.frame_rate.frame_at(show_ns),
             transport,
         }
+    }
+
+    /// The position for a picture that will be on screen at local time
+    /// `display_local_ns`, snapped to the Director's refresh grid when this
+    /// output's refreshes are on it. Returns the position and the distance
+    /// of the estimate from the grid (`None`: not on a grid).
+    ///
+    /// Snapping is what makes frame-locked Runners agree on the frame
+    /// exactly: the grid instant is the same integer everywhere, whereas
+    /// each Runner's own estimate is off by its clock and measurement error.
+    pub fn position_for_display(&self, display_local_ns: i64) -> (Position, Option<i64>) {
+        let reading = self.clock.read(display_local_ns);
+        let snapped = if reading.synced {
+            self.grid
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snap(reading.cluster_ns)
+        } else {
+            None
+        };
+        let cluster_ns = snapped.map_or(reading.cluster_ns, |s| s.instant_ns);
+        let position = self.position_from(lc_time::ClockReading {
+            cluster_ns,
+            ..reading
+        });
+        (position, snapped.map(|s| s.offset_ns))
+    }
+
+    /// Take a refresh grid from the Director.
+    pub fn accept_grid(&self, grid: lc_proto::VblankGrid) {
+        self.grid
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .accept(grid);
+    }
+
+    /// Forget the grid (the Director that published it is gone).
+    pub fn clear_grid(&self) {
+        *self.grid.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
     }
 
     /// Show time of an auxiliary timeline at cluster time `cluster_ns`, in

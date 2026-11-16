@@ -28,6 +28,7 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 |---|---|
 | Director: cluster clock, transport per timeline, control cues, show distribution, persistence, restart adoption, OSC input | implemented, tested |
 | Runner: renders the Director's show live (edits appear while playing), images, colours, video (HAP decoded by the GPU; other codecs hardware-decoded through ffmpeg), fades, warp, edge blend, auxiliary timelines, free-running cues, local asset cache, holdover | implemented, tested |
+| Frame sync on frame-locked hardware: frames rendered for the refresh they appear on, a cluster-wide refresh grid, NVIDIA present barrier, one GPU device per graphics card, per-output sync health, sync test pattern | implemented, **not yet run on real hardware** (see below) |
 | Runner management: restart, quit, standby, reboot / power off the computer (opt-in), Wake-on-LAN, remote log, live output pictures, remote desktop | implemented |
 | Asset Manager: upload, list, thumbnails, metadata, HTTP Range delivery | implemented |
 | Producer: stand-alone window with floating panels — stage (zoom, pan, snapping) with live content preview, timelines, tasks, runners, assets, inspector, undo, save/open | implemented (basic) |
@@ -63,7 +64,13 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 * **No authentication anywhere.** Closed show networks only.
 * **Tested on Linux only**, on one machine with a software GPU, plus
   simulated clock skew. It type-checks for Windows and macOS but has **not
-  been run there**, nor on real multi-machine hardware.
+  been run there**, nor on real multi-machine hardware. In particular the
+  Windows swap chain and NVIDIA present barrier code (`dxgi.rs`,
+  `nvapi.rs`) has only been compiled: the first run on a show machine is its
+  first run.
+* **A layer that spans two graphics cards of one Runner is decoded once per
+  card.** Fine for HAP at moderate sizes; plan canvases so that big video
+  stays on one card where possible.
 
 ## Run it on one laptop
 
@@ -177,6 +184,34 @@ multicast works.
 
 Default ports: discovery UDP 7400 (multicast 239.255.76.67), control TCP 7401,
 clock sync UDP 7402, assets HTTP 7403, Producer HTTP 7404, OSC UDP 7405.
+
+### Frame-locked rigs (Quadro Sync / RTX Pro Sync)
+
+Frame lock makes every display refresh together; LC Play then makes every
+output show the *same frame* on each refresh (how: `docs/ARCHITECTURE.md`
+§3.3). On Windows the Runner presents through its own DXGI swap chain and
+joins NVIDIA's present barrier by itself; nothing to configure. To get
+there:
+
+1. Set up frame lock in the NVIDIA Control Panel (*Synchronize displays*)
+   as for any other media server, all outputs at the same refresh rate.
+2. Displays **full screen** in LC Play (borderless, on their monitor),
+   Windows display scaling at 100 % on those monitors — otherwise the
+   present barrier does not engage.
+3. In the Producer's **Runners** window, each output shows a *Sync* line.
+   On a working rig it reads `dxgi · 59.94 Hz · barrier cluster ·
+   grid ±0.x ms · … missed 0 · late 0`. `barrier system` = synchronised
+   within the machine only (frame lock not active); `client` = joined but
+   not synchronised (usually: not truly full screen); `off grid` = this
+   output is not frame-locked with the reference Runner.
+4. Add a **Sync test** cue (Assets window) across the whole canvas, play,
+   and film adjacent outputs (or two machines) with a fast camera: the frame
+   numbers must match. Set its frame rate to the refresh rate.
+
+If a driver misbehaves: `LCPLAY_SWAPCHAIN=wgpu` falls back to wgpu's
+presentation (no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0` keeps
+the own swap chain without the barrier, `LCPLAY_FRAME_LATENCY=1..3` (default
+2) sets how many frames are queued ahead of the display.
 
 ## Workspace
 

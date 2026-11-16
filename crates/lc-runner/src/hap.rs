@@ -639,6 +639,10 @@ impl Content for HapContent {
     fn ready(&self) -> bool {
         self.shown.is_some()
     }
+
+    fn late(&self) -> bool {
+        self.shown.is_some() && self.last_want.is_some() && self.shown != self.last_want
+    }
 }
 
 impl Drop for HapContent {
@@ -786,6 +790,14 @@ impl Content for LazyVideo {
             State::Hap(c) if c.ready() => c.sampling(),
             State::Ffmpeg(c) if c.ready() => c.sampling(),
             _ => Sampling::default(),
+        }
+    }
+
+    fn late(&self) -> bool {
+        match &self.state {
+            State::Hap(c) => c.late(),
+            State::Ffmpeg(c) => c.late(),
+            _ => false,
         }
     }
 }

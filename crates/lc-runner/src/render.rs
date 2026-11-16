@@ -5,10 +5,25 @@
 //! slice" texture, per-layer uniform buffers, and the warp mesh + blend uniform
 //! for that output.
 //!
-//! A frame renders **every output together**: one show-clock sample, one
-//! command encoder, one queue submit, then all surfaces are presented. That is
-//! what keeps outputs in lockstep — they can never show different show times,
-//! and N windows don't serialize on N separate vsync waits.
+//! A Runner has one [`Gpu`] per graphics card that drives an output, so every
+//! output is rendered by the card it is connected to (no copy from one card
+//! to another by Windows, and each output can join the card's present
+//! barrier). On one card, a frame renders **every output together**: one
+//! show-clock sample, one command encoder, one queue submit, then every output
+//! is presented.
+//!
+//! A frame is made in three steps, so that the content can be chosen for the
+//! instant the picture will be *seen*:
+//!   1. [`Gpu::acquire`] each output — this is where the loop waits for the
+//!      display; afterwards the refresh the frame is for is known
+//!      ([`OutputTiming`]);
+//!   2. the caller samples the show clock for that refresh and updates the
+//!      contents, then [`Gpu::render`] encodes and submits;
+//!   3. [`Gpu::present`] each output.
+//!
+//! Outputs are presented through a [`Presenter`]: on Windows/D3D12, LC Play's
+//! own DXGI swap chain (frame statistics, NVIDIA present barrier — see
+//! `dxgi.rs`); elsewhere, or if that fails, wgpu's surface.
 //!
 //! Per output, the frame runs two passes:
 //!   1. **scene** → render every visible layer into the slice texture using the
@@ -26,6 +41,7 @@ use winit::window::Window;
 
 use crate::content::{Content, TextureFactory};
 use crate::show::{Output, Show};
+use crate::vsync::{PresentTracker, RefreshClock};
 
 /// Offscreen "canvas slice" format. sRGB so shader math stays in linear space.
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -117,8 +133,34 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Create the device from a first surface and build all pipelines.
-    pub fn new(first_window: Arc<Window>) -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
+    /// Create the device for the card that should render `window` and build
+    /// all pipelines. With `luid` (Windows/D3D12), the card with that adapter
+    /// LUID; otherwise the high-performance card that can present to it.
+    pub fn new(first_window: Arc<Window>, luid: Option<i64>) -> anyhow::Result<Self> {
+        #[cfg(windows)]
+        if let Some(luid) = luid {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::DX12,
+                ..Default::default()
+            });
+            let adapter = instance
+                .enumerate_adapters(wgpu::Backends::DX12)
+                .into_iter()
+                .find(|a| crate::dxgi::adapter_luid(a) == Some(luid))
+                // A laptop's built-in screen hangs off the integrated GPU:
+                // keep rendering on the discrete one, as before.
+                .filter(|a| a.get_info().device_type != wgpu::DeviceType::IntegratedGpu);
+            if let Some(adapter) = adapter {
+                return Self::with_adapter(instance, adapter, wgpu::TextureFormat::Bgra8UnormSrgb);
+            }
+        }
+        let _ = luid;
+        let (gpu, _surface) = Self::new_any(first_window)?;
+        Ok(gpu)
+    }
+
+    /// The device of the high-performance card that can present to `window`.
+    fn new_any(first_window: Arc<Window>) -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
         // Try the preferred graphics API first, then any.
         let mut found = None;
         for backends in [preferred_backends(), wgpu::Backends::all()] {
@@ -353,40 +395,89 @@ impl Gpu {
     }
 
     /// Create a surface for an additional window (outputs after the first).
-    pub fn create_surface(&self, window: Arc<Window>) -> anyhow::Result<wgpu::Surface<'static>> {
-        Ok(self.instance.create_surface(window)?)
+    /// Whether this device is D3D12 (where LC Play's own swap chain works).
+    pub fn is_dx12(&self) -> bool {
+        self.adapter.get_info().backend == wgpu::Backend::Dx12
     }
 
-    /// Build the per-output GPU state once the surface and window size are known.
+    /// The adapter's LUID (Windows/D3D12), to match it with monitors.
+    pub fn luid(&self) -> Option<i64> {
+        #[cfg(windows)]
+        return crate::dxgi::adapter_luid(&self.adapter);
+        #[cfg(not(windows))]
+        None
+    }
+
+    /// Whether the card is an integrated GPU.
+    pub fn is_integrated(&self) -> bool {
+        self.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu
+    }
+
+    /// Build the per-output GPU state for `window`: its presenter and render
+    /// resources.
     pub fn build_output(
         &self,
-        surface: wgpu::Surface<'static>,
-        width: u32,
-        height: u32,
+        window: Arc<Window>,
         output: &Output,
         layer_count: usize,
-    ) -> OutputGpu {
+    ) -> anyhow::Result<OutputGpu> {
         // A surface larger than the GPU's texture limit is a hard error
         // (panic) in wgpu. Sizes come from the window system and, through the
         // show, from the network: clamp rather than trust.
         let max = self.max_texture_dimension();
+        let phys = window.inner_size();
+        let (width, height) = (phys.width.clamp(1, max), phys.height.clamp(1, max));
+        let presenter = self.make_presenter(window, width, height)?;
+        let res = self.build_resources(width, height, output, layer_count);
+        Ok(OutputGpu {
+            presenter,
+            width,
+            height,
+            res,
+            timing: OutputTiming::default(),
+        })
+    }
+
+    fn make_presenter(
+        &self,
+        window: Arc<Window>,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<Presenter> {
+        #[cfg(windows)]
+        if self.is_dx12() && crate::dxgi::enabled() {
+            let made = crate::dxgi::hwnd_of(&window)
+                .ok_or_else(|| anyhow::anyhow!("no window handle"))
+                .and_then(|hwnd| {
+                    crate::dxgi::SwapChain::new(
+                        &self.device,
+                        hwnd,
+                        width,
+                        height,
+                        self.surface_format,
+                    )
+                });
+            match made {
+                Ok(sc) => return Ok(Presenter::Dxgi(Box::new(sc))),
+                Err(e) => tracing::warn!(
+                    "own swap chain unavailable ({e:#}); presenting through wgpu, \
+                     without frame statistics or present barrier"
+                ),
+            }
+        }
+        let surface = self.instance.create_surface(window)?;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
-            width: width.clamp(1, max),
-            height: height.clamp(1, max),
+            width,
+            height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: frame_latency(),
         };
         surface.configure(&self.device, &config);
-        let res = self.build_resources(config.width, config.height, output, layer_count);
-        OutputGpu {
-            surface,
-            config,
-            res,
-        }
+        Ok(Presenter::Surface { surface, config })
     }
 
     /// Everything an output needs to render, independent of where the final
@@ -462,8 +553,7 @@ impl Gpu {
         let rotated = matches!(output.rotation_degrees, 90 | 270);
         if rotated != res.rotated {
             res.rotated = rotated;
-            let (tex, view, bg) =
-                self.make_scene_target(out.config.width, out.config.height, rotated);
+            let (tex, view, bg) = self.make_scene_target(out.width, out.height, rotated);
             res._scene_tex = tex;
             res.scene_view = view;
             res.scene_bg = bg;
@@ -563,9 +653,24 @@ impl Gpu {
         }
         let max = self.max_texture_dimension();
         let (width, height) = (width.min(max), height.min(max));
-        out.config.width = width;
-        out.config.height = height;
-        out.surface.configure(&self.device, &out.config);
+        match &mut out.presenter {
+            Presenter::Surface { surface, config } => {
+                config.width = width;
+                config.height = height;
+                surface.configure(&self.device, config);
+            }
+            #[cfg(windows)]
+            Presenter::Dxgi(sc) => {
+                if let Err(e) = sc.resize(&self.device, width, height) {
+                    tracing::error!("cannot resize the output: {e:#}");
+                    return;
+                }
+            }
+        }
+        out.width = width;
+        out.height = height;
+        // A new size means a new mode: the refresh train is measured afresh.
+        out.timing.clock = RefreshClock::default();
         let res = &mut out.res;
         let (tex, view, bg) = self.make_scene_target(width, height, res.rotated);
         res._scene_tex = tex;
@@ -573,50 +678,106 @@ impl Gpu {
         res.scene_bg = bg;
     }
 
-    /// Acquire every output's surface, encode all of them into one command
-    /// buffer, and submit once. `times` gives each layer the time of the
-    /// timeline it belongs to (`None` = that timeline is off stage). Call
-    /// [`PendingFrame::present`] afterwards to put the frame on screen.
-    pub fn draw(
+    /// Wait until `out` can take a frame and get the texture to render into.
+    /// For the own swap chain, also feeds the driver's refresh statistics
+    /// into the output's timing; for a wgpu surface, the moment of release.
+    pub fn acquire(
         &self,
-        targets: &[(&OutputGpu, &Output)],
+        out: &mut OutputGpu,
+        local_now: impl Fn() -> i64,
+    ) -> Result<Acquired, wgpu::SurfaceError> {
+        match &mut out.presenter {
+            Presenter::Surface { surface, .. } => {
+                let frame = surface.get_current_texture()?;
+                out.timing.clock.observe_tick(local_now());
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                Ok(Acquired {
+                    view,
+                    surface: Some(frame),
+                })
+            }
+            #[cfg(windows)]
+            Presenter::Dxgi(sc) => {
+                // 100 ms is far beyond any refresh: the window is hidden or
+                // the display gone. Skip the output, keep the others.
+                if !sc.wait(100) {
+                    return Err(wgpu::SurfaceError::Timeout);
+                }
+                let now = local_now();
+                match sc.statistics() {
+                    Some(st) => {
+                        let at = crate::dxgi::qpc_to_local(st.sync_qpc, now);
+                        out.timing.clock.observe_refresh(st.sync_refresh, at);
+                        out.timing
+                            .tracker
+                            .landed(st.present_count, st.present_refresh);
+                    }
+                    // No statistics (composed window, mode change): the
+                    // loop's own timing is the best there is.
+                    None => out.timing.clock.observe_tick(now),
+                }
+                out.timing.barrier = sc.barrier_state().as_str();
+                Ok(Acquired {
+                    view: sc.begin().clone(),
+                    surface: None,
+                })
+            }
+        }
+    }
+
+    /// Encode every acquired output and submit once. `times` gives each layer
+    /// the time of the timeline it belongs to (`None` = that timeline is off
+    /// stage).
+    pub fn render(
+        &self,
+        targets: &[(&OutputGpu, &Output, &wgpu::TextureView)],
         show: &Show,
         times: &[Option<f64>],
         contents: &[Box<dyn Content>],
         draw_order: &[usize],
-    ) -> PendingFrame {
+    ) {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
-        let mut frames = Vec::with_capacity(targets.len());
-        let mut errors = Vec::new();
-
-        for (ti, &(out, output)) in targets.iter().enumerate() {
-            match out.surface.get_current_texture() {
-                Ok(frame) => {
-                    let view = frame
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
-                    self.encode_output(
-                        &mut encoder,
-                        &view,
-                        &out.res,
-                        output,
-                        show,
-                        times,
-                        contents,
-                        draw_order,
-                    );
-                    frames.push(frame);
-                }
-                Err(e) => errors.push((ti, e)),
-            }
+        for &(out, output, view) in targets {
+            self.encode_output(
+                &mut encoder,
+                view,
+                &out.res,
+                output,
+                show,
+                times,
+                contents,
+                draw_order,
+            );
         }
-
         self.queue.submit(Some(encoder.finish()));
-        PendingFrame { frames, errors }
+    }
+
+    /// Put a rendered frame on screen. `target` is the refresh it was
+    /// rendered for (see [`OutputTiming`]).
+    pub fn present(&self, out: &mut OutputGpu, frame: Acquired, target: Option<i64>) {
+        match &mut out.presenter {
+            Presenter::Surface { .. } => {
+                if let Some(f) = frame.surface {
+                    f.present();
+                }
+                out.timing.tracker.presents += 1;
+            }
+            #[cfg(windows)]
+            Presenter::Dxgi(sc) => match sc.end() {
+                Ok(id) => {
+                    out.timing.tracker.presented(id, target.unwrap_or(0));
+                    out.timing.frame_counter = sc.frame_counter();
+                }
+                Err(e) => tracing::warn!("present failed: {e:#}"),
+            },
+        }
+        let _ = target;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -728,7 +889,7 @@ impl Gpu {
     /// Uses the canvas slice rendered in the last frame. The result is read
     /// with [`Capture::take`] once the GPU has finished.
     pub fn capture_output(&self, out: &OutputGpu, name: &str, max_width: u32) -> Capture {
-        let (ow, oh) = (out.config.width.max(1), out.config.height.max(1));
+        let (ow, oh) = (out.width.max(1), out.height.max(1));
         let width = ow.min(max_width).max(1);
         let height = ((oh as u64 * width as u64 / ow as u64) as u32).max(1);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -843,23 +1004,6 @@ impl Gpu {
     /// Largest texture edge this device accepts.
     pub fn max_texture_dimension(&self) -> u32 {
         self.device.limits().max_texture_dimension_2d
-    }
-}
-
-/// A frame that has been submitted but not yet shown.
-pub struct PendingFrame {
-    frames: Vec<wgpu::SurfaceTexture>,
-    /// Outputs whose surface could not be acquired, by index into `targets`.
-    pub errors: Vec<(usize, wgpu::SurfaceError)>,
-}
-
-impl PendingFrame {
-    /// Present every acquired surface back-to-back.
-    pub fn present(self) -> Vec<(usize, wgpu::SurfaceError)> {
-        for frame in self.frames {
-            frame.present();
-        }
-        self.errors
     }
 }
 
@@ -999,11 +1143,75 @@ fn preferred_backends() -> wgpu::Backends {
     }
 }
 
-/// Per-output GPU state: the window surface plus its render resources.
+/// Frames rendered ahead of the display with a wgpu surface (1..=3,
+/// `LCPLAY_FRAME_LATENCY`, default 2). The own swap chain reads the same.
+pub fn frame_latency() -> u32 {
+    std::env::var("LCPLAY_FRAME_LATENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2u32)
+        .clamp(1, 3)
+}
+
+/// How an output's frames reach its display.
+pub enum Presenter {
+    /// wgpu's surface (every platform).
+    Surface {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
+    /// LC Play's own DXGI swap chain (Windows/D3D12).
+    #[cfg(windows)]
+    Dxgi(Box<crate::dxgi::SwapChain>),
+}
+
+/// A frame being made for one output.
+pub struct Acquired {
+    pub view: wgpu::TextureView,
+    surface: Option<wgpu::SurfaceTexture>,
+}
+
+/// One output's presentation timing and health.
+#[derive(Default)]
+pub struct OutputTiming {
+    /// The display's refresh train.
+    pub clock: RefreshClock,
+    /// Where presents really land (own swap chain only).
+    pub tracker: PresentTracker,
+    /// Frames where a layer on this output showed an older video frame than
+    /// the one due.
+    pub late_decodes: u64,
+    /// Distance from the Director's refresh grid, ns (`None`: not on it).
+    pub grid_offset: Option<i64>,
+    /// Present barrier state (`off` for wgpu surfaces).
+    pub barrier: &'static str,
+    pub frame_counter: Option<u32>,
+}
+
+/// Per-output GPU state: how it is presented plus its render resources.
 pub struct OutputGpu {
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
+    presenter: Presenter,
+    width: u32,
+    height: u32,
     res: OutputResources,
+    pub timing: OutputTiming,
+}
+
+impl OutputGpu {
+    /// `dxgi` or `wgpu`, for the health report.
+    pub fn presenter_name(&self) -> &'static str {
+        match self.presenter {
+            Presenter::Surface { .. } => "wgpu",
+            #[cfg(windows)]
+            Presenter::Dxgi(_) => "dxgi",
+        }
+    }
+
+    /// Whether the refresh numbers are the driver's (and presents are
+    /// tracked to the refresh they reach).
+    pub fn exact_timing(&self) -> bool {
+        self.timing.clock.is_exact()
+    }
 }
 
 struct OutputResources {

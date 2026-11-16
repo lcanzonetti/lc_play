@@ -188,6 +188,9 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
         if let Some(show) = show {
             send(&mut socket, &show_message(show)).await?;
         }
+        if let Some(grid) = core.grid() {
+            send(&mut socket, &ServerMessage::Grid { grid }).await?;
+        }
 
         // Runners do not need the cluster overview; everyone else gets it.
         let wants_status = hello.role != Role::Runner;

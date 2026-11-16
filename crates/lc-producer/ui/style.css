@@ -176,6 +176,7 @@ h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spac
 .runner-head .name { font-weight: 600; flex: 1; }
 .kv { display: grid; grid-template-columns: 70px 1fr; gap: 2px 8px; font-size: 12px; margin: 4px 0; }
 .kv > :nth-child(odd) { color: var(--dim); }
+.warn-text { color: #e8a33d; }
 .disp { display: grid; grid-template-columns: 1fr auto auto auto; gap: 6px; align-items: center; padding: 3px 4px; border-radius: 4px; font-size: 12px; }
 .disp:hover, .disp.sel { background: var(--head); }
 .disp .name { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

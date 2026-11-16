@@ -23,11 +23,17 @@ pub mod agent;
 pub mod app;
 pub mod assets;
 pub mod content;
+#[cfg(windows)]
+pub mod dxgi;
 pub mod hap;
 pub mod machine;
 pub mod mov;
+#[cfg(windows)]
+pub mod nvapi;
 pub mod playhead;
 pub mod render;
 pub mod show;
 pub mod stage;
+pub mod testpattern;
 pub mod video;
+pub mod vsync;

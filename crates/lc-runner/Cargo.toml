@@ -46,3 +46,19 @@ base64 = "0.23.1"
 [dev-dependencies]
 # Integration tests run a real Director in-process next to several agents.
 lc-director.workspace = true
+
+# Windows: LC Play's own DXGI swap chains on wgpu's D3D12 device (frame
+# statistics, NVIDIA present barrier). The version must be the one wgpu-hal
+# uses, so that the COM types it hands out are the same types.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+] }

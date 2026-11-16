@@ -816,6 +816,23 @@ function cuePicture(cue, track, t, tl, onAir) {
   return steerVideo(p, media, onAir && !!tr?.playing, (tr?.rate_permille ?? 1000) / 1000);
 }
 
+/** The stage's sketch of a sync test pattern (the Runners draw the real
+ *  one): its frame number at timeline time `t`, as the Runner computes it. */
+function drawSyncTest(cue, t) {
+  const fps = cue.source.fps || 60;
+  const frame = Math.floor(Math.max(0, cue.in_s + t - cue.start_s) * fps + 1e-6);
+  const flash = frame % Math.max(1, Math.round(fps)) === 0;
+  ctx.fillStyle = flash ? '#fff' : '#000';
+  ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+  ctx.fillStyle = flash ? '#000' : '#fff';
+  ctx.font = `bold ${Math.max(8, cue.h / 4)}px ui-monospace, monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(frame), 0, 0);
+  ctx.font = `${Math.max(6, cue.h / 14)}px system-ui, sans-serif`;
+  ctx.fillText('SYNC TEST', 0, -cue.h / 3);
+}
+
 /** When a cue starting at `startS` went on air under transport `tr`, at
  *  cluster time `now` (ns): when the playhead crossed its start, or when the
  *  state took effect if it did not get there by playing. */
@@ -911,6 +928,7 @@ function drawStage() {
         ctx.globalAlpha = onAir ? cue.opacity * fade : 0.3;
         const picture = cue.source.type === 'asset' ? cuePicture(cue, track, onAir ? t : cue.start_s, tl, onAir) : null;
         if (picture) ctx.drawImage(picture, -cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        else if (cue.source.type === 'sync_test') drawSyncTest(cue, onAir ? t : cue.start_s);
         else {
           ctx.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
           ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
@@ -1186,7 +1204,7 @@ function renderTimeline() {
       lane.append(el('div', {
         class: `cue ${cue.source.type}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
-      }, cue.name || (cue.source.type === 'color' ? 'colour' : 'cue'),
+      }, cue.name || ({ color: 'colour', sync_test: 'sync test' }[cue.source.type] || 'cue'),
         el('div', { class: 'h l' }), el('div', { class: 'h r' })));
     }
     const selected = S.sel?.type === 'track' && S.sel.id === track.id;
@@ -1402,7 +1420,9 @@ function renderRunners(force = false) {
   const key = JSON.stringify([
     names.map((n) => {
       const { node, h, machine, online } = runnerInfo(n);
-      return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine];
+      return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine,
+        (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000)]),
+        S.status?.grid_source === node?.node_id];
     }),
     S.doc.stage.displays, S.sel, S.connected, [...S.previewOn],
   ]);
@@ -1469,6 +1489,7 @@ function renderRunners(force = false) {
           `${h.outputs ?? 0} output(s)`,
         ].filter(Boolean).join(' · ')),
         el('span', {}, 'GPU'), el('span', {}, h.gpu || '—'),
+        ...outputSyncRows(h, node),
         el('span', {}, 'Monitors'), el('span', {}, h.monitors?.length
           ? h.monitors.map((m) => `#${m.index} ${m.width}×${m.height}${m === primaryMonitor(h.monitors) ? ' (primary)' : ''}`).join('   ')
           : '—'),
@@ -1495,6 +1516,39 @@ function renderRunners(force = false) {
     box.append(card);
     showPreviews(name);
   }
+}
+
+/** One "Sync" row per output of a Runner: how its frames reach the
+ *  display, and whether they are where they should be.
+ *
+ *  - presenter: `dxgi` = LC Play's own swap chain (exact refresh timing,
+ *    NVIDIA present barrier); `wgpu` = estimated from the render loop.
+ *  - barrier: NVIDIA present barrier — `cluster` (synchronized across
+ *    machines through frame lock) is the goal on a frame-locked rig.
+ *  - grid: distance from the Director's refresh grid; within a millisecond
+ *    or so when frame-locked. "off grid" = this output picks its frames on
+ *    its own clock (no frame lock, or another refresh rate).
+ *  - missed: frames that reached the screen later than planned; late: frames
+ *    where a video was not decoded in time. Both should stay at 0. */
+function outputSyncRows(h, node) {
+  const rows = [];
+  const isRef = node && S.status?.grid_source === node.node_id;
+  for (const o of h.output_health || []) {
+    const parts = [
+      o.presenter,
+      o.refresh_hz ? `${o.refresh_hz.toFixed(2)} Hz` : 'measuring',
+      o.barrier && o.barrier !== 'off' ? `barrier ${o.barrier}` : null,
+      o.grid_offset_ns == null ? 'off grid' : `grid ${o.grid_offset_ns >= 0 ? '+' : ''}${(o.grid_offset_ns / 1e6).toFixed(2)} ms`,
+      o.latency_frames != null ? `${o.latency_frames} frame(s) ahead` : null,
+      `missed ${o.missed}`,
+      `late ${o.late_decodes}`,
+      o.frame_counter != null ? `counter ${o.frame_counter}` : null,
+    ];
+    const bad = o.missed > 0 || o.late_decodes > 0;
+    rows.push(el('span', {}, `Sync ${o.id}`), el('span', { class: bad ? 'warn-text' : null, title: 'Frames presented: ' + o.presents }, parts.filter(Boolean).join(' · ')));
+  }
+  if (isRef) rows.push(el('span', {}, 'Grid'), el('span', {}, 'This Runner\'s refresh is the reference for the cluster\'s refresh grid.'));
+  return rows;
 }
 
 /** Where a display's picture goes: a window (a preview on the operator's
@@ -1724,6 +1778,11 @@ function renderInspector() {
       field('Opacity (%)', c, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
     );
     if (c.source.type === 'color') box.append(colorField('Colour', c.source, 'rgba'));
+    if (c.source.type === 'sync_test') {
+      box.append(
+        field('Frame rate', c.source, 'fps', { min: 1 }),
+        note('Drawn by each Runner: the frame number (digits and binary blocks), a marker stepping one place per frame, and a white flash on the first frame of every second. Film two outputs, or two machines, with a fast camera: any difference in the numbers is the offset in frames. Use the displays\' refresh rate as frame rate.'));
+    }
     const mw = asset?.width || extent().w, mh = asset?.height || extent().h;
     box.append(el('div', { class: 'btns' },
       el('button', { onclick: () => edit(() => Object.assign(c, fitRect(mw, mh, true))) }, 'Fit to stage'),
@@ -1853,6 +1912,10 @@ $('#chk-loop').onchange = (e) => command({ type: 'set_loop', loop_ns: e.target.c
 $('#sel-rate').onchange = (e) => command({ type: 'set_rate', rate_permille: Number(e.target.value) });
 $('#btn-undo').onclick = () => stepHistory(S.undo, S.redo);
 $('#btn-redo').onclick = () => stepHistory(S.redo, S.undo);
+$('#btn-synctest').onclick = () => {
+  const e = extent();
+  addCue({ name: 'Sync test', source: { type: 'sync_test', fps: 60 }, duration_s: 600, x: e.x, y: e.y, w: e.w, h: e.h }, S.tl, 0, showSeconds(S.tl));
+};
 $('#btn-color').onclick = () => addCue({ name: 'Colour', source: { type: 'color', rgba: [0.1, 0.4, 0.8, 1] }, duration_s: 10, ...fitRect(640, 360, false) }, S.tl, 0, showSeconds(S.tl));
 $('#btn-new').onclick = async () => {
   if (await ask('Start a new, empty show? The current one is replaced on the Director.')) edit(() => { S.doc = defaultDoc(); S.sel = null; S.tl = MAIN; });

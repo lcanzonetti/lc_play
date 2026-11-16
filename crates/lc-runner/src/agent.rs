@@ -319,6 +319,9 @@ impl Link {
         // picture if the timebase changed. Then the transport of that
         // timebase, then the sync target; the first sample releases the hold.
         playhead.clock.follow(welcome.clock_id);
+        // A grid belongs to the Director that published it; this one sends
+        // its own right after the welcome.
+        playhead.clear_grid();
         playhead.set_frame_rate(welcome.frame_rate);
         let mut changed = playhead.accept(welcome.clock_id, None, welcome.transport);
         for (id, state) in &welcome.tasks {
@@ -384,6 +387,14 @@ impl Link {
                         }
                         ServerMessage::Error { message } => {
                             tracing::warn!("director reported: {message}");
+                        }
+                        ServerMessage::Grid { grid } => {
+                            tracing::debug!(
+                                generation = grid.generation,
+                                period_ns = grid.period_ns(),
+                                "refresh grid"
+                            );
+                            playhead.accept_grid(grid);
                         }
                         ServerMessage::Pong
                         | ServerMessage::Cluster(_)
@@ -502,6 +513,8 @@ impl Link {
             outputs: hardware.outputs,
             machine: Some(machine.clone()),
             standby: self.playhead.standby(),
+            output_health: hardware.output_health,
+            vblank: hardware.vblank,
         }
     }
 

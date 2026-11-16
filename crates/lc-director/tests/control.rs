@@ -603,3 +603,85 @@ async fn a_task_that_leaves_and_returns_keeps_rising_epochs() {
     assert!(resumed.playing && resumed.epoch > stopped.epoch);
     director.shutdown().await;
 }
+
+/// A Runner's health report with a measured refresh.
+fn health_with_refresh(vblank_ns: i64, exact: bool) -> lc_proto::Health {
+    lc_proto::Health {
+        cluster_ns: vblank_ns,
+        show_ns: 0,
+        frame: 0,
+        transport_epoch: 0,
+        show_revision: None,
+        sync: Default::default(),
+        fps: None,
+        monitors: Vec::new(),
+        gpu: None,
+        outputs: 1,
+        machine: None,
+        standby: false,
+        output_health: Vec::new(),
+        vblank: Some(lc_proto::VblankReport {
+            vblank_ns,
+            period_ps: 16_683_333_333,
+            exact,
+        }),
+    }
+}
+
+/// The next refresh grid sent to `conn`.
+async fn next_grid(conn: &mut Connection) -> lc_proto::VblankGrid {
+    loop {
+        if let ServerMessage::Grid { grid } =
+            conn.recv_timeout(Duration::from_secs(3)).await.unwrap()
+        {
+            return grid;
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_refresh_grid_comes_from_the_best_measured_runner() {
+    let director = start().await;
+    let url = lc_net::control_url(director.control_addr());
+    let runner = |id: &str| Hello {
+        role: Role::Runner,
+        node_id: NodeId(id.into()),
+        name: id.into(),
+        runner: Some(RunnerHello::default()),
+        ..hello(PROTOCOL_VERSION)
+    };
+    let (mut a, _) = Connection::connect(&url, || runner("a")).await.unwrap();
+    let (mut b, _) = Connection::connect(&url, || runner("b")).await.unwrap();
+
+    // "a" sorts first, but only "b" reads its refreshes from the driver:
+    // the grid is built from "b".
+    let base = 1_000 * NANOS_PER_SEC;
+    b.send(&ClientMessage::Health(health_with_refresh(base, true)))
+        .await
+        .unwrap();
+    let grid = next_grid(&mut a).await;
+    assert_eq!(grid.origin_ns, base);
+    assert_eq!(grid.generation, 1);
+
+    // A report from a Runner that is not the reference changes nothing, nor
+    // does the reference staying on its grid.
+    a.send(&ClientMessage::Health(health_with_refresh(
+        base + 5_000_000,
+        false,
+    )))
+    .await
+    .unwrap();
+    b.send(&ClientMessage::Health(health_with_refresh(
+        grid.instant(600) + 50_000,
+        true,
+    )))
+    .await
+    .unwrap();
+    // A Runner connecting now is given the grid straight away.
+    let (mut c, _) = Connection::connect(&url, || runner("c")).await.unwrap();
+    assert_eq!(next_grid(&mut c).await, grid);
+    let status = director.core().status();
+    assert_eq!(status.grid, Some(grid));
+    assert_eq!(status.grid_source, Some(NodeId("b".into())));
+    director.shutdown().await;
+}

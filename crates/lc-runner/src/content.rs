@@ -87,6 +87,13 @@ pub trait Content {
         true
     }
 
+    /// Whether the picture in the textures is older than the frame last
+    /// asked for (the decoder did not have it in time). Counted per output
+    /// as a late decode: a frame where this layer was behind the others.
+    fn late(&self) -> bool {
+        false
+    }
+
     /// How the shader must interpret the planes.
     fn sampling(&self) -> Sampling {
         Sampling::default()
@@ -202,6 +209,8 @@ pub fn cache_key(layer: &Layer) -> String {
     match &layer.source {
         Source::Image { path } => format!("image:{path}"),
         Source::Color { rgba } => format!("color:{rgba:?}"),
+        // Keyed per layer, like video: each follows its own cue's timing.
+        Source::SyncTest { fps } => format!("sync-test:{}:{fps}", layer.id),
         Source::Video { path } => format!("video:{}:{path}", layer.id),
         Source::Live { kind } => format!("live:{kind}"),
         Source::Missing { reason } => format!("missing:{reason}"),
@@ -224,6 +233,11 @@ pub fn build(layer: &Layer, factory: &TextureFactory) -> anyhow::Result<Box<dyn 
             Ok(Box::new(factory.upload_rgba8("color", 1, 1, &px)))
         }
         Source::Video { path } => Ok(crate::hap::open_video(path, &layer.timing, factory)),
+        Source::SyncTest { fps } => Ok(Box::new(crate::testpattern::SyncTestContent::new(
+            *fps,
+            &layer.timing,
+            factory,
+        ))),
         Source::Missing { reason } => {
             tracing::debug!(layer = %layer.id, "{reason}; showing placeholder");
             Ok(placeholder(factory))

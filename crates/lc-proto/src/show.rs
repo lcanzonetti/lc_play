@@ -254,6 +254,20 @@ pub enum CueSource {
     Asset { asset: String },
     /// A solid colour, linear RGBA 0..1. Useful with no media at all.
     Color { rgba: [f32; 4] },
+    /// A synchronisation test pattern drawn by the Runner: the content frame
+    /// number in large digits and binary blocks, a marker stepping one place
+    /// per frame, and a full white flash once a second. Filmed across two
+    /// outputs (or measured with a photodiode), it shows any offset between
+    /// them in frames. `fps` is its frame rate.
+    #[serde(rename = "sync_test")]
+    SyncTest {
+        #[serde(default = "default_test_fps")]
+        fps: f64,
+    },
+}
+
+fn default_test_fps() -> f64 {
+    60.0
 }
 
 impl Default for CueSource {
@@ -499,6 +513,11 @@ impl ShowDocument {
                             }
                         }
                         CueSource::Color { rgba } => finite(&name, &rgba.map(f64::from))?,
+                        CueSource::SyncTest { fps } => {
+                            if !(fps.is_finite() && (1.0..=1000.0).contains(fps)) {
+                                return Err(format!("{name}: test pattern fps must be 1..1000"));
+                            }
+                        }
                     }
                 }
             }
@@ -516,6 +535,24 @@ mod tests {
         let doc: ShowDocument = serde_json::from_str("{}").unwrap();
         assert_eq!(doc, ShowDocument::default());
         doc.validate().unwrap();
+    }
+
+    #[test]
+    fn the_sync_test_source_is_spelled_as_the_producer_writes_it() {
+        let doc: ShowDocument = serde_json::from_str(
+            r#"{ "tracks": [ { "cues": [ { "source": { "type": "sync_test", "fps": 50 } } ] } ] }"#,
+        )
+        .unwrap();
+        doc.validate().unwrap();
+        assert_eq!(
+            doc.tracks[0].cues[0].source,
+            CueSource::SyncTest { fps: 50.0 }
+        );
+        let bad: ShowDocument = serde_json::from_str(
+            r#"{ "tracks": [ { "cues": [ { "source": { "type": "sync_test", "fps": 0 } } ] } ] }"#,
+        )
+        .unwrap();
+        assert!(bad.validate().is_err());
     }
 
     #[test]

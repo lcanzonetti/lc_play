@@ -36,6 +36,7 @@ use lc_time::TransportChange;
 use crate::assets::AssetCache;
 use crate::content::{self, Content};
 use crate::playhead::Playhead;
+use crate::playhead::Position;
 use crate::render::{Capture, Gpu, OutputGpu};
 use crate::show::{Canvas, Output, Playback, Show};
 use crate::stage;
@@ -101,6 +102,8 @@ pub enum ShowSource {
 struct RenderWindow {
     window: Arc<Window>,
     gpu: OutputGpu,
+    /// Index into `App::gpus`: the card this output is rendered by.
+    gpu_idx: usize,
     /// Index into `show.outputs`.
     output_idx: usize,
     /// The output as it was last applied to this window.
@@ -112,11 +115,14 @@ pub struct App {
     /// The show as the renderer sees it (empty until a cluster show arrives).
     show: Show,
     playhead: Arc<Playhead>,
-    gpu: Option<Gpu>,
-    /// One entry per layer, parallel to `show.layers`…
-    contents: Vec<Box<dyn Content>>,
+    /// One device per graphics card that drives an output.
+    gpus: Vec<Gpu>,
+    /// Per card, one entry per layer, parallel to `show.layers`…
+    contents: Vec<Vec<Box<dyn Content>>>,
     /// …and the identity of each, for reuse when the show is edited.
-    content_keys: Vec<String>,
+    content_keys: Vec<Vec<String>>,
+    /// When output health was last handed to the agent.
+    health_at: Instant,
     windows: Vec<RenderWindow>,
     /// The outputs the current windows were built for.
     window_outputs: Vec<Output>,
@@ -185,9 +191,10 @@ impl App {
             source,
             show: empty_show(),
             playhead,
-            gpu: None,
+            gpus: Vec::new(),
             contents: Vec::new(),
             content_keys: Vec::new(),
+            health_at: Instant::now(),
             windows: Vec::new(),
             window_outputs: Vec::new(),
             by_id: HashMap::new(),
@@ -237,20 +244,18 @@ impl App {
                     self.apply_show(event_loop, show);
                 }
                 RunnerAction::SendPreview => {
-                    if let Some(gpu) = &self.gpu {
-                        self.captures = self
-                            .windows
-                            .iter()
-                            .map(|rw| {
-                                let name = if rw.output.name.is_empty() {
-                                    &rw.output.id
-                                } else {
-                                    &rw.output.name
-                                };
-                                gpu.capture_output(&rw.gpu, name, PREVIEW_WIDTH)
-                            })
-                            .collect();
-                    }
+                    self.captures = self
+                        .windows
+                        .iter()
+                        .map(|rw| {
+                            let name = if rw.output.name.is_empty() {
+                                &rw.output.id
+                            } else {
+                                &rw.output.name
+                            };
+                            self.gpus[rw.gpu_idx].capture_output(&rw.gpu, name, PREVIEW_WIDTH)
+                        })
+                        .collect();
                     if self.captures.is_empty() {
                         // Nothing to show: answer anyway, so the operator
                         // sees that there are no outputs.
@@ -268,7 +273,7 @@ impl App {
         if self.captures.is_empty() {
             return;
         }
-        if let Some(gpu) = &self.gpu {
+        for gpu in &self.gpus {
             gpu.poll();
         }
         let all_done = self.captures.iter().all(|c| c.take_ready());
@@ -441,10 +446,8 @@ impl App {
                 .partial_cmp(&layers[b].transform.z)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        if let Some(gpu) = &self.gpu {
-            for rw in &mut self.windows {
-                gpu.set_layer_count(&mut rw.gpu, layers.len());
-            }
+        for rw in &mut self.windows {
+            self.gpus[rw.gpu_idx].set_layer_count(&mut rw.gpu, layers.len());
         }
     }
 
@@ -491,9 +494,7 @@ impl App {
                         || rw.output.blend != output.blend
                         || rw.output.rotation_degrees != output.rotation_degrees;
                     if geometry_changed {
-                        if let Some(gpu) = &self.gpu {
-                            gpu.update_output(&mut rw.gpu, output);
-                        }
+                        self.gpus[rw.gpu_idx].update_output(&mut rw.gpu, output);
                     }
                     rw.output = output.clone();
                     rw.output_idx = idx;
@@ -509,10 +510,11 @@ impl App {
         drop(existing);
 
         self.window_outputs = outputs.to_vec();
-        if let Some(gpu) = &self.gpu {
-            let (gpu_name, outputs) = (gpu.adapter_info(), self.windows.len() as u32);
+        if !self.gpus.is_empty() {
+            let names: Vec<String> = self.gpus.iter().map(|g| g.adapter_info()).collect();
+            let outputs = self.windows.len() as u32;
             self.playhead.update_hardware(|h| {
-                h.gpu = Some(gpu_name);
+                h.gpu = Some(names.join(" + "));
                 h.outputs = outputs;
             });
         }
@@ -530,32 +532,70 @@ impl App {
         layer_count: usize,
     ) -> anyhow::Result<RenderWindow> {
         let window = Arc::new(event_loop.create_window(window_attributes(output, event_loop))?);
-        let surface = match &self.gpu {
-            Some(gpu) => gpu.create_surface(window.clone())?,
-            None => {
-                let (gpu, surface) = Gpu::new(window.clone())?;
-                tracing::info!(
-                    "GPU: {}{}",
-                    gpu.adapter_info(),
-                    if gpu.supports_bc() {
-                        ""
-                    } else {
-                        " — no BC texture support: HAP will be decoded in software"
-                    }
-                );
-                self.gpu = Some(gpu);
-                surface
-            }
-        };
-        let gpu = self.gpu.as_ref().expect("gpu was just ensured");
-        let phys = window.inner_size();
-        let out_gpu = gpu.build_output(surface, phys.width, phys.height, output, layer_count);
+        let gpu_idx = self.gpu_for(&window)?;
+        let gpu = &self.gpus[gpu_idx];
+        let out_gpu = gpu.build_output(window.clone(), output, layer_count)?;
+        tracing::info!(
+            display = %output.id,
+            gpu = %gpu.adapter_info(),
+            presenter = out_gpu.presenter_name(),
+            "output opened"
+        );
         Ok(RenderWindow {
             window,
             gpu: out_gpu,
+            gpu_idx,
             output_idx: idx,
             output: output.clone(),
         })
+    }
+
+    /// The card that renders `window`: the one its monitor is connected to
+    /// (Windows/D3D12), so no other card has to copy the picture across —
+    /// which costs a frame of latency on that output alone and keeps it out
+    /// of the present barrier. Elsewhere, and on laptops whose screens hang
+    /// off the integrated GPU, the one high-performance card.
+    fn gpu_for(&mut self, window: &Arc<Window>) -> anyhow::Result<usize> {
+        #[cfg(windows)]
+        let luid = {
+            use winit::platform::windows::MonitorHandleExtWindows;
+            window
+                .current_monitor()
+                .and_then(|m| crate::dxgi::adapter_of_monitor(m.hmonitor()))
+        };
+        #[cfg(not(windows))]
+        let luid: Option<i64> = None;
+
+        if let Some(i) = luid.and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l))) {
+            return Ok(i);
+        }
+        if !self.gpus.is_empty() && luid.is_none() {
+            return Ok(0);
+        }
+        let gpu = Gpu::new(window.clone(), luid)?;
+        // The card asked for may have been refused (integrated): the device
+        // made instead may be one we already have.
+        if let Some(i) = gpu
+            .luid()
+            .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)))
+        {
+            return Ok(i);
+        }
+        tracing::info!(
+            "GPU: {}{}",
+            gpu.adapter_info(),
+            if gpu.supports_bc() {
+                ""
+            } else {
+                " — no BC texture support: HAP will be decoded in software"
+            }
+        );
+        self.gpus.push(gpu);
+        self.contents.push(Vec::new());
+        self.content_keys.push(Vec::new());
+        // The new card needs the show's contents too.
+        self.rebuild_contents_on(self.gpus.len() - 1);
+        Ok(self.gpus.len() - 1)
     }
 
     /// Load the content of every layer of `self.show`, keeping what was
@@ -563,18 +603,19 @@ impl App {
     /// source fails (missing file, oversized image, ...) gets a visible
     /// placeholder and an error log rather than taking the whole show down.
     fn rebuild_contents(&mut self) {
-        let Some(gpu) = self.gpu.as_ref() else {
-            // No GPU yet (no window was ever needed): nothing can be loaded,
-            // and nothing will be drawn.
-            self.contents.clear();
-            self.content_keys.clear();
-            return;
-        };
-        let factory = gpu.factory();
+        for g in 0..self.gpus.len() {
+            self.rebuild_contents_on(g);
+        }
+    }
+
+    /// [`rebuild_contents`](Self::rebuild_contents) for one card.
+    fn rebuild_contents_on(&mut self, g: usize) {
+        let factory = self.gpus[g].factory();
 
         // What is loaded now, by identity.
         let mut loaded: HashMap<String, Vec<Box<dyn Content>>> = HashMap::new();
-        for (key, content) in self.content_keys.drain(..).zip(self.contents.drain(..)) {
+        let (keys, contents) = (&mut self.content_keys[g], &mut self.contents[g]);
+        for (key, content) in keys.drain(..).zip(contents.drain(..)) {
             loaded.entry(key).or_default().push(content);
         }
 
@@ -593,8 +634,8 @@ impl App {
                     })
                 }
             };
-            self.contents.push(content);
-            self.content_keys.push(key);
+            contents.push(content);
+            keys.push(key);
         }
         // Whatever is left in `loaded` is no longer used and is dropped here
         // (for video that also stops its decoder).
@@ -615,33 +656,122 @@ impl App {
         self.local_transport(TransportChange::SeekBy(seconds * NANOS_PER_SEC));
     }
 
-    /// Render all outputs for one show-clock sample, then present them together.
+    /// Render one frame on every output, card by card.
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(gpu) = self.gpu.as_ref() else {
-            return;
-        };
         if self.windows.is_empty() {
             // No outputs (the show lost its displays): nothing may keep
             // decoding in the background.
-            for c in &mut self.contents {
-                c.idle();
-            }
+            self.contents.iter_mut().flatten().for_each(|c| c.idle());
             return;
         }
-        // One sample of the cluster clock per frame, shared by every output
-        // and every timeline.
-        let position = self.playhead.position();
-        let now = position.show_seconds();
-        let loop_s = position
-            .transport
-            .loop_ns
-            .map(|ns| ns as f64 / NANOS_PER_SEC as f64);
+        let mut sampled = None;
+        for g in 0..self.gpus.len() {
+            if let Some(position) = self.render_on(g, event_loop) {
+                sampled.get_or_insert(position);
+            }
+        }
+        if let Some(position) = sampled {
+            if let Some(fps) = self.stats.tick() {
+                // Reported to the Director with the next health message.
+                self.playhead.report_fps(fps as f32);
+                tracing::info!(
+                    "{fps:.1} fps (show time {:.1}s, frame {})",
+                    position.show_seconds(),
+                    position.frame
+                );
+            }
+        }
+        if self.health_at.elapsed() >= Duration::from_millis(500) {
+            self.health_at = Instant::now();
+            self.publish_output_health();
+        }
+    }
 
-        // Each layer's time is that of the timeline it belongs to: the main
-        // timeline's, or its task's — `None` while that task is off stage.
+    /// Render the outputs of card `g`:
+    ///
+    /// 1. wait for each output to take a frame (this is where the loop is
+    ///    paced by the displays);
+    /// 2. work out the refresh the frame will appear on — the next one plus
+    ///    the frames queued ahead of it, corrected by what the driver reports
+    ///    — and sample the show clock *for that instant*, snapped to the
+    ///    Director's refresh grid when frame-locked;
+    /// 3. update the contents of the layers this card shows, render, present.
+    fn render_on(&mut self, g: usize, event_loop: &ActiveEventLoop) -> Option<Position> {
+        let outs: Vec<usize> = (0..self.windows.len())
+            .filter(|&w| self.windows[w].gpu_idx == g)
+            .collect();
+        if outs.is_empty() {
+            self.contents[g].iter_mut().for_each(|c| c.idle());
+            return None;
+        }
+
+        let playhead = self.playhead.clone();
+        let local_now = || playhead.clock.local_now_ns();
+        let mut frames = Vec::with_capacity(outs.len());
+        for &w in &outs {
+            match self.gpus[g].acquire(&mut self.windows[w].gpu, local_now) {
+                Ok(frame) => frames.push((w, frame)),
+                Err(e) => self.surface_error(g, w, e, event_loop),
+            }
+        }
+        if frames.is_empty() {
+            return None;
+        }
+
+        // The refresh each output's frame will reach, and the instant the
+        // card's picture is for (that of its first output: outputs of one
+        // card share one sample, which keeps them in lockstep).
+        let now = local_now();
+        let latency = crate::render::frame_latency() as i64;
+        let targets: Vec<Option<(i64, i64)>> = frames
+            .iter()
+            .map(|(w, _)| {
+                let t = &self.windows[*w].gpu.timing;
+                let (next, _) = t.clock.next_after(now)?;
+                let n = next + latency - 1 + t.tracker.correction();
+                Some((n, t.clock.time_of(n)?))
+            })
+            .collect();
+        let display_local = targets[0].map_or(now, |(_, at)| at);
+        let (position, grid_offset) = playhead.position_for_display(display_local);
+
+        let times = self.layer_times(&position);
+        let late = self.update_contents(g, &outs, &position, &times);
+
+        let views: Vec<_> = frames
+            .iter()
+            .map(|(w, f)| {
+                let rw = &self.windows[*w];
+                (&rw.gpu, &self.show.outputs[rw.output_idx], &f.view)
+            })
+            .collect();
+        self.gpus[g].render(
+            &views,
+            &self.show,
+            &times,
+            &self.contents[g],
+            &self.draw_order,
+        );
+        for (w, _) in &frames {
+            self.windows[*w].window.pre_present_notify();
+        }
+        for ((w, frame), target) in frames.into_iter().zip(targets) {
+            let rw = &mut self.windows[w];
+            self.gpus[g].present(&mut rw.gpu, frame, target.map(|(n, _)| n));
+            rw.gpu.timing.grid_offset = grid_offset;
+            if late.contains(&w) {
+                rw.gpu.timing.late_decodes += 1;
+            }
+        }
+        Some(position)
+    }
+
+    /// Each layer's time: that of the timeline it belongs to — the main
+    /// timeline's, or its task's (`None` while that task is off stage).
+    fn layer_times(&self, position: &Position) -> Vec<Option<f64>> {
+        let now = position.show_seconds();
         let mut task_times: HashMap<&str, Option<f64>> = HashMap::new();
-        let times: Vec<Option<f64>> = self
-            .show
+        self.show
             .layers
             .iter()
             .map(|layer| match layer.timeline.as_deref() {
@@ -650,10 +780,36 @@ impl App {
                     .entry(id)
                     .or_insert_with(|| self.playhead.task_seconds(id, position.cluster_ns)),
             })
-            .collect();
+            .collect()
+    }
 
-        let factory = gpu.factory();
-        for ((layer, c), time) in self.show.layers.iter().zip(&mut self.contents).zip(&times) {
+    /// Bring card `g`'s contents to `position`. Only layers that fall on one
+    /// of the card's outputs (`outs`) are decoded; the others are idle on
+    /// this card. Returns the outputs on which a video layer was late.
+    fn update_contents(
+        &mut self,
+        g: usize,
+        outs: &[usize],
+        position: &Position,
+        times: &[Option<f64>],
+    ) -> Vec<usize> {
+        let loop_s = position
+            .transport
+            .loop_ns
+            .map(|ns| ns as f64 / NANOS_PER_SEC as f64);
+        let areas: Vec<(usize, crate::show::Rect)> = outs
+            .iter()
+            .map(|&w| (w, self.show.outputs[self.windows[w].output_idx].canvas_rect))
+            .collect();
+        let factory = self.gpus[g].factory();
+        let mut late = Vec::new();
+        let layers = self
+            .show
+            .layers
+            .iter()
+            .zip(&mut self.contents[g])
+            .zip(times);
+        for ((layer, c), time) in layers {
             let Some(t) = *time else {
                 c.idle(); // its timeline is off stage
                           // Played again later, it goes on air afresh.
@@ -689,14 +845,28 @@ impl App {
                 (true, None) => 0.0,
                 (false, _) => timeline_t,
             };
+            // Not on any of this card's outputs: another card (or Runner)
+            // shows it. Decoding it here would only cost time.
+            let here: Vec<usize> = areas
+                .iter()
+                .filter(|(_, r)| overlaps(&layer.transform, r))
+                .map(|&(w, _)| w)
+                .collect();
+            if here.is_empty() {
+                c.idle();
+                continue;
+            }
             // Time until the layer appears, allowing for the main timeline
             // looping back to a cue at its beginning.
             let mut until_start = layer.timing.start - t;
             if let (true, Some(len), None) = (until_start < 0.0, loop_s, &layer.timeline) {
                 until_start += len;
             }
-            if layer.timing.visible_at(t) {
+            if on_air {
                 c.update(media(t), &factory);
+                if c.late() {
+                    late.extend(here);
+                }
             } else if (0.0..=PREROLL_S).contains(&until_start) {
                 // About to appear: get its first frame decoded and into the
                 // texture now, so the cue starts on its first frame instead
@@ -708,50 +878,92 @@ impl App {
                 c.idle();
             }
         }
+        late.sort_unstable();
+        late.dedup();
+        late
+    }
 
-        let targets: Vec<_> = self
-            .windows
-            .iter()
-            .map(|rw| (&rw.gpu, &self.show.outputs[rw.output_idx]))
-            .collect();
-        let frame = gpu.draw(
-            &targets,
-            &self.show,
-            &times,
-            &self.contents,
-            &self.draw_order,
-        );
-        for rw in &self.windows {
-            rw.window.pre_present_notify();
-        }
-        let errors = frame.present();
-        if let Some(fps) = self.stats.tick() {
-            // Reported to the Director with the next health message.
-            self.playhead.report_fps(fps as f32);
-            tracing::info!(
-                "{fps:.1} fps (show time {now:.1}s, frame {})",
-                position.frame
-            );
-        }
-
-        for (idx, err) in errors {
-            let rw = &mut self.windows[idx];
-            match err {
-                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                    let size = rw.window.inner_size();
-                    gpu.resize_output(&mut rw.gpu, size.width, size.height);
-                }
-                wgpu::SurfaceError::OutOfMemory => {
-                    tracing::error!("GPU out of memory; exiting");
-                    event_loop.exit();
-                }
-                // Typical for a minimized/occluded window; it would otherwise
-                // log at the frame rate.
-                wgpu::SurfaceError::Timeout => tracing::debug!(output = idx, "surface timeout"),
-                e => tracing::warn!("surface error: {e:?}"),
+    /// React to an output whose frame could not be acquired.
+    fn surface_error(
+        &mut self,
+        g: usize,
+        w: usize,
+        err: wgpu::SurfaceError,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let rw = &mut self.windows[w];
+        match err {
+            wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                let size = rw.window.inner_size();
+                self.gpus[g].resize_output(&mut rw.gpu, size.width, size.height);
             }
+            wgpu::SurfaceError::OutOfMemory => {
+                tracing::error!("GPU out of memory; exiting");
+                event_loop.exit();
+            }
+            // Typical for a minimized/occluded window; it would otherwise
+            // log at the frame rate.
+            wgpu::SurfaceError::Timeout => tracing::debug!(output = w, "surface timeout"),
+            e => tracing::warn!("surface error: {e:?}"),
         }
     }
+
+    /// Hand each output's presentation health, and the first output's
+    /// refresh (for the Director's grid), to the agent.
+    fn publish_output_health(&self) {
+        let now = self.playhead.clock.local_now_ns();
+        let health: Vec<lc_proto::OutputHealth> = self
+            .windows
+            .iter()
+            .map(|rw| {
+                let t = &rw.gpu.timing;
+                let exact = rw.gpu.exact_timing();
+                lc_proto::OutputHealth {
+                    id: rw.output.id.clone(),
+                    gpu: self.gpus[rw.gpu_idx].adapter_info(),
+                    presenter: rw.gpu.presenter_name().into(),
+                    refresh_hz: t.clock.period().map(|p| 1e9 / p),
+                    presents: t.tracker.presents,
+                    missed: t.tracker.missed,
+                    late_decodes: t.late_decodes,
+                    latency_frames: exact
+                        .then(|| crate::render::frame_latency() as i64 + t.tracker.correction()),
+                    barrier: if t.barrier.is_empty() {
+                        "off"
+                    } else {
+                        t.barrier
+                    }
+                    .into(),
+                    grid_offset_ns: t.grid_offset,
+                    frame_counter: t.frame_counter,
+                }
+            })
+            .collect();
+        let vblank = self.windows.first().and_then(|rw| {
+            let clock = &rw.gpu.timing.clock;
+            let (_, at) = clock.last_refresh(now)?;
+            let period = clock.period()?;
+            let reading = self.playhead.clock.read(at);
+            reading.synced.then(|| lc_proto::VblankReport {
+                vblank_ns: reading.cluster_ns,
+                period_ps: (period * 1000.0).round() as i64,
+                exact: clock.is_exact(),
+            })
+        });
+        self.playhead.update_hardware(|h| {
+            h.output_health = health;
+            h.vblank = vblank;
+        });
+    }
+}
+
+/// Whether a layer can touch the canvas area `r`. Conservative: the layer is
+/// taken as a circle around its anchor point as wide as its diagonal, which
+/// covers any rotation and anchor.
+fn overlaps(t: &crate::show::Transform, r: &crate::show::Rect) -> bool {
+    let reach = (t.size[0] * t.scale[0]).hypot(t.size[1] * t.scale[1]);
+    let [x, y] = t.position;
+    x + reach >= r.x && x - reach <= r.x + r.w && y + reach >= r.y && y - reach <= r.y + r.h
 }
 
 /// Build the winit window attributes for one output.
@@ -870,9 +1082,8 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = self.gpu.as_ref() {
-                    gpu.resize_output(&mut self.windows[idx].gpu, size.width, size.height);
-                }
+                let rw = &mut self.windows[idx];
+                self.gpus[rw.gpu_idx].resize_output(&mut rw.gpu, size.width, size.height);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
@@ -903,9 +1114,7 @@ impl ApplicationHandler for App {
 
         if self.windows.is_empty() {
             // Nothing may keep decoding with no output to show it on.
-            for c in &mut self.contents {
-                c.idle();
-            }
+            self.contents.iter_mut().flatten().for_each(|c| c.idle());
             // Nothing to draw (no show yet, or no display for this Runner):
             // wake up a few times a second to look for one, instead of
             // spinning.

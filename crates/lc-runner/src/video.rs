@@ -352,6 +352,8 @@ pub struct VideoContent {
     standby: Option<Decoder>,
     /// Frame currently in the texture.
     shown: Option<i64>,
+    /// The frame last asked for (by `update`).
+    last_want: Option<i64>,
     /// When a decoder was last started; limits how often that happens.
     last_start: Option<std::time::Instant>,
     failed: bool,
@@ -434,6 +436,7 @@ impl VideoContent {
             decoder: None,
             standby: None,
             shown: None,
+            last_want: None,
             last_start: None,
             failed: false,
         }
@@ -507,6 +510,7 @@ impl Content for VideoContent {
             return;
         }
         let want = media_frame(&self.timing, self.info.fps(), self.info.frames, t);
+        self.last_want = Some(want);
         if self.shown == Some(want) {
             return;
         }
@@ -608,6 +612,10 @@ impl Content for VideoContent {
 
     fn ready(&self) -> bool {
         self.shown.is_some()
+    }
+
+    fn late(&self) -> bool {
+        self.shown.is_some() && self.last_want.is_some() && self.shown != self.last_want
     }
 }
 

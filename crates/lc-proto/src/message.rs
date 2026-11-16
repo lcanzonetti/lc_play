@@ -213,6 +213,12 @@ pub struct Health {
     /// Outputs closed by `Standby`.
     #[serde(default)]
     pub standby: bool,
+    /// Presentation health of each output.
+    #[serde(default)]
+    pub output_health: Vec<crate::OutputHealth>,
+    /// The refresh of this Runner's first output, for the Director's grid.
+    #[serde(default)]
+    pub vblank: Option<crate::VblankReport>,
 }
 
 /// Facts about a Runner's computer.
@@ -295,6 +301,11 @@ pub enum ServerMessage {
     },
     /// Cluster overview (Producers / controllers; 1 Hz and on request).
     Cluster(ClusterStatus),
+    /// The refresh grid frame-locked Runners render for (see
+    /// [`crate::vblank`]). Sent when it changes and on connection.
+    Grid {
+        grid: crate::VblankGrid,
+    },
     /// The Director could not act on a message. Never fatal for the link.
     Error {
         message: String,
@@ -344,6 +355,11 @@ pub struct ClusterStatus {
     /// offline one can still be listed and woken.
     #[serde(default)]
     pub known_runners: Vec<KnownRunner>,
+    /// The refresh grid in force, and the Runner it is measured on.
+    #[serde(default)]
+    pub grid: Option<crate::VblankGrid>,
+    #[serde(default)]
+    pub grid_source: Option<NodeId>,
 }
 
 /// A Runner the Director remembers.

@@ -94,6 +94,7 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
             for (ci, cue) in track.cues.iter().enumerate() {
                 let source = match &cue.source {
                     CueSource::Color { rgba } => Source::Color { rgba: *rgba },
+                    CueSource::SyncTest { fps } => Source::SyncTest { fps: *fps },
                     CueSource::Asset { asset } => match doc.asset(asset) {
                         None => Source::Missing {
                             reason: format!("asset '{asset}' is not in the show"),

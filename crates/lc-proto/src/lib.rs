@@ -31,6 +31,7 @@ pub mod beacon;
 pub mod message;
 pub mod show;
 pub mod transport;
+pub mod vblank;
 
 pub use beacon::{Beacon, DISCOVERY_GROUP, DISCOVERY_PORT};
 pub use message::{
@@ -39,6 +40,7 @@ pub use message::{
 };
 pub use show::ShowDocument;
 pub use transport::{FrameRate, TransportState};
+pub use vblank::{GridSchedule, OutputHealth, VblankGrid, VblankReport};
 
 use serde::{Deserialize, Serialize};
 

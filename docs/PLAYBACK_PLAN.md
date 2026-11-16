@@ -1,6 +1,13 @@
 # Playback and frame-sync plan
 
-Status: plan, November 2026. Nothing here is implemented yet. Claims marked
+Status, November 2026: **P0–P2 implemented** (see ARCHITECTURE §3.3) and
+awaiting their first run on frame-locked hardware; P3–P6 not started.
+Differences from the plan below: the shared timebase is a refresh grid
+published by the Director (exact integer instants) rather than NVIDIA's frame
+counter, which is reported for diagnosis only — the grid works without
+NVAPI and on any frame-locked hardware; and the present-wait / Vulkan timing
+extensions are not used (Windows uses DXGI statistics; elsewhere the render
+loop's timing). The rest of this document is the plan as written. Claims marked
 **[Uncertain]** come from documentation or inference, not from measurements on
 our hardware; each says what would settle it.
 
