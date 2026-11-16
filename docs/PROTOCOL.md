@@ -147,7 +147,9 @@ A Runner's `health` also reports `monitors` (index, name, size, position),
 presenter, refresh rate, presents, missed presents, late decodes, frames
 queued, NVIDIA present-barrier state, distance from the refresh grid,
 frame-lock counter), `vblank` (the first output's refresh, which the Director
-builds the grid from), and `machine`: `hostname`, `os`,
+builds the grid from), `downloads` (media being copied into its cache:
+`name`, `done` and `total` bytes, `bytes_per_s`, and `error` / `retry_in_s`
+while waiting to retry), and `machine`: `hostname`, `os`,
 `version`, `ip`, `mac`, `allow_power`, `supervised`. `cluster` carries
 `known_runners`: every Runner the Director has seen (`name`, `node_id`,
 `machine`, `online`), so offline ones can be listed and woken.

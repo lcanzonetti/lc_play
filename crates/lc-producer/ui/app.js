@@ -1423,6 +1423,7 @@ function renderRunners(force = false) {
       return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine,
         (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000),
           o.refresh_hz == null ? null : Math.round(o.refresh_hz * 10), o.frame_counter == null]),
+        (h?.downloads || []).map((d) => [d.name, d.total ? Math.floor((d.done / d.total) * 200) : Math.round(d.done / 1e7), !!d.error, d.retry_in_s]),
         S.status?.grid_source === node?.node_id];
     }),
     S.doc.stage.displays, S.sel, S.connected, [...S.previewOn],
@@ -1498,6 +1499,7 @@ function renderRunners(force = false) {
           ? [machine.os, `LC Play ${machine.version}`, machine.mac ? `MAC ${machine.mac}` : null, machine.allow_power ? 'power control allowed' : null].filter(Boolean).join(' · ')
           : '—')));
     }
+    if (h?.downloads?.length) card.append(downloadBars(h.downloads));
     if (S.previewOn.has(name)) card.append(el('div', { class: 'previews', dataset: { runner: name } }));
 
     // The displays this Runner drives: its own, and those assigned to none.
@@ -1517,6 +1519,26 @@ function renderRunners(force = false) {
     box.append(card);
     showPreviews(name);
   }
+}
+
+/** Media being copied into a Runner's cache: one bar each. Until a file is
+ *  complete, the cues that use it show the black-and-magenta placeholder on
+ *  that Runner's outputs. */
+function downloadBars(downloads) {
+  const mb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`);
+  const box = el('div', { class: 'downloads' }, el('h4', {}, 'Loading media'));
+  for (const d of downloads) {
+    const frac = d.total ? Math.min(1, d.done / d.total) : 0;
+    const left = d.total && d.bytes_per_s > 0 ? Math.max(0, (d.total - d.done) / d.bytes_per_s) : null;
+    const eta = left == null ? '' : left >= 90 ? ` · ${Math.round(left / 60)} min left` : ` · ${Math.ceil(left)} s left`;
+    const text = d.error
+      ? `failed — retrying in ${d.retry_in_s ?? 0} s`
+      : `${d.total ? Math.floor(frac * 100) + ' % · ' : ''}${mb(d.done)}${d.total ? ' / ' + mb(d.total) : ''} · ${mb(d.bytes_per_s)}/s${eta}`;
+    box.append(el('div', { class: `dl${d.error ? ' failed' : ''}`, title: d.error || d.name },
+      el('div', { class: 'dl-head' }, el('span', { class: 'dl-name' }, d.name), el('span', { class: 'dim' }, text)),
+      el('div', { class: 'bar' }, el('div', { class: 'fill', style: `width:${(frac * 100).toFixed(1)}%` }))));
+  }
+  return box;
 }
 
 /** One "Sync" row per output of a Runner: how its frames reach the

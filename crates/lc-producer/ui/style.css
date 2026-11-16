@@ -203,3 +203,12 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 #modal[hidden] { display: none; }
 #modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; max-width: 420px; white-space: pre-wrap; }
 #modal .btns { justify-content: flex-end; }
+/* Media downloads on a Runner (Runners window). */
+.downloads { margin: 6px 0; }
+.dl { margin: 4px 0; font-size: 12px; }
+.dl-head { display: flex; flex-wrap: wrap; gap: 0 8px; justify-content: space-between; }
+.dl-name { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl .bar { height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.08); overflow: hidden; margin-top: 2px; }
+.dl .fill { height: 100%; background: var(--accent, #3d8bfd); transition: width 0.4s linear; }
+.dl.failed .fill { background: #e8a33d; }
+.dl.failed .dim { color: #e8a33d; }

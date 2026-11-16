@@ -68,6 +68,11 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
   Windows swap chain and NVIDIA present barrier code (`dxgi.rs`,
   `nvapi.rs`) has only been compiled: the first run on a show machine is its
   first run.
+* **Runners copy media into their own cache before playing it** — on one
+  machine too. Until a file is complete its cues show a black-and-magenta
+  checkerboard; the Runners window shows a *Loading media* bar per file
+  (progress, rate, time left, or the error and the next retry). Load the
+  show and let the bars finish before the doors open.
 * **A layer that spans two graphics cards of one Runner is decoded once per
   card.** Fine for HAP at moderate sizes; plan canvases so that big video
   stays on one card where possible.

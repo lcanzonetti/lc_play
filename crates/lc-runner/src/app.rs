@@ -979,9 +979,14 @@ impl App {
                 exact: clock.is_exact(),
             })
         });
+        let downloads = match &self.source {
+            ShowSource::Cluster { assets, .. } => assets.downloads(),
+            ShowSource::Local(_) => Vec::new(),
+        };
         self.playhead.update_hardware(|h| {
             h.output_health = health;
             h.vblank = vblank;
+            h.downloads = downloads;
         });
     }
 }
@@ -1160,6 +1165,11 @@ impl ApplicationHandler for App {
         if self.windows.is_empty() {
             // Nothing may keep decoding with no output to show it on.
             self.contents.iter_mut().flatten().for_each(|c| c.idle());
+            // Downloads still progress (and are reported) without outputs.
+            if self.health_at.elapsed() >= Duration::from_millis(500) {
+                self.health_at = Instant::now();
+                self.publish_output_health();
+            }
             // Nothing to draw (no show yet, or no display for this Runner):
             // wake up a few times a second to look for one, instead of
             // spinning.

@@ -83,6 +83,8 @@ pub struct Hardware {
     pub output_health: Vec<lc_proto::OutputHealth>,
     /// The first output's refresh, for the Director's grid.
     pub vblank: Option<lc_proto::VblankReport>,
+    /// Media being copied into the cache.
+    pub downloads: Vec<lc_proto::AssetDownload>,
 }
 
 struct Inner {

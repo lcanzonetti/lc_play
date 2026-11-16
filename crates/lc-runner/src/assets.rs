@@ -20,9 +20,10 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lc_proto::show::Asset;
+use lc_proto::AssetDownload;
 
 /// Wait before retrying a failed download: this long after the first
 /// failure, doubling up to the maximum. An asset that was deleted or
@@ -40,6 +41,20 @@ pub struct AssetCache {
     generation: AtomicU64,
     /// Consecutive failed downloads per cache file name.
     failures: Mutex<HashMap<String, u32>>,
+    /// Downloads in progress or waiting to retry, by cache file name: what
+    /// the operator sees as progress bars.
+    progress: Mutex<HashMap<String, Progress>>,
+}
+
+/// One download's progress, shared with its thread.
+struct Progress {
+    name: String,
+    total: u64,
+    /// Bytes received, updated by the download thread as data arrives.
+    done: Arc<AtomicU64>,
+    started: Instant,
+    /// After a failed attempt: why, and when the next one starts.
+    failed: Option<(String, Instant)>,
 }
 
 enum Entry {
@@ -58,7 +73,33 @@ impl AssetCache {
             entries: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             failures: Mutex::new(HashMap::new()),
+            progress: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Downloads in progress or waiting to retry, for the health report.
+    pub fn downloads(&self) -> Vec<AssetDownload> {
+        let progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list: Vec<AssetDownload> = progress
+            .values()
+            .map(|p| {
+                let done = p.done.load(Ordering::Relaxed);
+                let secs = p.started.elapsed().as_secs_f64();
+                AssetDownload {
+                    name: p.name.clone(),
+                    done,
+                    total: p.total,
+                    bytes_per_s: if secs > 0.0 { done as f64 / secs } else { 0.0 },
+                    error: p.failed.as_ref().map(|(e, _)| e.clone()),
+                    retry_in_s: p
+                        .failed
+                        .as_ref()
+                        .map(|(_, at)| at.saturating_duration_since(Instant::now()).as_secs()),
+                }
+            })
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
     }
 
     pub fn generation(&self) -> u64 {
@@ -102,12 +143,30 @@ impl AssetCache {
     /// Download thread body.
     fn fetch(&self, asset: &Asset, name: &str, path: &Path) {
         tracing::info!("fetching asset '{}' from {}", asset.name, asset.url);
-        let result = download(&asset.url, path, asset.size);
+        let done = Arc::new(AtomicU64::new(0));
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                Progress {
+                    name: asset.name.clone(),
+                    total: asset.size,
+                    done: done.clone(),
+                    started: Instant::now(),
+                    failed: None,
+                },
+            );
+        let result = download(&asset.url, path, asset.size, &done);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Ok(bytes) => {
                 tracing::info!("asset '{}' ready ({bytes} bytes)", asset.name);
                 entries.insert(name.to_string(), Entry::Ready(path.to_path_buf()));
+                self.progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
                 self.failures
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -134,8 +193,21 @@ impl AssetCache {
                 } else {
                     tracing::debug!("asset '{}': {e:#} (attempt {attempt})", asset.name);
                 }
+                if let Some(p) = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(name)
+                {
+                    p.failed = Some((format!("{e:#}"), Instant::now() + wait));
+                }
                 std::thread::sleep(wait);
-                // Forget it, so the next request starts a fresh attempt.
+                // Forget it, so the next request starts a fresh attempt (and
+                // the bar, if the show still needs it).
+                self.progress
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
                 self.entries
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -168,7 +240,7 @@ fn file_name(asset: &Asset) -> String {
 
 /// Fetch `url` into `path` via a temporary file, so a partial download is
 /// never mistaken for the asset.
-fn download(url: &str, path: &Path, expected: u64) -> anyhow::Result<u64> {
+fn download(url: &str, path: &Path, expected: u64, done: &AtomicU64) -> anyhow::Result<u64> {
     let response = ureq::get(url)
         .timeout(Duration::from_secs(3600))
         .call()
@@ -189,7 +261,11 @@ fn download(url: &str, path: &Path, expected: u64) -> anyhow::Result<u64> {
     }
     let tmp = path.with_extension("part");
     let mut file = std::fs::File::create(&tmp)?;
-    let bytes = std::io::copy(&mut response.into_reader().take(u64::MAX), &mut file)?;
+    let mut reader = Counting {
+        inner: response.into_reader().take(u64::MAX),
+        done,
+    };
+    let bytes = std::io::copy(&mut reader, &mut file)?;
     file.sync_all()?;
     if expected != 0 && bytes != expected {
         let _ = std::fs::remove_file(&tmp);
@@ -197,6 +273,20 @@ fn download(url: &str, path: &Path, expected: u64) -> anyhow::Result<u64> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(bytes)
+}
+
+/// A reader that publishes how much has been read, for the progress bar.
+struct Counting<'a, R> {
+    inner: R,
+    done: &'a AtomicU64,
+}
+
+impl<R: std::io::Read> std::io::Read for Counting<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.done.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +316,53 @@ mod tests {
             !hostile.contains('/') && !hostile.contains(".."),
             "{hostile}"
         );
+    }
+
+    #[test]
+    fn download_progress_is_reported_while_it_runs_and_cleared_after() {
+        use std::io::{Read as _, Write as _};
+        // A tiny HTTP server that sends 64 KiB slowly, in 16 chunks.
+        const SIZE: usize = 64 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\n\r\n").unwrap();
+            for _ in 0..16 {
+                s.write_all(&[7u8; SIZE / 16]).unwrap();
+                s.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("lcplay-dl-test-{}", std::process::id()));
+        let cache = AssetCache::new(dir.clone());
+        let asset = Asset {
+            id: "big".into(),
+            name: "big.mov".into(),
+            size: SIZE as u64,
+            url: format!("http://127.0.0.1:{port}/stream/big"),
+            ..Default::default()
+        };
+        assert_eq!(cache.local_path(&asset), None, "starts a download");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen_partial = false;
+        while cache.local_path(&asset).is_none() {
+            assert!(Instant::now() < deadline, "download never finished");
+            if let Some(d) = cache.downloads().first() {
+                assert_eq!((d.name.as_str(), d.total), ("big.mov", SIZE as u64));
+                seen_partial |= d.done > 0 && d.done < d.total;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(seen_partial, "progress was visible mid-way");
+        assert!(
+            cache.downloads().is_empty(),
+            "a finished download leaves the list"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

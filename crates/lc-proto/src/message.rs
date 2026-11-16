@@ -219,6 +219,29 @@ pub struct Health {
     /// The refresh of this Runner's first output, for the Director's grid.
     #[serde(default)]
     pub vblank: Option<crate::VblankReport>,
+    /// Media being copied into the Runner's cache (cues using it show a
+    /// placeholder until it is complete).
+    #[serde(default)]
+    pub downloads: Vec<AssetDownload>,
+}
+
+/// One asset on its way into a Runner's cache.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AssetDownload {
+    /// The asset's file name, as the operator knows it.
+    pub name: String,
+    /// Bytes received so far.
+    pub done: u64,
+    /// Size of the file (0 = unknown).
+    pub total: u64,
+    /// Average rate since the download started, bytes per second.
+    pub bytes_per_s: f64,
+    /// Why the last attempt failed, while waiting to retry.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Seconds until the next attempt, while waiting to retry.
+    #[serde(default)]
+    pub retry_in_s: Option<u64>,
 }
 
 /// Facts about a Runner's computer.

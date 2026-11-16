@@ -515,6 +515,7 @@ impl Link {
             standby: self.playhead.standby(),
             output_health: hardware.output_health,
             vblank: hardware.vblank,
+            downloads: hardware.downloads,
         }
     }
 
