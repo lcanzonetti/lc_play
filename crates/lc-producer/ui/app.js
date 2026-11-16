@@ -730,6 +730,42 @@ async function uploadFiles(files) {
 
 const previews = new Map(); // key → { kind, node, thumb, failed }
 
+// Live video in the stage preview can be turned off on this computer: video
+// cues then show their still thumbnail and no <video> element exists, so the
+// browser decodes nothing. Images are drawn either way (decoded once).
+const LIVE_VIDEO_KEY = 'lcplay.liveVideo';
+let liveVideo = (() => {
+  try { return localStorage.getItem(LIVE_VIDEO_KEY) !== 'off'; } catch { return true; }
+})();
+const stills = new Map(); // asset id:size → thumbnail <img> (still mode)
+
+function setLiveVideo(on) {
+  liveVideo = on;
+  try { localStorage.setItem(LIVE_VIDEO_KEY, on ? 'on' : 'off'); } catch { /* not remembered */ }
+  if (!on) {
+    // Release every video decoder now, not when the previews time out.
+    for (const [key, p] of previews) {
+      if (p.kind !== 'video') continue;
+      p.node.pause();
+      p.node.removeAttribute('src');
+      p.node.load();
+      previews.delete(key);
+    }
+  }
+}
+
+/** The still picture of a video asset (its thumbnail), or null while loading. */
+function stillFor(asset) {
+  const key = `${asset.id}:${asset.size}`;
+  let img = stills.get(key);
+  if (!img) {
+    img = new Image();
+    img.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
+    stills.set(key, img);
+  }
+  return drawable(img);
+}
+
 function previewFor(cue, asset) {
   // One element per video cue (each has its own position); images are
   // shared per file. The size is in the key so a replaced file reloads.
@@ -794,6 +830,7 @@ function tidyPreviews(now) {
 function cuePicture(cue, track, t, tl, onAir) {
   const asset = assetOf(cue);
   if (!asset) return null;
+  if (asset.kind === 'video' && !liveVideo) return stillFor(asset);
   const p = previewFor(cue, asset);
   if (asset.kind !== 'video') return (!p.failed && drawable(p.node)) || drawable(p.thumb);
   const tr = currentTransport(tl);
@@ -1935,6 +1972,8 @@ $('#chk-loop').onchange = (e) => command({ type: 'set_loop', loop_ns: e.target.c
 $('#sel-rate').onchange = (e) => command({ type: 'set_rate', rate_permille: Number(e.target.value) });
 $('#btn-undo').onclick = () => stepHistory(S.undo, S.redo);
 $('#btn-redo').onclick = () => stepHistory(S.redo, S.undo);
+$('#stage-video').checked = liveVideo;
+$('#stage-video').onchange = (e) => setLiveVideo(e.target.checked);
 $('#btn-synctest').onclick = () => {
   const e = extent();
   addCue({ name: 'Sync test', source: { type: 'sync_test', fps: 60 }, duration_s: 600, x: e.x, y: e.y, w: e.w, h: e.h }, S.tl, 0, showSeconds(S.tl));

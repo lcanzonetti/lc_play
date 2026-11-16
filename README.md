@@ -115,7 +115,7 @@ and resets them. The layout is remembered.
 
 | Window | What it is for |
 |---|---|
-| Stage | The canvas — unbounded, the whole window — with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it; wheel to zoom, drag the background to pan, double-click to fit the displays. |
+| Stage | The canvas — unbounded, the whole window — with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it; wheel to zoom, drag the background to pan, double-click to fit the displays. Untick **live video** to show video cues as still thumbnails: the Producer's computer then decodes no video (remembered on that computer; Runners are not affected). |
 | Timeline | One timeline at a time; the tabs switch between **Main** and the tasks. Drag cues, trim their ends, drag on the ruler to scrub. **+ Control cue** adds a pause / play / stop / jump at the playhead. A video cue's **Free run** box (inspector) keeps it playing while its timeline is paused; it holds its last frame unless **Loop** is on. |
 | Tasks | The auxiliary timelines: independent timelines with their own play / pause / stop, drawn in front of the main one. |
 | Runners | Each Runner: health, GPU, monitors, the displays it drives (fullscreen, monitor), and **Reload outputs**. |
