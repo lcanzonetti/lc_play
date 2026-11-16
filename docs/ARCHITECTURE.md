@@ -174,9 +174,10 @@ at a frame boundary. The renderer now works per refresh:
    grid instant* — the same integer on every Runner — as the time the frame
    is for. From there show time and frame index are integer arithmetic, so
    frame-locked Runners compute exactly the same frame, whatever their clock
-   or measurement error (it only has to be under a quarter period). A Runner
-   whose refreshes are not on the grid (no frame lock, another refresh rate)
-   uses its own estimate. The Director re-measures the grid when the
+   or measurement error (it has to be within a tenth of a period to join the
+   grid, a quarter to stay on it — the gap keeps a drifting, unlocked display
+   from flipping in and out). A Runner whose refreshes are not on the grid
+   (no frame lock, another refresh rate) uses its own estimate. The Director re-measures the grid when the
    reference drifts from it by 200 µs or 2 ppm (at most every 10 s); a new
    grid takes effect on a grid line every Runner identifies identically.
 4. **NVIDIA present barrier.** Each output's swap chain joins NVIDIA's
@@ -186,7 +187,11 @@ at a frame boundary. The renderer now works per refresh:
    machine delays everyone by one refresh instead of showing a different
    frame. Effective only in a borderless full-screen window without desktop
    scaling or taskbar composition; its state (`client`, `system`, `cluster`)
-   is reported per output.
+   is reported per output. Before rendering into a buffer again, the Runner waits
+   (100 ms at most) on the barrier's fence for the present that last showed
+   it, as NVAPI requires; it assumes the driver counts presents on that
+   fence, and stops waiting, with a log line, if it does not **[to verify on
+   hardware]**.
 5. **One device per graphics card.** Each output is rendered by the card its
    monitor is connected to (matched through DXGI), so Windows never copies a
    picture from one card to another (a frame of latency on that output only,
