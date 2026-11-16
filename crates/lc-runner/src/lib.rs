@@ -32,6 +32,7 @@ pub mod mov;
 #[cfg(windows)]
 pub mod nvapi;
 pub mod playhead;
+pub mod priority;
 pub mod render;
 pub mod show;
 pub mod stage;

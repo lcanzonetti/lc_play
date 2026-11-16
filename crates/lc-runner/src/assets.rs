@@ -131,7 +131,10 @@ impl AssetCache {
         let (cache, asset, thread_name) = (self.clone(), asset.clone(), name.clone());
         let spawned = std::thread::Builder::new()
             .name("lc-asset".into())
-            .spawn(move || cache.fetch(&asset, &thread_name, &path));
+            .spawn(move || {
+                crate::priority::background_thread();
+                cache.fetch(&asset, &thread_name, &path)
+            });
         if let Err(e) = spawned {
             // Not `Pending` forever: the next request tries again.
             tracing::error!("cannot start a download thread: {e}");

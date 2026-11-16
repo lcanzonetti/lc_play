@@ -61,7 +61,9 @@ fn ffprobe_bin() -> String {
 }
 
 /// A command that does not open a console window on Windows (the Runner is
-/// a windowed program; every ffmpeg it starts would otherwise flash one).
+/// a windowed program; every ffmpeg it starts would otherwise flash one),
+/// and runs below normal priority, so that decoding gives way to the render
+/// loop (see `priority.rs`).
 fn quiet_command(program: String) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(program);
@@ -69,7 +71,13 @@ fn quiet_command(program: String) -> Command {
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        let below = std::env::var("LCPLAY_THREAD_PRIORITY").map_or(true, |v| v != "0");
+        command.creation_flags(if below {
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            CREATE_NO_WINDOW
+        });
     }
     command
 }
@@ -282,15 +290,19 @@ impl Decoder {
         let (recycle, recycled) = sync_channel::<Vec<u8>>(QUEUE_FRAMES + 2);
         std::thread::Builder::new()
             .name("lc-video".into())
-            .spawn(move || loop {
-                let mut buf = recycled.try_recv().unwrap_or_default();
-                buf.resize(frame_len, 0);
-                // `read_exact` fails at end of file or when ffmpeg is killed;
-                // `send` fails when the Decoder is dropped. Either way: done.
-                // A full queue blocks here, which stalls ffmpeg on its pipe —
-                // that is the back-pressure that keeps it from running ahead.
-                if stdout.read_exact(&mut buf).is_err() || tx.send(buf).is_err() {
-                    break;
+            .spawn(move || {
+                crate::priority::background_thread();
+                loop {
+                    let mut buf = recycled.try_recv().unwrap_or_default();
+                    buf.resize(frame_len, 0);
+                    // `read_exact` fails at end of file or when ffmpeg is
+                    // killed; `send` fails when the Decoder is dropped.
+                    // Either way: done. A full queue blocks here, which
+                    // stalls ffmpeg on its pipe — that is the back-pressure
+                    // that keeps it from running ahead.
+                    if stdout.read_exact(&mut buf).is_err() || tx.send(buf).is_err() {
+                        break;
+                    }
                 }
             })
             .context("starting video reader thread")?;

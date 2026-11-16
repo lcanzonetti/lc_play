@@ -250,6 +250,11 @@ presentation (no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0` keeps
 the own swap chain without the barrier, `LCPLAY_FRAME_LATENCY=1..3` (default
 2) sets how many frames are queued ahead of the display.
 
+The render loop runs at multimedia priority (MMCSS "Playback") and decoding
+below normal, so a busy CPU delays a video layer rather than every output.
+If `late` climbs on a machine where other software competes for the CPU,
+`LCPLAY_THREAD_PRIORITY=0` leaves priorities as Windows sets them.
+
 ## Workspace
 
 | Crate | Role |

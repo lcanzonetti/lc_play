@@ -293,6 +293,7 @@ fn decode_chunked(payload: &[u8], out: &mut [u8], threads: usize) -> anyhow::Res
             .into_iter()
             .map(|group| {
                 scope.spawn(move || {
+                    crate::priority::background_thread();
                     for (input, target) in group {
                         unpack(input, target)?;
                     }
@@ -429,7 +430,10 @@ impl HapContent {
             );
             let spawned = std::thread::Builder::new()
                 .name("lc-hap".into())
-                .spawn(move || worker(shared, track, path, format, chunk_threads));
+                .spawn(move || {
+                    crate::priority::background_thread();
+                    worker(shared, track, path, format, chunk_threads)
+                });
             match spawned {
                 Ok(handle) => self.workers.push(handle),
                 Err(e) => tracing::error!("cannot start a HAP decoding thread: {e}"),
@@ -685,6 +689,7 @@ pub fn open_video(path: &str, timing: &Timing, gpu: &TextureFactory) -> Box<dyn 
     let spawned = std::thread::Builder::new()
         .name("lc-video-open".into())
         .spawn(move || {
+            crate::priority::background_thread();
             let result = (|| -> anyhow::Result<Probed> {
                 if !std::path::Path::new(&owned).is_file() {
                     bail!("video file '{owned}' not found");

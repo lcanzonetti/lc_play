@@ -266,6 +266,7 @@ impl ImageContent {
         let spawned = std::thread::Builder::new()
             .name("lc-image".into())
             .spawn(move || {
+                crate::priority::background_thread();
                 let _ = tx.send(decode_image(&owned, max));
             });
         if let Err(e) = spawned {
