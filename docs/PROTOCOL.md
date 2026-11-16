@@ -218,10 +218,10 @@ broadcasts them back. Other tools may ignore it.
     { "id": "sting", "name": "Sting", "duration_s": 8, "tracks": [ … ], "control_cues": [ … ] }
   ],
   "tracks": [
-    { "id": "t1", "name": "Track 1", "free_run": false, "cues": [
+    { "id": "t1", "name": "Track 1", "cues": [
       { "id": "c1", "name": "clip.mp4",
         "source": { "type": "asset", "asset": "636c6970" },
-        "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false,
+        "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false, "free_run": false,
         "x": 0, "y": 0, "w": 1920, "h": 1080,
         "rotation": 0, "opacity": 1, "fade_in_s": 1, "fade_out_s": 1 }
     ] }
@@ -229,7 +229,10 @@ broadcasts them back. Other tools may ignore it.
 }
 ```
 
-* Space: canvas pixels, origin top-left, y down. `x, y, w, h` is the cue's
+* Space: canvas pixels, origin top-left, y down; the canvas is unbounded
+  (negative positions are fine). `stage.width/height` must be positive but
+  are informational: the Producer sets them to the displays' bottom-right
+  extent. `x, y, w, h` is the cue's
   rectangle; `rotation` is degrees clockwise about its centre.
 * `source` is `{ "type": "asset", "asset": <id> }` or
   `{ "type": "color", "rgba": [r, g, b, a] }` (linear 0..1).
@@ -250,9 +253,12 @@ broadcasts them back. Other tools may ignore it.
   timeline acted on — empty for the cue's own, `"main"`, or a task id. The
   Director schedules the resulting transport change for the exact cluster
   instant of the cue, ahead of time.
-* `free_run` on a track: its video ignores the timeline's position and loops
-  on cluster time (`frame = floor(cluster_seconds × fps) mod length`); the
-  cues still decide when it is visible.
+* `free_run` on a cue (video): it plays at normal speed from the instant it
+  goes on air — the instant its timeline, playing forward, crossed
+  `start_s`, or else the instant of the transport state that put it on air —
+  and keeps playing while the timeline is paused, until it goes off air. At
+  the end it holds the last frame, or loops from `in_s` if `loop` is set.
+* `free_run` on a track (legacy): the same for every cue on the track.
 
 ## 6. OSC (Director, UDP 7405)
 

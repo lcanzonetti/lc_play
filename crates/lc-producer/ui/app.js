@@ -103,7 +103,8 @@ const S = {
   status: null,         // last cluster status
   library: [],          // items on the Asset Manager
   pxPerSec: 40,         // timeline zoom
-  view: { zoom: 1, panX: 0, panY: 0 }, // stage view: zoom relative to "fit", pan in screen px
+  view: { k: null, cx: 0, cy: 0 }, // stage view: screen px per canvas px (null = fit), canvas point at the centre
+  onsets: new Map(),    // free-running cue id → cluster ns it went on air (preview)
   previewOn: new Set(), // runners whose output pictures are being shown
   previews: {},         // runner name → [{ name, width, height, png_base64 }]
   logRunner: '',        // runner shown in the log window
@@ -163,12 +164,15 @@ function normalize(doc) {
       Object.assign(cc, Object.assign({ name: '', at_s: 0, action: 'pause', target: '', to_s: 0 }, cc));
     }
     for (const t of tl.tracks) {
-      t.id ||= uid(); t.name ??= ''; t.cues ??= []; t.free_run ??= false;
+      t.id ||= uid(); t.name ??= ''; t.cues ??= [];
+      // Free-run used to be a track setting; it is now per cue.
+      if (t.free_run) for (const c of t.cues) c.free_run = true;
+      t.free_run = false;
       for (const c of t.cues) {
         c.id ||= uid();
         Object.assign(c, Object.assign({
           name: '', source: { type: 'color', rgba: [0.5, 0.5, 0.5, 1] },
-          start_s: 0, duration_s: 10, in_s: 0, loop: false,
+          start_s: 0, duration_s: 10, in_s: 0, loop: false, free_run: false,
           x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0,
         }, c));
       }
@@ -491,6 +495,7 @@ function sendDoc(force = false) {
   clearTimeout(sendTimer);
   sendTimer = 0;
   delete S.doc._edit; // e.g. from an opened file; the tag is added per send
+  syncStageSize();
   const json = JSON.stringify(S.doc);
   if (!force && !S.dirty && json === S.lastSent) return;
   if (S.ws?.readyState !== WebSocket.OPEN) {
@@ -562,12 +567,32 @@ function addCue(cue, tl, ti, t) {
   syncLoop(); // the main timeline may have grown
 }
 
-/** Largest rectangle with the media's aspect that fits the stage, centred. */
+/** The area the displays cover on the canvas (the canvas itself is
+ *  unbounded). With no displays: the cues, or a plain HD frame. */
+function extent() {
+  const rects = S.doc.stage.displays.map((d) => d.canvas_rect);
+  if (!rects.length) for (const tl of tlIds()) for (const t of tlObj(tl).tracks) rects.push(...t.cues);
+  if (!rects.length) return { x: 0, y: 0, w: 1920, h: 1080 };
+  const x = Math.min(...rects.map((r) => r.x)), y = Math.min(...rects.map((r) => r.y));
+  const r = Math.max(...rects.map((r) => r.x + r.w)), b = Math.max(...rects.map((r) => r.y + r.h));
+  return { x, y, w: Math.max(1, r - x), h: Math.max(1, b - y) };
+}
+
+/** The document still carries a stage size (older Runners read it). It is
+ *  no longer edited: it simply follows the area the displays cover. */
+function syncStageSize() {
+  const e = extent();
+  S.doc.stage.width = Math.max(1, Math.ceil(e.x + e.w));
+  S.doc.stage.height = Math.max(1, Math.ceil(e.y + e.h));
+}
+
+/** Largest rectangle with the media's aspect that fits the displays' area,
+ *  centred in it. */
 function fitRect(mediaW, mediaH, enlarge) {
-  const { width: sw, height: sh } = S.doc.stage;
-  const k = Math.min(sw / mediaW, sh / mediaH, enlarge ? Infinity : 1);
+  const a = extent();
+  const k = Math.min(a.w / mediaW, a.h / mediaH, enlarge ? Infinity : 1);
   const w = Math.round(mediaW * k), h = Math.round(mediaH * k);
-  return { x: Math.round((sw - w) / 2), y: Math.round((sh - h) / 2), w, h };
+  return { x: Math.round(a.x + (a.w - w) / 2), y: Math.round(a.y + (a.h - h) / 2), w, h };
 }
 
 function addAssetCue(item, tl, ti, t) {
@@ -772,14 +797,40 @@ function cuePicture(cue, track, t, tl, onAir) {
   if (asset.kind !== 'video') return (!p.failed && drawable(p.node)) || drawable(p.thumb);
   const tr = currentTransport(tl);
   const length = asset.duration_s || p.node.duration || 0;
-  if (track.free_run) {
-    // Free-running: loops on the cluster clock, whatever the timeline does.
-    const now = (clusterNow() ?? 0) / NS, span = Math.max(0.1, length - cue.in_s);
-    return steerVideo(p, cue.in_s + (now % span), onAir, 1);
+  if (cue.free_run) {
+    // Free-running: real time since the cue went on air, whatever the
+    // timeline does; held at the end unless it loops. (The same rule as the
+    // Runner's `on_air_since`.)
+    if (!onAir) { S.onsets.delete(cue.id); return steerVideo(p, cue.in_s, false, 1); }
+    const now = clusterNow() ?? 0;
+    if (!S.onsets.has(cue.id)) S.onsets.set(cue.id, tr ? onAirSince(tr, cue.start_s, now) : now);
+    let media = cue.in_s + (now - S.onsets.get(cue.id)) / NS;
+    if (length > cue.in_s) {
+      media = cue.loop ? cue.in_s + ((media - cue.in_s) % (length - cue.in_s)) : Math.min(media, length - 0.05);
+    }
+    return steerVideo(p, media, true, 1);
   }
   let media = cue.in_s + Math.max(0, t - cue.start_s);
   if (cue.loop && length > cue.in_s) media = cue.in_s + ((media - cue.in_s) % (length - cue.in_s));
   return steerVideo(p, media, onAir && !!tr?.playing, (tr?.rate_permille ?? 1000) / 1000);
+}
+
+/** When a cue starting at `startS` went on air under transport `tr`, at
+ *  cluster time `now` (ns): when the playhead crossed its start, or when the
+ *  state took effect if it did not get there by playing. */
+function onAirSince(tr, startS, now) {
+  const start = startS * NS;
+  if (tr.playing && tr.rate_permille > 0) {
+    const toCluster = (show) => (show * 1000) / tr.rate_permille;
+    const len = tr.loop_ns > 0 ? tr.loop_ns : 0;
+    const ahead = len ? (((start - (tr.anchor_show_ns % len)) % len) + len) % len : start - tr.anchor_show_ns;
+    if (ahead >= 0) {
+      let crossing = tr.anchor_cluster_ns + toCluster(ahead);
+      if (len && crossing <= now) { const lap = toCluster(len); crossing += Math.floor((now - crossing) / lap) * lap; }
+      if (crossing <= now) return crossing;
+    }
+  }
+  return Math.min(tr.anchor_cluster_ns, now);
 }
 
 // ───────────────────────────── stage ─────────────────────────────
@@ -805,17 +856,39 @@ function drawStage() {
   if (!S.doc) return;
 
   const st = S.doc.stage;
-  // "Fit" scale times the operator's zoom, centred, then panned.
-  const fit = Math.min((W - 48) / st.width, (H - 48) / st.height);
-  const k = fit * S.view.zoom;
-  view = { k, fit, W, H, ox: (W - st.width * k) / 2 + S.view.panX, oy: (H - st.height * k) / 2 + S.view.panY };
+  // The whole window is canvas. The view is a scale and the canvas point
+  // shown at the window's centre; it is fitted to the displays once (and on
+  // "Fit"), then left where the operator puts it.
+  if (S.view.k == null) {
+    const e = extent();
+    S.view = { k: Math.min((W - 48) / e.w, (H - 48) / e.h), cx: e.x + e.w / 2, cy: e.y + e.h / 2 };
+  }
+  const k = S.view.k;
+  view = { k, W, H, ox: W / 2 - S.view.cx * k, oy: H / 2 - S.view.cy * k };
   $('#stage-zoom').textContent = `${Math.round(k * 100)}%`;
+
+  // Background colour everywhere, and a grid in canvas pixels (lines at
+  // least ~60 screen px apart) to place things by; the canvas origin is
+  // marked more strongly.
+  ctx.fillStyle = rgbaCss(st.background);
+  ctx.fillRect(0, 0, W, H);
+  const step = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000].find((g) => g * k >= 60) || 100000;
+  const x0 = Math.floor(-view.ox / k / step) * step, y0 = Math.floor(-view.oy / k / step) * step;
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.beginPath();
+  for (let x = x0; x * k + view.ox < W; x += step) { const sx = Math.round(x * k + view.ox) + 0.5; ctx.moveTo(sx, 0); ctx.lineTo(sx, H); }
+  for (let y = y0; y * k + view.oy < H; y += step) { const sy = Math.round(y * k + view.oy) + 0.5; ctx.moveTo(0, sy); ctx.lineTo(W, sy); }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath();
+  ctx.moveTo(Math.round(view.ox) + 0.5, 0); ctx.lineTo(Math.round(view.ox) + 0.5, H);
+  ctx.moveTo(0, Math.round(view.oy) + 0.5); ctx.lineTo(W, Math.round(view.oy) + 0.5);
+  ctx.stroke();
+
   ctx.save();
   ctx.translate(view.ox, view.oy);
   ctx.scale(k, k);
-
-  ctx.fillStyle = rgbaCss(st.background);
-  ctx.fillRect(0, 0, st.width, st.height);
 
   // Back to front: the main timeline first, then the tasks (the first task
   // is front-most); within a timeline the last track is at the back.
@@ -945,18 +1018,16 @@ stage.addEventListener('mousedown', (e) => {
   drag = { ...start, kind: 'pan', orig: { ...S.view }, moved: false, deselect: true };
 });
 
-/** Zoom by `factor`, keeping the stage point under screen point (sx, sy)
+/** Zoom by `factor`, keeping the canvas point under screen point (sx, sy)
  *  where it is. */
 function zoomAt(factor, sx, sy) {
-  const { k, fit, W, H, ox, oy } = view;
-  const zoom = clamp(S.view.zoom * factor, 0.05, 200);
-  const k2 = fit * zoom, st = S.doc.stage;
-  const cx = (sx - ox) / k, cy = (sy - oy) / k; // stage point under the pointer
-  S.view.zoom = zoom;
-  S.view.panX = sx - cx * k2 - (W - st.width * k2) / 2;
-  S.view.panY = sy - cy * k2 - (H - st.height * k2) / 2;
+  const { k, W, H, ox, oy } = view;
+  const k2 = clamp(k * factor, 0.0005, 50);
+  const px = (sx - ox) / k, py = (sy - oy) / k; // canvas point under the pointer
+  S.view = { k: k2, cx: px - (sx - W / 2) / k2, cy: py - (sy - H / 2) / k2 };
 }
-const fitStage = () => { S.view = { zoom: 1, panX: 0, panY: 0 }; };
+/** Show all the displays (and, without displays, all the content). */
+const fitStage = () => { S.view = { k: null, cx: 0, cy: 0 }; };
 
 stage.addEventListener('wheel', (e) => {
   if (!S.doc) return;
@@ -987,10 +1058,12 @@ function snapAxis(pos, size, candidates, tol) {
   return best === null ? pos : pos + best;
 }
 
-/** Lines to snap to: the stage's edges and those of every display except
+/** Lines to snap to: the canvas origin and the edges of every display except
  *  `skip`; for cues, also the displays' centres. */
 function snapLines(skip, centres) {
-  const st = S.doc.stage, xs = [0, st.width], ys = [0, st.height];
+  // The canvas origin, and the edges (for cues also the centres) of the
+  // displays.
+  const st = S.doc.stage, xs = [0], ys = [0];
   for (const d of st.displays) {
     if (d === skip) continue;
     const r = d.canvas_rect;
@@ -1004,8 +1077,7 @@ function stageDragMove(e) {
   if (drag.kind === 'pan') {
     const dx = e.clientX - drag.mx, dy = e.clientY - drag.my;
     if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; $('#stage-wrap').classList.add('panning'); }
-    S.view.panX = drag.orig.panX + dx;
-    S.view.panY = drag.orig.panY + dy;
+    S.view = { k: drag.orig.k, cx: drag.orig.cx - dx / drag.orig.k, cy: drag.orig.cy - dy / drag.orig.k };
     return;
   }
   // The undo point is taken on the first real movement, so a plain click
@@ -1110,7 +1182,7 @@ function renderTimeline() {
     for (const cue of track.cues) {
       const selected = S.sel?.type === 'cue' && S.sel.id === cue.id;
       lane.append(el('div', {
-        class: `cue ${cue.source.type}${track.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
+        class: `cue ${cue.source.type}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
       }, cue.name || (cue.source.type === 'color' ? 'colour' : 'cue'),
         el('div', { class: 'h l' }), el('div', { class: 'h r' })));
@@ -1118,12 +1190,7 @@ function renderTimeline() {
     const selected = S.sel?.type === 'track' && S.sel.id === track.id;
     tracks.append(el('div', { class: 'track' },
       el('div', { class: `track-head${selected ? ' sel' : ''}`, title: 'Click to select the track', onclick: () => select({ type: 'track', id: track.id }) },
-        el('span', { class: 'name' }, track.name || `Track ${ti + 1}`),
-        el('button', {
-          class: `small${track.free_run ? ' on' : ''}`,
-          title: 'Free run: video on this track loops on its own and keeps moving while the timeline is paused',
-          onclick: (e) => { e.stopPropagation(); edit(() => (track.free_run = !track.free_run)); },
-        }, '∞')),
+        el('span', { class: 'name' }, track.name || `Track ${ti + 1}`),),
       lane));
   });
 }
@@ -1223,7 +1290,7 @@ window.addEventListener('mouseup', (e) => {
 
 $('#tl-play').onclick = () => command({ type: currentTransport(S.tl)?.playing ? 'pause' : 'play' }, S.tl);
 $('#tl-stop').onclick = () => command({ type: 'stop' }, S.tl);
-$('#btn-track').onclick = () => edit(() => { const o = tlObj(S.tl); o.tracks.push({ id: uid(), name: `Track ${o.tracks.length + 1}`, cues: [], free_run: false }); });
+$('#btn-track').onclick = () => edit(() => { const o = tlObj(S.tl); o.tracks.push({ id: uid(), name: `Track ${o.tracks.length + 1}`, cues: [] }); });
 $('#btn-control').onclick = () => edit(() => {
   const cc = { id: uid(), name: '', at_s: round2(showSeconds(S.tl)), action: 'pause', target: '', to_s: 0 };
   tlObj(S.tl).control_cues.push(cc);
@@ -1517,9 +1584,9 @@ function freeMonitor(runner) {
   return mons.find((m) => !used.has(m.index) && !(isLocal(node) && m === primary)) || null;
 }
 
-/** A new display: placed to the right of the existing ones on the stage
- *  (the stage grows to fit), fullscreen on a free monitor of its Runner if
- *  there is one, otherwise a preview window. */
+/** A new display: placed to the right of the existing ones on the canvas,
+ *  fullscreen on a free monitor of its Runner if there is one, otherwise a
+ *  preview window. */
 function addDisplay(runner = '') {
   const st = S.doc.stage, n = st.displays.length + 1;
   const mon = freeMonitor(runner);
@@ -1533,8 +1600,6 @@ function addDisplay(runner = '') {
         : { fullscreen: false, position: [60 + 40 * n, 60 + 40 * n], size: [960, Math.round((960 * h) / w)] },
     };
     st.displays.push(d);
-    st.width = Math.max(st.width, x + w);
-    st.height = Math.max(st.height, h);
     normalize(S.doc);
     S.sel = { type: 'display', id: d.id };
   });
@@ -1544,8 +1609,7 @@ function addDisplay(runner = '') {
     : `Display ${n}: shown in a window — ${runner || 'the runner'} has no free monitor${runner === '' ? '' : ''}. Choose fullscreen in the Runners window once a monitor is connected.`, true);
 }
 
-/** Line the displays up left to right, in their current order, and size
- *  the stage to them. */
+/** Line the displays up left to right, in their current order. */
 function arrangeSideBySide() {
   edit(() => {
     const st = S.doc.stage;
@@ -1554,22 +1618,6 @@ function arrangeSideBySide() {
       d.canvas_rect.x = x; d.canvas_rect.y = 0;
       x += d.canvas_rect.w; h = Math.max(h, d.canvas_rect.h);
     }
-    if (x > 0) { st.width = x; st.height = h; }
-  });
-  fitStage();
-}
-
-/** Make the stage exactly the area the displays cover. */
-function stageToDisplays() {
-  const ds = S.doc.stage.displays;
-  if (!ds.length) return;
-  edit(() => {
-    const minX = Math.min(...ds.map((d) => d.canvas_rect.x)), minY = Math.min(...ds.map((d) => d.canvas_rect.y));
-    // Content positions move with the displays, so nothing shifts on screen.
-    for (const d of ds) { d.canvas_rect.x -= minX; d.canvas_rect.y -= minY; }
-    for (const tl of tlIds()) for (const t of tlObj(tl).tracks) for (const c of t.cues) { c.x -= minX; c.y -= minY; }
-    S.doc.stage.width = Math.max(...ds.map((d) => d.canvas_rect.x + d.canvas_rect.w));
-    S.doc.stage.height = Math.max(...ds.map((d) => d.canvas_rect.y + d.canvas_rect.h));
   });
   fitStage();
 }
@@ -1660,8 +1708,11 @@ function renderInspector() {
       field('Fade out (s)', c, 'fade_out_s', sec),
     );
     if (asset?.kind === 'video') {
-      box.append(field('In point (s)', c, 'in_s', sec), field('Loop video', c, 'loop', { type: 'checkbox' }));
-      if (track.free_run) box.append(note('This track is free-running: the video loops on its own clock; start and duration only decide when it is visible.'));
+      box.append(
+        field('In point (s)', c, 'in_s', sec),
+        field('Loop video', c, 'loop', { type: 'checkbox' }),
+        field('Free run', c, 'free_run', { type: 'checkbox' }),
+        note('Free run: the video plays at normal speed from the moment the cue goes on air and keeps playing while the timeline is paused; it stops on its last frame unless Loop is on. Start and duration still decide when it is on air.'));
     }
     box.append(
       el('h4', {}, 'Position on stage'),
@@ -1703,8 +1754,6 @@ function renderInspector() {
     box.append(
       el('h3', {}, 'Track'),
       field('Name', track, 'name', { type: 'text' }),
-      field('Free run', track, 'free_run', { type: 'checkbox' }),
-      note('Free run: video on this track loops continuously and keeps moving while the timeline is paused or scrubbed — for backgrounds and ambient loops. Its cues still decide when it is visible. The loop is tied to the cluster clock, so all Runners show the same frame, but a clip does not necessarily start from its first frame.'),
       deleteButton('Delete track'));
     return;
   }
@@ -1728,7 +1777,7 @@ function renderInspector() {
       field('Name', d, 'name', { type: 'text' }),
       field('Runner', d, 'runner', { type: 'text' }),
       note("The Runner's --name; empty = any Runner."),
-      el('h4', {}, 'Area of the stage it shows'),
+      el('h4', {}, 'Area of the canvas it shows'),
       pair('X / Y', d.canvas_rect, 'x', 'y'),
       pair('W / H', d.canvas_rect, 'w', 'h', { min: 1 }),
       el('h4', {}, 'Window on the Runner'),
@@ -1753,9 +1802,9 @@ function renderInspector() {
     el('h3', {}, 'Show'),
     field('Name', S.doc, 'name', { type: 'text' }),
     field('Length (s)', S.doc, 'duration_s', { min: 1, after: syncLoop }),
-    el('h4', {}, 'Stage (canvas pixels)'),
-    pair('W / H', st, 'width', 'height', { min: 1 }),
+    el('h4', {}, 'Canvas'),
     colorField('Background', st, 'background'),
+    note(`The canvas has no fixed size: displays and content can go anywhere on it. The displays cover ${extent().w}×${extent().h} px.`),
     el('h4', {}, 'Displays'),
   );
   for (const d of st.displays) {
@@ -1765,8 +1814,7 @@ function renderInspector() {
   }
   box.append(el('div', { class: 'btns' },
     el('button', { onclick: () => addDisplay(''), title: 'A new display, to the right of the others' }, '+ Display'),
-    el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right and size the stage to them (content stays where it is on the stage)' }, 'Side by side'),
-    el('button', { onclick: stageToDisplays, title: 'Make the stage exactly the area the displays cover' }, 'Stage = displays')));
+    el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right (content stays where it is on the canvas)' }, 'Side by side')));
 }
 
 // ───────────────────────────── top bar ─────────────────────────────
@@ -1838,7 +1886,8 @@ assetList.addEventListener('drop', (e) => {
 window.addEventListener('keydown', (e) => {
   if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return; // typing in a field
   const mod = e.ctrlKey || e.metaKey;
-  if (e.code === 'Space') { e.preventDefault(); $('#btn-play').click(); }
+  // Space plays / pauses the timeline open in the Timeline window.
+  if (e.code === 'Space') { e.preventDefault(); $('#tl-play').click(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelection(); }
   else if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); (e.shiftKey ? $('#btn-redo') : $('#btn-undo')).click(); }
   else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); $('#btn-redo').click(); }

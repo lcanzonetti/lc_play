@@ -138,7 +138,7 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
                         fade_out: cue.fade_out_s,
                         media_in: cue.in_s,
                         media_loop: cue.looping,
-                        free_run: track.free_run,
+                        free_run: cue.free_run || track.free_run,
                     },
                     timeline: timeline.clone(),
                 });
@@ -229,7 +229,10 @@ mod tests {
         let show = build(&d, "left", &cache());
         let overlay = show.layers.iter().find(|l| l.id == "overlay").unwrap();
         assert_eq!(overlay.timeline.as_deref(), Some("sting"));
-        assert!(overlay.timing.free_run);
+        assert!(
+            overlay.timing.free_run,
+            "a free-running track makes its cues free-run"
+        );
         let front_of_main = show.layers.iter().find(|l| l.id == "front").unwrap();
         assert_eq!(front_of_main.timeline, None);
         assert!(overlay.transform.z > front_of_main.transform.z);

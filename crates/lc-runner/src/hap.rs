@@ -357,7 +357,8 @@ impl HapContent {
     fn loop_span(&self) -> Option<i64> {
         let total = self.track.frames.len() as i64;
         let first = (self.timing.media_in.max(0.0) * self.track.fps()).floor() as i64;
-        (self.timing.media_loop || self.timing.free_run)
+        self.timing
+            .media_loop
             .then_some(total - first)
             .filter(|&n| n > 0)
     }
@@ -455,7 +456,7 @@ impl HapContent {
     fn window(&self, want: i64) -> Vec<i64> {
         let total = self.track.frames.len() as i64;
         let first = (self.timing.media_in.max(0.0) * self.track.fps()).floor() as i64;
-        let loops = self.timing.media_loop || self.timing.free_run;
+        let loops = self.timing.media_loop;
         prefetch_window(want, self.step, total, first, loops)
     }
 }

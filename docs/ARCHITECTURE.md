@@ -304,14 +304,29 @@ the Director is down, control cues do not fire and Runners play through
 them. Moving their execution into the Runners is possible (they are part of
 the show document) and is the way to remove that dependency.
 
-### Free-running tracks
+### Free-running cues
 
-Video on a free-running track takes its position from cluster time instead
-of from its timeline: `frame = floor(cluster_seconds × fps) mod length`. It
-therefore keeps moving while the timeline is paused or scrubbed and needs no
-state, so every Runner — including one that just started — shows the same
-frame. The price is that the loop's phase is arbitrary: the clip does not
-start from its first frame when the cue appears.
+A video cue with `free_run` set plays at normal speed from the instant it
+goes on air, whatever its timeline does afterwards (pause, rate change,
+scrub), until it goes off air; at the end of the file it holds the last
+frame, or loops if `loop` is set. Its media time is
+`in + (cluster_now − on_air)`.
+
+`on_air` must be the same on every Runner without any message carrying it,
+so it is derived from the transport state alone (`on_air_since` in
+`lc-runner/src/app.rs`): if the timeline is playing forward and has crossed
+the cue's start since its anchor, `on_air` is that crossing instant (for a
+looping timeline, the most recent lap); otherwise — the timeline was paused,
+located or started inside the cue — it is the state's anchor instant. A
+Runner remembers the instant while the cue stays on air, so a later pause
+does not move it. A Runner that joins while the cue is on air computes it
+from the state it receives, which agrees with the others unless the state
+changed while the cue was already on air (then the joiner restarts the clip
+from that change) [design limit, not measured].
+
+`free_run` on a *track* is the older form and still read: it makes every cue
+on the track free-running. The Producer converts it to per-cue flags when it
+opens a show.
 
 ### From document to pixels
 
@@ -403,8 +418,15 @@ by the Runner) and output pictures (rendered small through the warp pass,
 PNG) are sent on request and relayed only to Producers and controllers.
 Rebooting or powering off the computer requires `--allow-power` on that
 Runner. Remote desktop is launched by the Producer service on its own
-machine (`mstsc` for RDP on Windows, `vnc://` / `rdp://` URLs elsewhere),
-for requests from that machine only.
+machine (`mstsc` for RDP on Windows; for VNC on Windows an installed viewer
+found in the usual folders or named by `LCPLAY_VNC_VIEWER`, since Windows has
+no `vnc://` handler; `vnc://` / `rdp://` URLs elsewhere), for requests from
+that machine only.
+
+The canvas is unbounded in the Producer. `stage.width/height` remain in the
+document (validated, shown in logs) but the Producer sets them on every send
+to the bottom-right corner of the area the displays cover; nothing in
+rendering depends on them.
 
 ## 8. Roadmap
 
@@ -421,7 +443,7 @@ Still to do, roughly in order of how much they limit real use:
 |---|---|
 | Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); vblank-predicted sampling; audio. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
-| Authoring | Keyframes/tweens; a warp editor; free-running media that starts on its first frame; control cues executed by Runners (so they work without the Director). |
+| Authoring | Keyframes/tweens; a warp editor; control cues executed by Runners (so they work without the Director). |
 | Packaging | An installer; a launcher without a console window; the Producer preview is the web view's own video playback, not frame-exact. |
 | External control | MIDI/MTC, Art-Net, LTC chase; per-show control mapping. |
 | Outputs | Freeform mesh warp; SDI and NDI outputs (NDI needs the proprietary NDI SDK and its licence); framelock integration. |

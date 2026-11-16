@@ -171,6 +171,11 @@ impl Playhead {
             .then(|| state.show_time_at(cluster_ns) as f64 / NANOS_PER_SEC as f64)
     }
 
+    /// The transport state of an auxiliary timeline in force at `cluster_ns`.
+    pub fn task_state(&self, id: &str, cluster_ns: i64) -> Option<TransportState> {
+        self.lock().tasks.get(id).map(|tl| tl.state_at(cluster_ns))
+    }
+
     /// Newest transport state of every auxiliary timeline.
     pub fn task_transports(&self) -> BTreeMap<String, TransportState> {
         self.lock()

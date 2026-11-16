@@ -228,6 +228,25 @@ async fn remote_desktop(
             c.arg(format!("/v:{host}"));
             c
         }
+        // Windows has no VNC viewer of its own, and no handler for vnc://
+        // links (it would ask which program to use): start an installed
+        // viewer directly.
+        ("vnc", "windows") => match windows_vnc_viewer() {
+            Some(viewer) => {
+                let mut c = std::process::Command::new(viewer);
+                c.arg(&host);
+                c
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "No VNC viewer found on this computer. Install one (RealVNC Viewer, \
+                     TightVNC, TigerVNC or UltraVNC), or set LCPLAY_VNC_VIEWER to its \
+                     program file. For Windows runners, RDP needs no extra software."
+                        .into(),
+                );
+            }
+        },
         (kind @ ("rdp" | "vnc"), os) => {
             let url = if kind == "rdp" {
                 format!("rdp://full%20address=s:{host}")
@@ -257,6 +276,28 @@ async fn remote_desktop(
             format!("cannot start the remote-desktop client: {e}"),
         ),
     }
+}
+
+/// An installed VNC viewer on Windows: `LCPLAY_VNC_VIEWER` if set, else the
+/// usual install locations of the common viewers.
+fn windows_vnc_viewer() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("LCPLAY_VNC_VIEWER") {
+        return Some(path.into());
+    }
+    let roots = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from);
+    let candidates = [
+        r"RealVNC\VNC Viewer\vncviewer.exe",
+        r"TightVNC\tvnviewer.exe",
+        r"TigerVNC\vncviewer.exe",
+        r"uvnc bvba\UltraVNC\vncviewer.exe",
+        r"UltraVNC\vncviewer.exe",
+    ];
+    roots
+        .flat_map(|root| candidates.iter().map(move |c| root.join(c)))
+        .find(|p| p.is_file())
 }
 
 /// A static file. `no-cache` so a rebuilt binary is picked up on reload

@@ -251,9 +251,11 @@ pub struct Timing {
     /// Video: start over from `media_in` when the file ends.
     #[serde(default)]
     pub media_loop: bool,
-    /// Video: loop on the cluster clock instead of following the timeline
-    /// (see `lc_proto::show::Track::free_run`). `start`/`end` still decide
-    /// when the layer is visible.
+    /// Video: run at normal speed from the moment the layer went on air,
+    /// independent of the timeline (see `lc_proto::show::Cue::free_run`).
+    /// The renderer then passes media time — seconds since going on air —
+    /// instead of timeline time. `start`/`end` still decide when the layer
+    /// is visible.
     #[serde(default)]
     pub free_run: bool,
 }

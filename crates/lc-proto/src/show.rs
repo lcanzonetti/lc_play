@@ -121,6 +121,8 @@ impl Default for ShowDocument {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stage {
+    /// Informational: the canvas is unbounded. The Producer sets this to the
+    /// bottom-right corner of the area the displays cover. Must be positive.
     pub width: f32,
     pub height: f32,
     /// Colour behind all cues, linear RGBA 0..1.
@@ -239,14 +241,8 @@ pub struct Track {
     pub id: String,
     pub name: String,
     pub cues: Vec<Cue>,
-    /// Free-running: video on this track loops on the cluster clock instead
-    /// of following the timeline's position. It keeps moving while the
-    /// timeline is paused and is unaffected by seeking — for backgrounds and
-    /// ambient loops. The cues still decide *when* it is visible.
-    ///
-    /// The loop's phase is tied to cluster time, not to the moment the cue
-    /// appeared: every Runner shows the same frame, but the clip does not
-    /// necessarily start from its first frame.
+    /// Every cue on this track free-runs (see [`Cue::free_run`]). Kept for
+    /// shows written before free-run became a property of each cue.
     pub free_run: bool,
 }
 
@@ -285,6 +281,12 @@ pub struct Cue {
     /// frame is held).
     #[serde(rename = "loop")]
     pub looping: bool,
+    /// Video: play at normal speed from the moment the cue goes on air,
+    /// whatever its timeline does — paused, slowed, scrubbed — until the cue
+    /// goes off air. At the end of the file it freezes on the last frame,
+    /// or loops if `loop` is set. The cue's start and duration still decide
+    /// *when* it is on air.
+    pub free_run: bool,
     pub x: f32,
     pub y: f32,
     pub w: f32,
@@ -306,6 +308,7 @@ impl Default for Cue {
             duration_s: 10.0,
             in_s: 0.0,
             looping: false,
+            free_run: false,
             x: 0.0,
             y: 0.0,
             w: 640.0,

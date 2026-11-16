@@ -27,7 +27,7 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 | Part | State |
 |---|---|
 | Director: cluster clock, transport per timeline, control cues, show distribution, persistence, restart adoption, OSC input | implemented, tested |
-| Runner: renders the Director's show live (edits appear while playing), images, colours, video (HAP decoded by the GPU; other codecs hardware-decoded through ffmpeg), fades, warp, edge blend, auxiliary timelines, free-running tracks, local asset cache, holdover | implemented, tested |
+| Runner: renders the Director's show live (edits appear while playing), images, colours, video (HAP decoded by the GPU; other codecs hardware-decoded through ffmpeg), fades, warp, edge blend, auxiliary timelines, free-running cues, local asset cache, holdover | implemented, tested |
 | Runner management: restart, quit, standby, reboot / power off the computer (opt-in), Wake-on-LAN, remote log, live output pictures, remote desktop | implemented |
 | Asset Manager: upload, list, thumbnails, metadata, HTTP Range delivery | implemented |
 | Producer: stand-alone window with floating panels — stage (zoom, pan, snapping) with live content preview, timelines, tasks, runners, assets, inspector, undo, save/open | implemented (basic) |
@@ -47,8 +47,10 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
   opacity, plus fade in/out.
 * **Control cues are executed by the Director.** They are frame-exact on all
   Runners, but do not fire while the Director is down.
-* **Free-running tracks loop on the cluster clock**: all Runners agree on the
-  frame, but a clip does not necessarily start from its first frame.
+* **Free-running cues follow the Director's timing**: each Runner works out
+  the instant the cue went on air from the shared transport state, so they
+  agree; a cue that is already on air when a Runner starts is picked up from
+  the moment its timeline last started.
 * **Warp is corner-pin only**, and is set as numbers in the show file — the
   Producer has fields for edge blend but no warp editor yet.
 * **MIDI, Art-Net and LTC are not implemented**; OSC is.
@@ -89,7 +91,8 @@ Windows 11 and of up-to-date Windows 10), WebKitGTK on Linux
    also be copied into `lcplay-data/media/`; they appear within seconds.
 2. **Double-click** an asset to add it at the playhead of the open timeline,
    or drag it onto a track. A Runner window opens showing the stage.
-3. **Play** (Space). Drag cues on the stage or the timeline while it plays:
+3. **Play** (Space plays / pauses the timeline open in the Timeline window).
+   Drag cues on the stage or the timeline while it plays:
    the output follows.
 
 The interface is a desktop of floating windows — drag a title bar to move
@@ -98,8 +101,8 @@ and resets them. The layout is remembered.
 
 | Window | What it is for |
 |---|---|
-| Stage | The canvas with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it. |
-| Timeline | One timeline at a time; the tabs switch between **Main** and the tasks. Drag cues, trim their ends, drag on the ruler to scrub. **+ Control cue** adds a pause / play / stop / jump at the playhead. The **∞** button on a track makes it free-running. |
+| Stage | The canvas — unbounded, the whole window — with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it; wheel to zoom, drag the background to pan, double-click to fit the displays. |
+| Timeline | One timeline at a time; the tabs switch between **Main** and the tasks. Drag cues, trim their ends, drag on the ruler to scrub. **+ Control cue** adds a pause / play / stop / jump at the playhead. A video cue's **Free run** box (inspector) keeps it playing while its timeline is paused; it holds its last frame unless **Loop** is on. |
 | Tasks | The auxiliary timelines: independent timelines with their own play / pause / stop, drawn in front of the main one. |
 | Runners | Each Runner: health, GPU, monitors, the displays it drives (fullscreen, monitor), and **Reload outputs**. |
 | Inspector | Properties of whatever is selected; with nothing selected, the show and stage. |
@@ -126,7 +129,11 @@ connected), **Restart** and **Quit** the Runner program, **Reboot** and
 `--allow-power`), **Wake** (Wake-on-LAN, for an offline Runner that was
 connected before), **RDP / VNC** (open this computer's remote-desktop client
 on it; the Runner's computer must have Remote Desktop or a VNC server
-enabled, and this only works from the Producer's own machine).
+enabled, and this only works from the Producer's own machine). RDP uses
+Windows' own `mstsc`. VNC needs a VNC viewer on the Producer's computer:
+RealVNC Viewer, TightVNC, TigerVNC or UltraVNC in their default install
+folders are found automatically; any other one can be named with the
+`LCPLAY_VNC_VIEWER` environment variable (the full path of its `.exe`).
 
 Things worth trying:
 

@@ -76,26 +76,22 @@ fn quiet_command(program: String) -> Command {
 
 /// The frame of a file that belongs on screen at time `t`.
 ///
-/// `t` is the layer's timeline time — or, for a free-running layer, cluster
-/// time in seconds: the clip then loops on the cluster clock, identically on
-/// every Runner, whatever the timeline does. `frames` is the file's length
-/// in frames, if known.
+/// `t` is the layer's timeline time — or, for a free-running layer, the
+/// seconds since it went on air (the renderer works that out). `frames` is
+/// the file's length in frames, if known.
 pub(crate) fn media_frame(timing: &Timing, fps: f64, frames: Option<i64>, t: f64) -> i64 {
     let first = (timing.media_in.max(0.0) * fps).floor() as i64;
     let since = if timing.free_run { t } else { t - timing.start };
     let elapsed = (since.max(0.0) * fps).floor() as i64;
     match frames {
         Some(total) if total > first => {
-            if timing.media_loop || timing.free_run {
+            if timing.media_loop {
                 first + elapsed % (total - first)
             } else {
                 // Past the end: hold the last frame.
                 (first + elapsed).min(total - 1)
             }
         }
-        // Length unknown: a free-running clip cannot be looped (cluster time
-        // is far beyond any file), so it holds its first frame.
-        _ if timing.free_run => first,
         _ => first + elapsed,
     }
 }
@@ -551,7 +547,7 @@ impl Content for VideoContent {
         }
 
         // Approaching the loop point: get the next pass ready.
-        if (self.timing.media_loop || self.timing.free_run) && self.standby.is_none() {
+        if self.timing.media_loop && self.standby.is_none() {
             if let Some(total) = self.info.frames {
                 if total - want <= fps as i64 && total - self.first_frame() > (2.0 * fps) as i64 {
                     self.standby = self.start_decoder(self.first_frame());
@@ -733,11 +729,19 @@ mod tests {
             ..timing.clone()
         };
         assert_eq!(media_frame(&looping, 10.0, Some(50), 16.0), 10);
+        // Free-running: `t` is seconds since going on air, whatever the
+        // cue's start; held at the end unless looping.
         let free = Timing {
             free_run: true,
+            ..timing.clone()
+        };
+        assert_eq!(media_frame(&free, 10.0, Some(50), 2.0), 20);
+        assert_eq!(media_frame(&free, 10.0, Some(50), 100.0), 49);
+        let free_loop = Timing {
+            free_run: true,
+            media_loop: true,
             ..timing
         };
-        assert_eq!(media_frame(&free, 10.0, Some(50), 1003.0), 30030 % 50);
-        assert_eq!(media_frame(&free, 10.0, None, 1003.0), 0);
+        assert_eq!(media_frame(&free_loop, 10.0, Some(50), 6.0), 10);
     }
 }

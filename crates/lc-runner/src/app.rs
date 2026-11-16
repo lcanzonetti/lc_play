@@ -40,6 +40,40 @@ use crate::render::{Capture, Gpu, OutputGpu};
 use crate::show::{Canvas, Output, Playback, Show};
 use crate::stage;
 
+/// The cluster time at which a cue starting at `start_s` went on air under
+/// transport `state`, as seen at cluster time `now`.
+///
+/// If the playhead reached the cue by playing through its start, that is the
+/// exact instant it crossed it — the same on every Runner, since they all
+/// hold the same transport state. Otherwise (a seek or jump into the middle
+/// of the cue, a stop-and-play) the cue went on air when that state took
+/// effect.
+pub fn on_air_since(state: &lc_proto::TransportState, start_s: f64, now: i64) -> i64 {
+    let start = (start_s * NANOS_PER_SEC as f64).round() as i64;
+    if state.playing && state.rate_permille > 0 {
+        let rate = state.rate_permille as i128;
+        let to_cluster = |show: i64| (show as i128 * 1000 / rate) as i64;
+        let ahead = match state.loop_ns.filter(|&len| len > 0) {
+            Some(len) => (start - state.anchor_show_ns.rem_euclid(len)).rem_euclid(len),
+            None => start - state.anchor_show_ns,
+        };
+        if ahead >= 0 {
+            let mut crossing = state.anchor_cluster_ns + to_cluster(ahead);
+            if let Some(len) = state.loop_ns.filter(|&len| len > 0) {
+                // The most recent pass over the cue's start.
+                let lap = to_cluster(len).max(1);
+                if crossing <= now {
+                    crossing += (now - crossing) / lap * lap;
+                }
+            }
+            if crossing <= now {
+                return crossing;
+            }
+        }
+    }
+    state.anchor_cluster_ns.min(now)
+}
+
 /// Width of the output pictures sent to the operator, in pixels.
 const PREVIEW_WIDTH: u32 = 480;
 
@@ -91,6 +125,9 @@ pub struct App {
     reloads_done: u64,
     /// Outputs closed on the operator's request.
     standby: bool,
+    /// Free-running layers on air: layer id → the cluster time they went on
+    /// air (their media runs from there).
+    onsets: HashMap<String, i64>,
     /// Output pictures on their way back from the GPU.
     captures: Vec<Capture>,
     /// How the process should end when the event loop stops: 0 to quit,
@@ -157,6 +194,7 @@ impl App {
             started: false,
             reloads_done: 0,
             standby: false,
+            onsets: HashMap::new(),
             captures: Vec::new(),
             exit_code: 0,
         }
@@ -585,7 +623,6 @@ impl App {
         // and every timeline.
         let position = self.playhead.position();
         let now = position.show_seconds();
-        let cluster_s = position.cluster_ns as f64 / NANOS_PER_SEC as f64;
         let loop_s = position
             .transport
             .loop_ns
@@ -612,14 +649,31 @@ impl App {
                 c.idle(); // its timeline is off stage
                 continue;
             };
-            // What the content is asked for: timeline time — or, for a
-            // free-running layer, cluster time (see `Timing::free_run`).
-            let media = |timeline_t: f64| {
-                if layer.timing.free_run {
-                    cluster_s
+            // A free-running layer is asked for media time: seconds since it
+            // went on air, at normal speed, whatever its timeline does.
+            let on_air = layer.timing.visible_at(t);
+            if layer.timing.free_run {
+                if on_air {
+                    if !self.onsets.contains_key(&layer.id) {
+                        let state = match layer.timeline.as_deref() {
+                            None => Some(position.transport),
+                            Some(id) => self.playhead.task_state(id, position.cluster_ns),
+                        };
+                        let onset = state.map_or(position.cluster_ns, |s| {
+                            on_air_since(&s, layer.timing.start, position.cluster_ns)
+                        });
+                        self.onsets.insert(layer.id.clone(), onset);
+                    }
                 } else {
-                    timeline_t
+                    self.onsets.remove(&layer.id);
                 }
+            }
+            let onset = self.onsets.get(&layer.id).copied();
+            let media = |timeline_t: f64| match (layer.timing.free_run, onset) {
+                (true, Some(onset)) => (position.cluster_ns - onset) as f64 / NANOS_PER_SEC as f64,
+                // About to go on air: its first frame.
+                (true, None) => 0.0,
+                (false, _) => timeline_t,
             };
             // Time until the layer appears, allowing for the main timeline
             // looping back to a cue at its beginning.
@@ -851,5 +905,47 @@ impl ApplicationHandler for App {
         // paces the loop, so Poll does not spin the CPU.
         self.render_frame(event_loop);
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lc_proto::TransportState;
+
+    const S: i64 = NANOS_PER_SEC;
+
+    fn playing(anchor_cluster_ns: i64, anchor_show_ns: i64) -> TransportState {
+        TransportState {
+            epoch: 1,
+            playing: true,
+            anchor_cluster_ns,
+            anchor_show_ns,
+            ..TransportState::STOPPED
+        }
+    }
+
+    #[test]
+    fn a_free_running_cue_goes_on_air_when_the_playhead_crosses_its_start() {
+        // Play from 0 at cluster time 100 s; the cue starts at 3 s of show
+        // time, so it went on air at cluster time 103 s.
+        assert_eq!(on_air_since(&playing(100 * S, 0), 3.0, 104 * S), 103 * S);
+        // Seeked into the middle of the cue: on air since that seek.
+        assert_eq!(
+            on_air_since(&playing(100 * S, 5 * S), 3.0, 104 * S),
+            100 * S
+        );
+        // Paused (here: the state in which it became visible is a pause).
+        let paused = TransportState {
+            playing: false,
+            ..playing(100 * S, 4 * S)
+        };
+        assert_eq!(on_air_since(&paused, 3.0, 104 * S), 100 * S);
+        // Looping every 10 s: the most recent pass over the start.
+        let looping = TransportState {
+            loop_ns: Some(10 * S),
+            ..playing(100 * S, 0)
+        };
+        assert_eq!(on_air_since(&looping, 3.0, 125 * S), 123 * S);
     }
 }
