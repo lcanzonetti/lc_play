@@ -175,13 +175,20 @@ impl Playhead {
     /// Snapping is what makes frame-locked Runners agree on the frame
     /// exactly: the grid instant is the same integer everywhere, whereas
     /// each Runner's own estimate is off by its clock and measurement error.
-    pub fn position_for_display(&self, display_local_ns: i64) -> (Position, Option<i64>) {
+    ///
+    /// `was_on_grid`: whether this output was on the grid last frame (joining
+    /// is stricter than staying; see `lc_proto::vblank`).
+    pub fn position_for_display(
+        &self,
+        display_local_ns: i64,
+        was_on_grid: bool,
+    ) -> (Position, Option<i64>) {
         let reading = self.clock.read(display_local_ns);
         let snapped = if reading.synced {
             self.grid
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .snap(reading.cluster_ns)
+                .snap(reading.cluster_ns, was_on_grid)
         } else {
             None
         };

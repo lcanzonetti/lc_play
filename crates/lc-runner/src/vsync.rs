@@ -154,11 +154,17 @@ impl RefreshClock {
 }
 
 /// Which refresh presents really reach, learnt from the driver's reports.
+///
+/// The lag is measured against the *uncorrected* prediction (`base`), never
+/// against the corrected target: otherwise honouring the correction would
+/// make the measured lag 0, the correction would fall back to 0, frames would
+/// land late again, and the correction would flip every frame.
 #[derive(Debug, Clone, Default)]
 pub struct PresentTracker {
-    /// Presents not yet reported: (present id, refresh it was rendered for).
-    pending: VecDeque<(u32, i64)>,
-    /// Recent "landed minus intended" values, in refreshes.
+    /// Presents not yet reported: (present id, uncorrected prediction, the
+    /// correction that was applied to it).
+    pending: VecDeque<(u32, i64, i64)>,
+    /// Recent "landed minus uncorrected prediction" values, in refreshes.
     lags: VecDeque<i64>,
     /// Frames that landed later than the learnt latency.
     pub missed: u64,
@@ -178,10 +184,12 @@ impl PresentTracker {
         v[v.len() / 2].clamp(0, 4)
     }
 
-    /// A frame rendered for refresh `target` was presented as `present_id`.
-    pub fn presented(&mut self, present_id: u32, target: i64) {
+    /// A frame was presented as `present_id`. `base` is the refresh it was
+    /// predicted to reach without correction; it was rendered for
+    /// `base + correction`.
+    pub fn presented(&mut self, present_id: u32, base: i64, correction: i64) {
         self.presents += 1;
-        self.pending.push_back((present_id, target));
+        self.pending.push_back((present_id, base, correction));
         while self.pending.len() > 16 {
             self.pending.pop_front();
         }
@@ -190,8 +198,7 @@ impl PresentTracker {
     /// The driver says present `present_id` reached the screen at refresh
     /// `refresh`.
     pub fn landed(&mut self, present_id: u32, refresh: i64) {
-        let correction = self.correction();
-        while let Some(&(id, target)) = self.pending.front() {
+        while let Some(&(id, base, correction)) = self.pending.front() {
             // Wrapping comparison: present ids are 32-bit counters.
             let behind = present_id.wrapping_sub(id) as i32;
             if behind < 0 {
@@ -199,7 +206,8 @@ impl PresentTracker {
             }
             self.pending.pop_front();
             if behind == 0 {
-                let lag = refresh - target;
+                let lag = refresh - base;
+                // Later than the refresh it was rendered for: a miss.
                 if lag > correction && self.lags.len() >= MIN_SAMPLES {
                     self.missed += 1;
                 }
@@ -265,17 +273,37 @@ mod tests {
     #[test]
     fn the_tracker_learns_the_real_queue_depth_and_counts_misses() {
         let mut t = PresentTracker::default();
-        // Frames are rendered for refresh n but land on n + 1.
+        // Frames are predicted for refresh n but land on n + 1.
         for id in 0..20u32 {
-            t.presented(id, id as i64);
+            let c = t.correction();
+            t.presented(id, id as i64, c);
             t.landed(id, id as i64 + 1);
         }
         assert_eq!(t.correction(), 1);
         assert_eq!(t.missed, 0);
         // One lands two refreshes late: a miss.
-        t.presented(20, 20);
+        t.presented(20, 20, 1);
         t.landed(20, 22);
         assert_eq!(t.missed, 1);
+    }
+
+    #[test]
+    fn the_correction_does_not_feed_back_on_itself() {
+        // Closed loop, as in the render loop: the correction in force is
+        // applied, and frames really land one refresh after the uncorrected
+        // prediction every time. The correction must settle at 1 and stay,
+        // with no misses.
+        let mut t = PresentTracker::default();
+        let mut used = Vec::new();
+        for id in 0..200u32 {
+            let base = id as i64;
+            let c = t.correction();
+            used.push(c);
+            t.presented(id, base, c);
+            t.landed(id, base + 1);
+        }
+        assert!(used[20..].iter().all(|&c| c == 1), "{:?}", &used[..40]);
+        assert_eq!(t.missed, 0);
     }
 
     #[test]
@@ -283,7 +311,7 @@ mod tests {
         let mut t = PresentTracker::default();
         for k in 0..12u32 {
             let id = (u32::MAX - 5).wrapping_add(k);
-            t.presented(id, k as i64);
+            t.presented(id, k as i64, 0);
             t.landed(id, k as i64);
         }
         assert_eq!(t.correction(), 0);

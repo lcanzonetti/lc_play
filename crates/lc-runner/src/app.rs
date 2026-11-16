@@ -100,8 +100,10 @@ pub enum ShowSource {
 }
 
 struct RenderWindow {
-    window: Arc<Window>,
+    /// Before `window`: fields drop in order, and the swap chain must be
+    /// released before its window is destroyed.
     gpu: OutputGpu,
+    window: Arc<Window>,
     /// Index into `App::gpus`: the card this output is rendered by.
     gpu_idx: usize,
     /// Index into `show.outputs`.
@@ -484,8 +486,28 @@ impl App {
                         && output.window.size.is_none()
                         && (rw.output.canvas_rect.w, rw.output.canvas_rect.h)
                             != (output.canvas_rect.w, output.canvas_rect.h);
-                    if rw.output.window != output.window || size_follows_area {
+                    let moved = rw.output.window != output.window;
+                    if moved || size_follows_area {
                         apply_placement(&rw.window, output, event_loop);
+                    }
+                    // Moved to a monitor on another card: render it there.
+                    if moved && self.gpus.len() > 1 {
+                        let wanted = monitor_adapter(&rw.window)
+                            .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)));
+                        if let Some(g) = wanted.filter(|&g| g != rw.gpu_idx) {
+                            let RenderWindow { gpu, window, .. } = rw;
+                            drop(gpu); // one swap chain per window: old one first
+                            let out_gpu =
+                                self.gpus[g].build_output(window.clone(), output, layer_count)?;
+                            tracing::info!(display = %output.id, gpu = %self.gpus[g].adapter_info(), "output moved to another card");
+                            rw = RenderWindow {
+                                gpu: out_gpu,
+                                window,
+                                gpu_idx: g,
+                                output_idx: idx,
+                                output: output.clone(),
+                            };
+                        }
                     }
                     if rw.output.name != output.name {
                         rw.window.set_title(&window_title(output));
@@ -556,30 +578,34 @@ impl App {
     /// of the present barrier. Elsewhere, and on laptops whose screens hang
     /// off the integrated GPU, the one high-performance card.
     fn gpu_for(&mut self, window: &Arc<Window>) -> anyhow::Result<usize> {
-        #[cfg(windows)]
-        let luid = {
-            use winit::platform::windows::MonitorHandleExtWindows;
-            window
-                .current_monitor()
-                .and_then(|m| crate::dxgi::adapter_of_monitor(m.hmonitor()))
-        };
-        #[cfg(not(windows))]
-        let luid: Option<i64> = None;
-
+        let luid = monitor_adapter(window);
         if let Some(i) = luid.and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l))) {
             return Ok(i);
         }
-        if !self.gpus.is_empty() && luid.is_none() {
-            return Ok(0);
+        if !self.gpus.is_empty() {
+            // A card of its own only if it is a dedicated D3D12 card we are
+            // allowed to use; otherwise the card already rendering. (Checked
+            // before building a device: that is expensive.)
+            #[cfg(windows)]
+            let own_card = luid.and_then(crate::render::dedicated_adapter).is_some();
+            #[cfg(not(windows))]
+            let own_card = false;
+            if !own_card {
+                return Ok(0);
+            }
         }
         let gpu = Gpu::new(window.clone(), luid)?;
-        // The card asked for may have been refused (integrated): the device
-        // made instead may be one we already have.
-        if let Some(i) = gpu
-            .luid()
-            .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)))
-        {
-            return Ok(i);
+        // The device made may be one we already have (the card asked for was
+        // refused), or not identifiable: then use the existing one.
+        if !self.gpus.is_empty() {
+            match gpu
+                .luid()
+                .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)))
+            {
+                Some(i) => return Ok(i),
+                None if gpu.luid().is_none() => return Ok(0),
+                None => {}
+            }
         }
         tracing::info!(
             "GPU: {}{}",
@@ -723,17 +749,20 @@ impl App {
         // card share one sample, which keeps them in lockstep).
         let now = local_now();
         let latency = crate::render::frame_latency() as i64;
-        let targets: Vec<Option<(i64, i64)>> = frames
+        // (prediction without correction, correction, time of the refresh)
+        let targets: Vec<Option<(i64, i64, i64)>> = frames
             .iter()
             .map(|(w, _)| {
                 let t = &self.windows[*w].gpu.timing;
                 let (next, _) = t.clock.next_after(now)?;
-                let n = next + latency - 1 + t.tracker.correction();
-                Some((n, t.clock.time_of(n)?))
+                let base = next + latency - 1;
+                let correction = t.tracker.correction();
+                Some((base, correction, t.clock.time_of(base + correction)?))
             })
             .collect();
-        let display_local = targets[0].map_or(now, |(_, at)| at);
-        let (position, grid_offset) = playhead.position_for_display(display_local);
+        let display_local = targets[0].map_or(now, |(_, _, at)| at);
+        let was_on_grid = self.windows[frames[0].0].gpu.timing.grid_offset.is_some();
+        let (position, grid_offset) = playhead.position_for_display(display_local, was_on_grid);
 
         let times = self.layer_times(&position);
         let late = self.update_contents(g, &outs, &position, &times);
@@ -757,7 +786,7 @@ impl App {
         }
         for ((w, frame), target) in frames.into_iter().zip(targets) {
             let rw = &mut self.windows[w];
-            self.gpus[g].present(&mut rw.gpu, frame, target.map(|(n, _)| n));
+            self.gpus[g].present(&mut rw.gpu, frame, target.map(|(b, c, _)| (b, c)));
             rw.gpu.timing.grid_offset = grid_offset;
             if late.contains(&w) {
                 rw.gpu.timing.late_decodes += 1;
@@ -954,6 +983,22 @@ impl App {
             h.output_health = health;
             h.vblank = vblank;
         });
+    }
+}
+
+/// The LUID of the card driving the monitor `window` is on (Windows only).
+fn monitor_adapter(window: &Window) -> Option<i64> {
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::MonitorHandleExtWindows;
+        window
+            .current_monitor()
+            .and_then(|m| crate::dxgi::adapter_of_monitor(m.hmonitor()))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
     }
 }
 

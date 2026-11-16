@@ -239,6 +239,9 @@ struct PublishedGrid {
 /// this far from it (clock drift between the house sync and the Director's
 /// clock accumulates slowly)…
 const GRID_MAX_OFFSET_NS: i64 = 200_000;
+/// …or, for a reference that times its refreshes from the render loop (about
+/// a millisecond of jitter), this far…
+const GRID_MAX_OFFSET_INEXACT_NS: i64 = 2_000_000;
 /// …or its period by this much…
 const GRID_MAX_PERIOD_PPM: f64 = 2.0;
 /// …but not more often than this: each new grid is a (tiny) step in every
@@ -629,7 +632,12 @@ impl Core {
                     .vblank_ns
                     .saturating_sub(g.instant(g.line_near(report.vblank_ns)));
                 let ppm = (report.period_ps - g.period_ps) as f64 / g.period_ps as f64 * 1e6;
-                (off.abs() > GRID_MAX_OFFSET_NS || ppm.abs() > GRID_MAX_PERIOD_PPM)
+                let max_off = if report.exact {
+                    GRID_MAX_OFFSET_NS
+                } else {
+                    GRID_MAX_OFFSET_INEXACT_NS
+                };
+                (off.abs() > max_off || ppm.abs() > GRID_MAX_PERIOD_PPM)
                     && now.saturating_sub(p.at) >= GRID_MIN_INTERVAL_NS
             }
         };

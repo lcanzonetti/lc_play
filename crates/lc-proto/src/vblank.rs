@@ -33,12 +33,17 @@ use serde::{Deserialize, Serialize};
 /// Picoseconds per nanosecond.
 const PS_PER_NS: i128 = 1000;
 
-/// A Runner's refreshes count as "on the grid" when they are within this
+/// A Runner's refreshes count as "on the grid" while they stay within this
 /// fraction of a period of a grid line. Frame-locked displays measure within
 /// about a millisecond (clock sync plus measurement error); unlocked ones
-/// drift through every phase. A quarter period leaves room for the first and
-/// still rejects most of the second.
+/// drift through every phase. A quarter period leaves room for the first.
 pub const ON_GRID_TOLERANCE: f64 = 0.25;
+
+/// …but they only *join* the grid within this fraction. The gap between the
+/// two is hysteresis: an unlocked display drifting past a grid line does not
+/// flip in and out (each flip is a step of up to a quarter period in the
+/// instant its frames are chosen for).
+pub const JOIN_GRID_TOLERANCE: f64 = 0.1;
 
 /// The refresh grid published by the Director.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,18 +104,21 @@ impl VblankGrid {
     /// Runner's refreshes are not on this grid (no frame lock, or a different
     /// refresh rate), and the estimate must be used as it is.
     pub fn snap(&self, estimate_ns: i64) -> Option<Snapped> {
+        self.snap_within(estimate_ns, ON_GRID_TOLERANCE)
+    }
+
+    /// [`snap`](Self::snap) with a given tolerance, in periods.
+    pub fn snap_within(&self, estimate_ns: i64, tolerance: f64) -> Option<Snapped> {
         if !self.is_valid() {
             return None;
         }
         let k = self.line_near(estimate_ns);
         let instant_ns = self.instant(k);
         let offset_ns = estimate_ns.saturating_sub(instant_ns);
-        (offset_ns.unsigned_abs() as f64 <= ON_GRID_TOLERANCE * self.period_ns()).then_some(
-            Snapped {
-                instant_ns,
-                offset_ns,
-            },
-        )
+        (offset_ns.unsigned_abs() as f64 <= tolerance * self.period_ns()).then_some(Snapped {
+            instant_ns,
+            offset_ns,
+        })
     }
 }
 
@@ -144,7 +152,11 @@ impl GridSchedule {
     /// `current` that is at or after `next.valid_from_ns`. That is decided on
     /// grid instants, so every Runner switches on the same refresh even
     /// though their estimates differ a little.
-    pub fn snap(&mut self, estimate_ns: i64) -> Option<Snapped> {
+    ///
+    /// `was_on` says whether the caller's refreshes were on the grid last
+    /// time: staying on uses [`ON_GRID_TOLERANCE`], joining the stricter
+    /// [`JOIN_GRID_TOLERANCE`].
+    pub fn snap(&mut self, estimate_ns: i64, was_on: bool) -> Option<Snapped> {
         let current = self.current?;
         if let Some(next) = self.next {
             let line = current.instant(current.line_near(estimate_ns));
@@ -153,7 +165,13 @@ impl GridSchedule {
                 self.next = None;
             }
         }
-        self.current.and_then(|g| g.snap(estimate_ns))
+        let tolerance = if was_on {
+            ON_GRID_TOLERANCE
+        } else {
+            JOIN_GRID_TOLERANCE
+        };
+        self.current
+            .and_then(|g| g.snap_within(estimate_ns, tolerance))
     }
 }
 
@@ -274,6 +292,15 @@ mod tests {
     }
 
     #[test]
+    fn joining_the_grid_is_stricter_than_staying_on_it() {
+        let mut s = GridSchedule::default();
+        s.accept(grid(0));
+        let off = P / 1000 / 5; // a fifth of a period
+        assert!(s.snap(grid(0).instant(7) + off, false).is_none());
+        assert!(s.snap(grid(0).instant(7) + off, true).is_some());
+    }
+
+    #[test]
     fn hostile_grids_are_ignored() {
         let mut s = GridSchedule::default();
         s.accept(VblankGrid {
@@ -306,7 +333,7 @@ mod tests {
             s.accept(old);
             s.accept(next);
             (1190..1210)
-                .map(|k| s.snap(old.instant(k) + bias).unwrap().instant_ns)
+                .map(|k| s.snap(old.instant(k) + bias, true).unwrap().instant_ns)
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(4_000_000 / 10), run(-3_000_000 / 10));

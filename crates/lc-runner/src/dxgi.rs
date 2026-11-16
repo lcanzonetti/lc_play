@@ -101,6 +101,22 @@ pub struct SwapChain {
     barrier: Option<BarrierClient>,
     barrier_fence: Option<ID3D12Fence>,
     barrier_state: BarrierState,
+    /// Presents made while registered with the barrier: the barrier fence's
+    /// value is expected to reach this count (NVAPI: "monotonically
+    /// increasing on every present call, and tracked by the application").
+    barrier_presents: u64,
+    /// Per buffer: the barrier-fence value of the present that last showed
+    /// it. Before rendering into the buffer again, the fence must reach it.
+    barrier_due: Vec<u64>,
+    /// The barrier fence never reached a value in time: stop waiting on it
+    /// (a driver that does not signal it must not freeze the output).
+    barrier_wait_broken: bool,
+    /// Event for CPU waits on the barrier fence.
+    barrier_event: Option<HANDLE>,
+    /// Whether the frame-lock counter can be read (`None`: not tried yet).
+    counter_supported: Option<bool>,
+    /// The buffers are gone (a resize failed): the swap chain cannot be used.
+    broken: bool,
 }
 
 impl SwapChain {
@@ -177,6 +193,12 @@ impl SwapChain {
             barrier: None,
             barrier_fence: None,
             barrier_state: BarrierState::Off,
+            barrier_presents: 0,
+            barrier_due: Vec::new(),
+            barrier_wait_broken: false,
+            barrier_event: None,
+            counter_supported: None,
+            broken: false,
         };
         sc.wrap_buffers(device)?;
         sc.setup_barrier();
@@ -223,6 +245,7 @@ impl SwapChain {
             self.transitions.push(self.record(&resource)?);
             self.raw.push(resource);
             self.presented.push(false);
+            self.barrier_due.push(0);
         }
         Ok(())
     }
@@ -285,6 +308,7 @@ impl SwapChain {
         if client.register(&fence, &self.raw) && client.join() {
             tracing::info!("output joined the NVIDIA present barrier");
             self.barrier_state = BarrierState::Client;
+            self.barrier_event = unsafe { CreateEventW(None, false, false, None).ok() };
         } else {
             self.barrier_state = BarrierState::NotJoined;
         }
@@ -298,9 +322,14 @@ impl SwapChain {
         unsafe { WaitForSingleObject(self.waitable, timeout_ms) == WAIT_OBJECT_0 }
     }
 
-    /// Start a frame: the buffer to render into.
-    pub fn begin(&mut self) -> &wgpu::TextureView {
+    /// Start a frame: the buffer to render into. `None` if the swap chain
+    /// lost its buffers (a failed resize): it must be replaced.
+    pub fn begin(&mut self) -> Option<&wgpu::TextureView> {
+        if self.broken || self.raw.is_empty() {
+            return None;
+        }
         let i = unsafe { self.swap.GetCurrentBackBufferIndex() } as usize % self.raw.len();
+        self.wait_for_barrier(i);
         if self.presented[i] {
             unsafe {
                 self.queue
@@ -308,7 +337,40 @@ impl SwapChain {
             }
         }
         self.current = Some(i);
-        &self.views[i]
+        Some(&self.views[i])
+    }
+
+    /// NVAPI: "Application must wait on this fence to ensure the scanout
+    /// resources are ready for use in the next rendering loop." Wait (on the
+    /// CPU, with a timeout) until the barrier has released the present that
+    /// last showed buffer `i`.
+    ///
+    /// [Not verified on hardware] how the driver numbers the fence: this
+    /// assumes it reaches the count of presents made since registration, as
+    /// the header describes. If it never does, the first timeout turns the
+    /// waits off and says so in the log — the barrier itself keeps working.
+    fn wait_for_barrier(&mut self, i: usize) {
+        if self.barrier_wait_broken {
+            return;
+        }
+        let (Some(fence), Some(event)) = (&self.barrier_fence, self.barrier_event) else {
+            return;
+        };
+        let due = self.barrier_due[i];
+        unsafe {
+            if due == 0 || fence.GetCompletedValue() >= due {
+                return;
+            }
+            if fence.SetEventOnCompletion(due, event).is_err()
+                || WaitForSingleObject(event, 100) != WAIT_OBJECT_0
+            {
+                tracing::warn!(
+                    "present barrier: the driver did not release frame {due} in time; \
+                     no longer waiting on its fence"
+                );
+                self.barrier_wait_broken = true;
+            }
+        }
     }
 
     /// Finish the frame begun with [`begin`](Self::begin) (wgpu's work for it
@@ -324,6 +386,10 @@ impl SwapChain {
                 .ExecuteCommandLists(&[Some(self.transitions[i].to_present.clone())]);
             self.presented[i] = true;
             self.swap.Present(1, DXGI_PRESENT(0)).ok()?;
+            if self.barrier_event.is_some() {
+                self.barrier_presents += 1;
+                self.barrier_due[i] = self.barrier_presents;
+            }
             Ok(self.swap.GetLastPresentCount()?)
         }
     }
@@ -351,9 +417,22 @@ impl SwapChain {
         self.barrier_state
     }
 
-    /// NVIDIA's frame-lock frame counter, when frame lock is active.
-    pub fn frame_counter(&self) -> Option<u32> {
-        Nvapi::get()?.frame_count(&self.device)
+    /// NVIDIA's frame-lock frame counter, when frame lock is active. Not
+    /// asked again once the driver has said it does not have one.
+    pub fn frame_counter(&mut self) -> Option<u32> {
+        if self.counter_supported == Some(false) {
+            return None;
+        }
+        let count = Nvapi::get().and_then(|api| api.frame_count(&self.device));
+        if self.counter_supported.is_none() {
+            self.counter_supported = Some(count.is_some());
+        }
+        count
+    }
+
+    /// Whether the swap chain lost its buffers and must be replaced.
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// Resize the buffers. Waits for the GPU: only on window changes.
@@ -369,7 +448,11 @@ impl SwapChain {
         self.transitions.clear();
         self.raw.clear();
         self.presented.clear();
+        self.barrier_due.clear();
         self.current = None;
+        // From here on, until the new buffers exist, the swap chain is
+        // unusable; on failure it stays so and the caller replaces it.
+        self.broken = true;
         let _ = device.poll(wgpu::Maintain::Wait);
         self.wait_idle();
         unsafe {
@@ -380,8 +463,15 @@ impl SwapChain {
         self.width = width;
         self.height = height;
         self.wrap_buffers(device)?;
+        self.broken = false;
         if let (Some(client), Some(fence)) = (&self.barrier, &self.barrier_fence) {
-            client.register(fence, &self.raw);
+            if !client.register(fence, &self.raw) {
+                // [Not verified on hardware] whether re-registering after a
+                // resize keeps the client joined; if not, say so.
+                tracing::warn!("present barrier: buffers not re-registered after a resize");
+                self.barrier_state = BarrierState::NotJoined;
+                self.barrier_event = None;
+            }
         }
         Ok(())
     }
@@ -415,6 +505,9 @@ impl Drop for SwapChain {
         self.wait_idle();
         unsafe {
             let _ = CloseHandle(self.waitable);
+            if let Some(event) = self.barrier_event {
+                let _ = CloseHandle(event);
+            }
         }
     }
 }

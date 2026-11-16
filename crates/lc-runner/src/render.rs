@@ -138,21 +138,8 @@ impl Gpu {
     /// LUID; otherwise the high-performance card that can present to it.
     pub fn new(first_window: Arc<Window>, luid: Option<i64>) -> anyhow::Result<Self> {
         #[cfg(windows)]
-        if let Some(luid) = luid {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::DX12,
-                ..Default::default()
-            });
-            let adapter = instance
-                .enumerate_adapters(wgpu::Backends::DX12)
-                .into_iter()
-                .find(|a| crate::dxgi::adapter_luid(a) == Some(luid))
-                // A laptop's built-in screen hangs off the integrated GPU:
-                // keep rendering on the discrete one, as before.
-                .filter(|a| a.get_info().device_type != wgpu::DeviceType::IntegratedGpu);
-            if let Some(adapter) = adapter {
-                return Self::with_adapter(instance, adapter, wgpu::TextureFormat::Bgra8UnormSrgb);
-            }
+        if let Some((instance, adapter)) = luid.and_then(dedicated_adapter) {
+            return Self::with_adapter(instance, adapter, wgpu::TextureFormat::Bgra8UnormSrgb);
         }
         let _ = luid;
         let (gpu, _surface) = Self::new_any(first_window)?;
@@ -427,9 +414,10 @@ impl Gpu {
         let max = self.max_texture_dimension();
         let phys = window.inner_size();
         let (width, height) = (phys.width.clamp(1, max), phys.height.clamp(1, max));
-        let presenter = self.make_presenter(window, width, height)?;
+        let presenter = self.make_presenter(window.clone(), width, height)?;
         let res = self.build_resources(width, height, output, layer_count);
         Ok(OutputGpu {
+            window,
             presenter,
             width,
             height,
@@ -661,11 +649,26 @@ impl Gpu {
             }
             #[cfg(windows)]
             Presenter::Dxgi(sc) => {
-                if let Err(e) = sc.resize(&self.device, width, height) {
-                    tracing::error!("cannot resize the output: {e:#}");
-                    return;
+                let resized = if sc.is_broken() {
+                    Err(anyhow::anyhow!("its buffers were lost"))
+                } else {
+                    sc.resize(&self.device, width, height)
+                };
+                if let Err(e) = resized {
+                    // Start over with a new presenter for the window: the old
+                    // swap chain must be gone first (one per window).
+                    tracing::error!("output swap chain unusable ({e:#}); recreating it");
+                    out.presenter = Presenter::Dead;
+                    let _ = self.device.poll(wgpu::Maintain::Wait);
+                    out.presenter = self
+                        .make_presenter(out.window.clone(), width, height)
+                        .unwrap_or_else(|e| {
+                            tracing::error!("cannot present to this output any more: {e:#}");
+                            Presenter::Dead
+                        });
                 }
             }
+            Presenter::Dead => {}
         }
         out.width = width;
         out.height = height;
@@ -698,13 +701,26 @@ impl Gpu {
                     surface: Some(frame),
                 })
             }
+            Presenter::Dead => Err(wgpu::SurfaceError::Timeout),
             #[cfg(windows)]
             Presenter::Dxgi(sc) => {
                 // 100 ms is far beyond any refresh: the window is hidden or
-                // the display gone. Skip the output, keep the others.
-                if !sc.wait(100) {
+                // the display gone. Skip the output; and for the next frames
+                // only look (no wait), so the other outputs of the card are
+                // not held up by it.
+                let timeout = if out.timing.stalled > 0 {
+                    out.timing.stalled -= 1;
+                    0
+                } else {
+                    100
+                };
+                if !sc.wait(timeout) {
+                    if timeout > 0 {
+                        out.timing.stalled = 60;
+                    }
                     return Err(wgpu::SurfaceError::Timeout);
                 }
+                out.timing.stalled = 0;
                 let now = local_now();
                 match sc.statistics() {
                     Some(st) => {
@@ -719,10 +735,14 @@ impl Gpu {
                     None => out.timing.clock.observe_tick(now),
                 }
                 out.timing.barrier = sc.barrier_state().as_str();
-                Ok(Acquired {
-                    view: sc.begin().clone(),
-                    surface: None,
-                })
+                match sc.begin() {
+                    Some(view) => Ok(Acquired {
+                        view: view.clone(),
+                        surface: None,
+                    }),
+                    // Buffers lost: the caller resizes, which replaces it.
+                    None => Err(wgpu::SurfaceError::Lost),
+                }
             }
         }
     }
@@ -759,9 +779,11 @@ impl Gpu {
     }
 
     /// Put a rendered frame on screen. `target` is the refresh it was
-    /// rendered for (see [`OutputTiming`]).
-    pub fn present(&self, out: &mut OutputGpu, frame: Acquired, target: Option<i64>) {
+    /// predicted to reach without correction, and the correction applied
+    /// (see [`PresentTracker`]).
+    pub fn present(&self, out: &mut OutputGpu, frame: Acquired, target: Option<(i64, i64)>) {
         match &mut out.presenter {
+            Presenter::Dead => {}
             Presenter::Surface { .. } => {
                 if let Some(f) = frame.surface {
                     f.present();
@@ -771,8 +793,12 @@ impl Gpu {
             #[cfg(windows)]
             Presenter::Dxgi(sc) => match sc.end() {
                 Ok(id) => {
-                    out.timing.tracker.presented(id, target.unwrap_or(0));
-                    out.timing.frame_counter = sc.frame_counter();
+                    let (base, correction) = target.unwrap_or((0, 0));
+                    out.timing.tracker.presented(id, base, correction);
+                    // Diagnosis only: twice a second at 60 Hz is plenty.
+                    if out.timing.tracker.presents % 30 == 1 {
+                        out.timing.frame_counter = sc.frame_counter();
+                    }
                 }
                 Err(e) => tracing::warn!("present failed: {e:#}"),
             },
@@ -1143,6 +1169,27 @@ fn preferred_backends() -> wgpu::Backends {
     }
 }
 
+/// The D3D12 adapter with this LUID, if outputs should be rendered on it:
+/// only when D3D12 is the backend in use (`LCPLAY_BACKEND`), and not for an
+/// integrated GPU — a laptop's built-in screen hangs off it, and rendering
+/// stays on the discrete card as before.
+#[cfg(windows)]
+pub fn dedicated_adapter(luid: i64) -> Option<(wgpu::Instance, wgpu::Adapter)> {
+    if !preferred_backends().contains(wgpu::Backends::DX12) {
+        return None;
+    }
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..Default::default()
+    });
+    let adapter = instance
+        .enumerate_adapters(wgpu::Backends::DX12)
+        .into_iter()
+        .find(|a| crate::dxgi::adapter_luid(a) == Some(luid))
+        .filter(|a| a.get_info().device_type != wgpu::DeviceType::IntegratedGpu)?;
+    Some((instance, adapter))
+}
+
 /// Frames rendered ahead of the display with a wgpu surface (1..=3,
 /// `LCPLAY_FRAME_LATENCY`, default 2). The own swap chain reads the same.
 pub fn frame_latency() -> u32 {
@@ -1163,6 +1210,8 @@ pub enum Presenter {
     /// LC Play's own DXGI swap chain (Windows/D3D12).
     #[cfg(windows)]
     Dxgi(Box<crate::dxgi::SwapChain>),
+    /// Nothing works for this window any more (logged); it is skipped.
+    Dead,
 }
 
 /// A frame being made for one output.
@@ -1186,11 +1235,19 @@ pub struct OutputTiming {
     /// Present barrier state (`off` for wgpu surfaces).
     pub barrier: &'static str,
     pub frame_counter: Option<u32>,
+    /// Frames left during which a stalled output is only polled, not waited
+    /// for (see [`Gpu::acquire`]).
+    pub stalled: u32,
 }
 
 /// Per-output GPU state: how it is presented plus its render resources.
 pub struct OutputGpu {
+    /// Declared before the window handle's owner drops it: the presenter
+    /// must go before the window.
     presenter: Presenter,
+    /// To make a new presenter if the swap chain is lost (Windows).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    window: Arc<Window>,
     width: u32,
     height: u32,
     res: OutputResources,
@@ -1204,6 +1261,7 @@ impl OutputGpu {
             Presenter::Surface { .. } => "wgpu",
             #[cfg(windows)]
             Presenter::Dxgi(_) => "dxgi",
+            Presenter::Dead => "none",
         }
     }
 

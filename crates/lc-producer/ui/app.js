@@ -1421,7 +1421,8 @@ function renderRunners(force = false) {
     names.map((n) => {
       const { node, h, machine, online } = runnerInfo(n);
       return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine,
-        (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000)]),
+        (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000),
+          o.refresh_hz == null ? null : Math.round(o.refresh_hz * 10), o.frame_counter == null]),
         S.status?.grid_source === node?.node_id];
     }),
     S.doc.stage.displays, S.sel, S.connected, [...S.previewOn],
