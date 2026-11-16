@@ -47,10 +47,12 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
   opacity, plus fade in/out.
 * **Control cues are executed by the Director.** They are frame-exact on all
   Runners, but do not fire while the Director is down.
-* **Free-running cues follow the Director's timing**: each Runner works out
-  the instant the cue went on air from the shared transport state, so they
-  agree; a cue that is already on air when a Runner starts is picked up from
-  the moment its timeline last started.
+* **Free-running cues can be out of step on a Runner that (re)joins late.**
+  Each Runner works out when the cue went on air from the shared transport
+  state, so Runners that saw it go on air agree. A Runner that starts or
+  reconnects while the cue is on air, after the timeline was paused, its
+  rate changed, or a looping timeline wrapped, picks a later instant and
+  plays the clip from an earlier point than the others.
 * **Warp is corner-pin only**, and is set as numbers in the show file — the
   Producer has fields for edge blend but no warp editor yet.
 * **MIDI, Art-Net and LTC are not implemented**; OSC is.

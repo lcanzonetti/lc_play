@@ -322,7 +322,11 @@ Runner remembers the instant while the cue stays on air, so a later pause
 does not move it. A Runner that joins while the cue is on air computes it
 from the state it receives, which agrees with the others unless the state
 changed while the cue was already on air (then the joiner restarts the clip
-from that change) [design limit, not measured].
+from that change) [design limit, not measured]. The same happens on a
+looping timeline when the cue spans the loop point and never goes off air:
+the Runners that were there keep the first instant, a joiner takes the most
+recent lap. The fix is for the Director to put each free-running cue's
+on-air instant in the state it broadcasts; not done yet.
 
 `free_run` on a *track* is the older form and still read: it makes every cue
 on the track free-running. The Producer converts it to per-cue flags when it

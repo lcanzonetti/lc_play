@@ -137,7 +137,8 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
                         fade_in: cue.fade_in_s,
                         fade_out: cue.fade_out_s,
                         media_in: cue.in_s,
-                        media_loop: cue.looping,
+                        // A free-running track (the older form) always looped.
+                        media_loop: cue.looping || track.free_run,
                         free_run: cue.free_run || track.free_run,
                     },
                     timeline: timeline.clone(),
@@ -232,6 +233,10 @@ mod tests {
         assert!(
             overlay.timing.free_run,
             "a free-running track makes its cues free-run"
+        );
+        assert!(
+            overlay.timing.media_loop,
+            "…and loop, as free-running tracks always did"
         );
         let front_of_main = show.layers.iter().find(|l| l.id == "front").unwrap();
         assert_eq!(front_of_main.timeline, None);

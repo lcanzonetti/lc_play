@@ -166,7 +166,8 @@ function normalize(doc) {
     for (const t of tl.tracks) {
       t.id ||= uid(); t.name ??= ''; t.cues ??= [];
       // Free-run used to be a track setting; it is now per cue.
-      if (t.free_run) for (const c of t.cues) c.free_run = true;
+      // (A free-running track always looped, so its cues loop too.)
+      if (t.free_run) for (const c of t.cues) { c.free_run = true; c.loop = true; }
       t.free_run = false;
       for (const c of t.cues) {
         c.id ||= uid();
@@ -900,6 +901,7 @@ function drawStage() {
         const onAir = active && t >= cue.start_s && t < cue.start_s + cue.duration_s;
         // The selected cue is always shown (ghosted when not on air), so it
         // can be positioned without scrubbing to it first.
+        if (!onAir) S.onsets.delete(cue.id); // on air again later: afresh
         if (!onAir && cue !== sel) continue;
         const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
                    * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
@@ -1190,7 +1192,7 @@ function renderTimeline() {
     const selected = S.sel?.type === 'track' && S.sel.id === track.id;
     tracks.append(el('div', { class: 'track' },
       el('div', { class: `track-head${selected ? ' sel' : ''}`, title: 'Click to select the track', onclick: () => select({ type: 'track', id: track.id }) },
-        el('span', { class: 'name' }, track.name || `Track ${ti + 1}`),),
+        el('span', { class: 'name' }, track.name || `Track ${ti + 1}`)),
       lane));
   });
 }
@@ -1722,7 +1724,7 @@ function renderInspector() {
       field('Opacity (%)', c, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
     );
     if (c.source.type === 'color') box.append(colorField('Colour', c.source, 'rgba'));
-    const mw = asset?.width || S.doc.stage.width, mh = asset?.height || S.doc.stage.height;
+    const mw = asset?.width || extent().w, mh = asset?.height || extent().h;
     box.append(el('div', { class: 'btns' },
       el('button', { onclick: () => edit(() => Object.assign(c, fitRect(mw, mh, true))) }, 'Fit to stage'),
       asset?.width ? el('button', { onclick: () => edit(() => Object.assign(c, { w: asset.width, h: asset.height })) }, 'Original size') : null,

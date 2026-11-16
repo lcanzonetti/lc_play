@@ -212,7 +212,9 @@ async fn remote_desktop(
             "remote desktop can only be opened from the Producer's own page".into(),
         );
     }
+    // A leading '-' would be read as an option by the program it is given to.
     let host_ok = !req.host.is_empty()
+        && !req.host.starts_with('-')
         && req.host.len() < 256
         && req
             .host
@@ -233,8 +235,19 @@ async fn remote_desktop(
         // viewer directly.
         ("vnc", "windows") => match windows_vnc_viewer() {
             Some(viewer) => {
+                // VNC viewers read `host:N` as display N (port 5900 + N);
+                // the operator means a port, which is `host::port`. A
+                // bracketed IPv6 address is passed without brackets.
+                let target = match host.rsplit_once("]:").or_else(|| {
+                    (host.matches(':').count() == 1)
+                        .then(|| host.split_once(':'))
+                        .flatten()
+                }) {
+                    Some((h, port)) => format!("{}::{port}", h.trim_start_matches('[')),
+                    None => host.trim_matches(['[', ']']).to_string(),
+                };
                 let mut c = std::process::Command::new(viewer);
-                c.arg(&host);
+                c.arg(target);
                 c
             }
             None => {
@@ -253,11 +266,8 @@ async fn remote_desktop(
             } else {
                 format!("vnc://{host}")
             };
-            let mut c = std::process::Command::new(match os {
-                "windows" => "explorer",
-                "macos" => "open",
-                _ => "xdg-open",
-            });
+            // (Windows is handled above, for both kinds.)
+            let mut c = std::process::Command::new(if os == "macos" { "open" } else { "xdg-open" });
             c.arg(url);
             c
         }

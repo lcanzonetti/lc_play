@@ -49,25 +49,31 @@ use crate::stage;
 /// of the cue, a stop-and-play) the cue went on air when that state took
 /// effect.
 pub fn on_air_since(state: &lc_proto::TransportState, start_s: f64, now: i64) -> i64 {
-    let start = (start_s * NANOS_PER_SEC as f64).round() as i64;
+    // The state comes off the wire: everything is worked out in i128 so no
+    // value can overflow (as in `TransportState::show_time_at`), and the
+    // result is clamped to `now` at the end.
+    let start = (start_s * NANOS_PER_SEC as f64).round() as i64 as i128; // `as` saturates (NaN → 0)
+    let now128 = now as i128;
     if state.playing && state.rate_permille > 0 {
         let rate = state.rate_permille as i128;
-        let to_cluster = |show: i64| (show as i128 * 1000 / rate) as i64;
-        let ahead = match state.loop_ns.filter(|&len| len > 0) {
-            Some(len) => (start - state.anchor_show_ns.rem_euclid(len)).rem_euclid(len),
-            None => start - state.anchor_show_ns,
+        let to_cluster = |show: i128| show * 1000 / rate;
+        let anchor_show = state.anchor_show_ns as i128;
+        let len = state.loop_ns.filter(|&len| len > 0).map(|len| len as i128);
+        let ahead = match len {
+            Some(len) => (start - anchor_show.rem_euclid(len)).rem_euclid(len),
+            None => start - anchor_show,
         };
         if ahead >= 0 {
-            let mut crossing = state.anchor_cluster_ns + to_cluster(ahead);
-            if let Some(len) = state.loop_ns.filter(|&len| len > 0) {
+            let mut crossing = state.anchor_cluster_ns as i128 + to_cluster(ahead);
+            if let Some(len) = len {
                 // The most recent pass over the cue's start.
                 let lap = to_cluster(len).max(1);
-                if crossing <= now {
-                    crossing += (now - crossing) / lap * lap;
+                if crossing <= now128 {
+                    crossing += (now128 - crossing) / lap * lap;
                 }
             }
-            if crossing <= now {
-                return crossing;
+            if crossing <= now128 {
+                return crossing as i64; // ≤ now, ≥ an i64 anchor: fits
             }
         }
     }
@@ -408,6 +414,9 @@ impl App {
 
     /// Make `show` the one being rendered.
     fn apply_show(&mut self, event_loop: &ActiveEventLoop, show: Show) {
+        // Forget the on-air instants of layers that are gone.
+        self.onsets
+            .retain(|id, _| show.layers.iter().any(|l| &l.id == id && l.timing.free_run));
         // Windows are expensive and visible: touch them only if the displays
         // changed. Moving a cue must not make every output blink.
         // In standby the outputs stay closed, whatever the show says.
@@ -647,6 +656,8 @@ impl App {
         for ((layer, c), time) in self.show.layers.iter().zip(&mut self.contents).zip(&times) {
             let Some(t) = *time else {
                 c.idle(); // its timeline is off stage
+                          // Played again later, it goes on air afresh.
+                self.onsets.remove(&layer.id);
                 continue;
             };
             // A free-running layer is asked for media time: seconds since it
@@ -667,6 +678,9 @@ impl App {
                 } else {
                     self.onsets.remove(&layer.id);
                 }
+            } else {
+                // Free run switched off: switched back on, it starts afresh.
+                self.onsets.remove(&layer.id);
             }
             let onset = self.onsets.get(&layer.id).copied();
             let media = |timeline_t: f64| match (layer.timing.free_run, onset) {
@@ -922,6 +936,30 @@ mod tests {
             anchor_cluster_ns,
             anchor_show_ns,
             ..TransportState::STOPPED
+        }
+    }
+
+    #[test]
+    fn on_air_since_survives_hostile_states() {
+        // Values off the wire must not overflow (a debug build would panic).
+        for (anchor_cluster, anchor_show, rate, looping) in [
+            (i64::MIN, i64::MAX, 1, None),
+            (i64::MAX, i64::MIN, 1, Some(i64::MAX)),
+            (0, i64::MIN, 1_000_000, Some(1)),
+            (i64::MAX - 1, 0, 1, None),
+        ] {
+            let s = TransportState {
+                epoch: 1,
+                playing: true,
+                rate_permille: rate,
+                anchor_cluster_ns: anchor_cluster,
+                anchor_show_ns: anchor_show,
+                loop_ns: looping,
+                active: true,
+            };
+            for start in [0.0, 1e30, -1e30, f64::NAN] {
+                assert!(on_air_since(&s, start, 1_000) <= 1_000);
+            }
         }
     }
 
