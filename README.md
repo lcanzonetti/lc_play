@@ -153,8 +153,9 @@ Things worth trying:
 
 * Stop the Director (`pkill lc-director`, or end the process): the Runner
   keeps playing. `lc-play` leaves the other services running.
-* Restart `lc-play`: the show, its position and the Runner's media cache are
-  restored from `lcplay-data/`.
+* Restart `lc-play`: the show and its position are restored from
+  `lcplay-data/`, and the Runner keeps the media it already copied (see
+  *Where a Runner keeps its files* below).
 * Send OSC to UDP port 7405: `/lcplay/play`, `/lcplay/pause`, `/lcplay/stop`,
   `/lcplay/seek <seconds>`, `/lcplay/rate <speed>`, `/lcplay/loop <seconds|0>`,
   and `/lcplay/task/<id>/play` (`pause`, `stop`, `seek`) for a task — its id
@@ -172,7 +173,7 @@ target/release/lc-director --state-dir /data/director
 target/release/lc-producer --browser --assets http://10.0.0.1:7403
 
 # on each render machine
-target/release/lc-runner --director 10.0.0.1:7401 --name left --cache-dir /data/runner --allow-power
+target/release/lc-runner --director 10.0.0.1:7401 --name left --allow-power
 ```
 
 `lc-runner` runs under a small supervisor (the same program): **Restart**
@@ -189,6 +190,37 @@ multicast works.
 
 Default ports: discovery UDP 7400 (multicast 239.255.76.67), control TCP 7401,
 clock sync UDP 7402, assets HTTP 7403, Producer HTTP 7404, OSC UDP 7405.
+
+### Where a Runner keeps its files
+
+Each Runner has one folder, kept across restarts: downloaded media in
+`assets\` (named `<asset id>-<size>.<ext>`), plus its last show, its
+identity and its log. By default it is **`lc-runner\` in the folder the LC
+Play programs are in** — e.g. `C:\LC Play\lc-runner\assets\` — so media
+is copied once and survives restarts and reboots. (On Linux and macOS the
+folder is `lc-runner-data/`: the program itself is called `lc-runner`.)
+
+To put it elsewhere (a separate media drive, for instance), in order of
+priority:
+
+1. `--cache-dir D:\lcplay-runner` on the command line;
+2. the `LCPLAY_RUNNER_DIR` environment variable;
+3. a settings file `lcplay.json` next to the programs — the file a future
+   installer will write:
+
+   ```json
+   { "runner": { "dir": "D:\\lcplay-runner" } }
+   ```
+
+   A relative path is relative to the programs' folder.
+
+If the programs' folder cannot be written (installed under
+`C:\Program Files`), the Runner uses `%LOCALAPPDATA%\LC Play\lc-runner`
+instead. The Runner logs which folder it uses when it starts. Nothing in
+the folder is deleted automatically: remove unused media by hand, with the
+Runner stopped. A Runner started with a `--name` other than the default
+keeps its show and identity in `runner-<name>\` inside that folder (the media
+folder is shared), so several Runners can be tried on one machine.
 
 ### Frame-locked rigs (Quadro Sync / RTX Pro Sync)
 

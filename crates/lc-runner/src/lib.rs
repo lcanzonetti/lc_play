@@ -25,6 +25,7 @@ pub mod assets;
 pub mod content;
 #[cfg(windows)]
 pub mod dxgi;
+pub mod folders;
 pub mod hap;
 pub mod machine;
 pub mod mov;

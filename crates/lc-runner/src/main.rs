@@ -52,8 +52,9 @@ struct Args {
     /// Name shown to operators.
     #[arg(long, default_value = "runner")]
     name: String,
-    /// Directory for the show/transport cache and this node's identity.
-    /// Without it the Runner forgets everything on restart.
+    /// The Runner's folder: downloaded media (`assets`), the last show, its
+    /// identity and log. Default: `lc-runner` in the LC Play install folder
+    /// (or as set in `lcplay.json` / `LCPLAY_RUNNER_DIR`).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// IPv4 address of the network interface used for discovery.
@@ -87,11 +88,9 @@ fn main() -> anyhow::Result<()> {
     // before a crash or restart can still be read from the Producer. The
     // supervisor writes there too (it reports the crashes); the Runner itself
     // reads the end of the file back when it starts.
-    let log_file = args
-        .cache_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("lcplay-runner-{}", args.name)))
-        .join("runner.log");
+    // Kept across restarts: see `folders.rs` for where, and why.
+    let folders = lc_runner::folders::runner_folders(args.cache_dir.clone(), &args.name);
+    let log_file = folders.state.join("runner.log");
     let is_supervisor = !args.worker && !args.no_supervise;
     lc_runner::machine::persist_log(&log_file, !is_supervisor);
 
@@ -116,7 +115,7 @@ fn main() -> anyhow::Result<()> {
     if args.headless {
         let director = director.context("--headless needs --director <host:port> or --discover")?;
         let mut cfg = AgentConfig::new(args.name, director);
-        cfg.cache_dir = args.cache_dir;
+        cfg.cache_dir = Some(folders.state.clone());
         cfg.announce = Some(discovery);
         cfg.allow_power = args.allow_power;
         cfg.supervised = supervised;
@@ -154,13 +153,13 @@ fn main() -> anyhow::Result<()> {
         None => TransportState::STOPPED,
     };
 
-    // Downloaded media lives next to the rest of the cache; without a cache
-    // directory it goes to the system's temporary folder.
-    let assets_dir = args
-        .cache_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("lcplay-runner"))
-        .join("assets");
+    tracing::info!(
+        "runner folder {} ({}); media in {}",
+        folders.state.display(),
+        folders.origin,
+        folders.assets.display()
+    );
+    let assets_dir = folders.assets.clone();
     let runner_name = args.name.clone();
 
     // The agent lives on its own small runtime; the main thread belongs to
@@ -174,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             let mut cfg = AgentConfig::new(args.name, director);
-            cfg.cache_dir = args.cache_dir;
+            cfg.cache_dir = Some(folders.state.clone());
             cfg.announce = Some(discovery);
             cfg.local_clock = local_clock;
             cfg.initial_transport = initial;

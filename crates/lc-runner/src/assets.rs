@@ -259,7 +259,9 @@ fn download(url: &str, path: &Path, expected: u64, done: &AtomicU64) -> anyhow::
             );
         }
     }
-    let tmp = path.with_extension("part");
+    // Per process: two Runners on one machine share the media folder and may
+    // fetch the same file at once.
+    let tmp = path.with_extension(format!("{}.part", std::process::id()));
     let mut file = std::fs::File::create(&tmp)?;
     let mut reader = Counting {
         inner: response.into_reader().take(u64::MAX),

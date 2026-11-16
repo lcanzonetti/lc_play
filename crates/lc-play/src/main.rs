@@ -134,9 +134,10 @@ async fn main() -> anyhow::Result<()> {
         let mut runner = Command::new(sibling("lc-runner")?);
         runner
             // Explicit address: on one machine there is nothing to discover.
-            .args(["--director", "127.0.0.1:7401", "--name", &args.runner_name])
-            .arg("--cache-dir")
-            .arg(dir_arg(&args.dir, "runner"));
+            // Its folder (downloaded media, last show, identity) is its own
+            // default: `lc-runner` in the install folder, kept across
+            // restarts and independent of where this was started from.
+            .args(["--director", "127.0.0.1:7401", "--name", &args.runner_name]);
         children.push(("runner", Some(spawn("runner", runner)?)));
     }
 

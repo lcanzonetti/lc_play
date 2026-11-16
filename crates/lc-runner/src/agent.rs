@@ -21,7 +21,7 @@
 //!    restarted Director can adopt them (see `lc-director`).
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -606,9 +606,4 @@ impl Cache {
     fn save_tasks(&self, tasks: &std::collections::BTreeMap<String, TransportState>) {
         self.write("tasks.json", tasks);
     }
-}
-
-/// Convenience for binaries: the default cache location under `base`.
-pub fn default_cache_dir(base: &Path, name: &str) -> PathBuf {
-    base.join(format!("runner-{name}"))
 }
