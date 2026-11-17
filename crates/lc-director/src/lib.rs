@@ -810,7 +810,7 @@ impl Core {
                 ))
             }
             Command::SetLoop { loop_ns } => TransportChange::SetLoop(loop_ns),
-            Command::LoadShow { document } => return self.load_show(document),
+            Command::LoadShow { document, tag } => return self.load_show(document, tag),
             Command::EditShow { ops, tag } => return self.edit_show(&ops, tag),
             Command::RunnerAction { runner, action } => return self.runner_action(&runner, action),
             Command::WakeRunner { runner } => return self.wake_runner(&runner),
@@ -1012,67 +1012,151 @@ impl Core {
         }
     }
 
-    /// Apply a Producer's edit to the show (see `lc_proto::edit`). Done under
-    /// the state lock from reading the show to storing the result, so that
-    /// two edits arriving together are applied one after the other, each to
-    /// the result of the previous one — neither is lost.
+    /// Apply a Producer's edit to the show (see `lc_proto::edit`).
+    ///
+    /// Exactly once: the show records, per editor, the number of the last
+    /// edit applied (`_applied`), so an edit sent again after a reconnect is
+    /// recognised and ignored instead of overwriting newer changes.
+    ///
+    /// Applying, checking and parsing happen on a copy, outside the state
+    /// lock (so a big edit cannot hold up transport and health). The result
+    /// is stored only if the show has not changed meanwhile; otherwise the
+    /// edit is applied again to the newer show. Either way edits are applied
+    /// one after the other, each to the result of the previous one.
     fn edit_show(
         &self,
         ops: &[lc_proto::edit::EditOp],
         tag: Option<serde_json::Value>,
     ) -> Result<(), String> {
+        let tag = edit_tag(tag);
+        for attempt in 0.. {
+            let (base_id, mut document) = {
+                let st = self.state();
+                let Some(show) = &st.show else {
+                    return Err("edit_show: there is no show to edit".into());
+                };
+                if let Some((by, n)) = &tag {
+                    if applied_number(&show.document, by) >= *n {
+                        return Ok(()); // already applied: a re-send
+                    }
+                }
+                (show.id.clone(), show.document.clone())
+            };
+            let duplicates = lc_proto::edit::duplicate_ids(&document);
+            let result = lc_proto::edit::apply(&mut document, ops)?;
+            if result.skipped > 0 {
+                tracing::debug!(
+                    skipped = result.skipped,
+                    "edit_show: parts of an edit referred to something deleted meanwhile"
+                );
+            }
+            if lc_proto::edit::duplicate_ids(&document) > duplicates {
+                return Err(
+                    "edit_show: it would give two objects of the same kind the same id \
+                     (they were changed by someone else meanwhile)"
+                        .into(),
+                );
+            }
+            let prepared =
+                prepare_show(document).map_err(|e| e.replacen("load_show", "edit_show", 1))?;
+            let mut st = self.state();
+            let unchanged = st.show.as_ref().is_some_and(|s| s.id == base_id);
+            // After a few collisions, apply it under the lock rather than
+            // retry for ever.
+            if unchanged || attempt >= 3 {
+                if !unchanged {
+                    drop(st);
+                    return self.edit_show_locked(ops, tag);
+                }
+                self.install_show(&mut st, prepared, tag);
+                return Ok(());
+            }
+        }
+        unreachable!()
+    }
+
+    /// `edit_show`, all under the state lock (the rare contended case).
+    fn edit_show_locked(
+        &self,
+        ops: &[lc_proto::edit::EditOp],
+        tag: Option<(String, u64)>,
+    ) -> Result<(), String> {
         let mut st = self.state();
         let Some(show) = &st.show else {
             return Err("edit_show: there is no show to edit".into());
         };
+        if let Some((by, n)) = &tag {
+            if applied_number(&show.document, by) >= *n {
+                return Ok(());
+            }
+        }
         let mut document = show.document.clone();
-        let applied = lc_proto::edit::apply(&mut document, ops)?;
-        if applied.skipped > 0 {
-            tracing::debug!(
-                skipped = applied.skipped,
-                "edit_show: parts of an edit referred to something deleted meanwhile"
-            );
+        let duplicates = lc_proto::edit::duplicate_ids(&document);
+        lc_proto::edit::apply(&mut document, ops)?;
+        if lc_proto::edit::duplicate_ids(&document) > duplicates {
+            return Err("edit_show: it would give two objects of the same kind the same id".into());
         }
-        // The tag of *this* edit, or none: never an older one left behind.
-        if let Some(map) = document.as_object_mut() {
-            match tag {
-                Some(tag) => map.insert("_edit".into(), tag),
-                None => map.remove("_edit"),
-            };
-        }
-        self.load_show_locked(&mut st, document)
-            .map_err(|e| e.replacen("load_show", "edit_show", 1))
+        let prepared =
+            prepare_show(document).map_err(|e| e.replacen("load_show", "edit_show", 1))?;
+        self.install_show(&mut st, prepared, tag);
+        Ok(())
     }
 
-    fn load_show(&self, document: serde_json::Value) -> Result<(), String> {
+    fn load_show(
+        &self,
+        document: serde_json::Value,
+        tag: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let prepared = prepare_show(document)?;
         let mut st = self.state();
-        self.load_show_locked(&mut st, document)
+        self.install_show(&mut st, prepared, edit_tag(tag));
+        Ok(())
     }
 
-    fn load_show_locked(
+    /// Make `prepared` the show: record the edit that made it, stop tasks
+    /// that left it, store and distribute it.
+    fn install_show(
         &self,
         st: &mut std::sync::MutexGuard<'_, State>,
-        mut document: serde_json::Value,
-    ) -> Result<(), String> {
-        if !document.is_object() {
-            return Err("load_show: the show document must be a JSON object".into());
+        (mut document, parsed): (serde_json::Value, ShowDocument),
+        tag: Option<(String, u64)>,
+    ) {
+        // Who has had which edit applied: carried over from the show being
+        // replaced (whatever the new document says), plus this one.
+        let mut applied = st
+            .show
+            .as_ref()
+            .and_then(|s| s.document.get(APPLIED).cloned())
+            .and_then(|v| match v {
+                serde_json::Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
+        if let Some((by, n)) = tag {
+            applied.insert(by, serde_json::json!([n, revision]));
+            // Keep the most recent editors only (every page load is a new
+            // editor id).
+            while applied.len() > MAX_EDITORS {
+                let oldest = applied
+                    .iter()
+                    .min_by_key(|(_, v)| v.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0))
+                    .map(|(k, _)| k.clone());
+                match oldest {
+                    Some(k) => applied.remove(&k),
+                    None => break,
+                };
+            }
         }
-        // Stored and sent to everyone: it must stay readable.
-        if lc_proto::edit::depth(&document) > lc_proto::edit::MAX_DOCUMENT_DEPTH {
-            return Err(format!(
-                "load_show: the show is nested deeper than {} levels",
-                lc_proto::edit::MAX_DOCUMENT_DEPTH
-            ));
+        if let Some(map) = document.as_object_mut() {
+            map.remove("_edit"); // the former, single-edit tag
+            if applied.is_empty() {
+                map.remove(APPLIED); // e.g. a show loaded with lc-ctl: as sent
+            } else {
+                map.insert(APPLIED.into(), serde_json::Value::Object(applied));
+            }
         }
-        // Edits address list elements by id: make sure every one has one.
-        lc_proto::edit::ensure_ids(&mut document);
-        // Refuse what no Runner could render, here, with a message for the
-        // operator — instead of distributing it and failing on every node.
-        // (Unknown fields are allowed and preserved: the document is stored
-        // and forwarded as received.)
-        let parsed: ShowDocument =
-            serde_json::from_value(document.clone()).map_err(|e| format!("load_show: {e}"))?;
-        parsed.validate().map_err(|e| format!("load_show: {e}"))?;
+
         // A task that is no longer in the show goes off stage — but its
         // transport is *kept*, stopped. Dropping it would restart its epochs
         // at 1 if the task ever came back (an undo, an older show file), and
@@ -1094,7 +1178,6 @@ impl Core {
             );
         }
         st.parsed = Some(Arc::new(parsed));
-        let revision = st.show.as_ref().map_or(1, |s| s.revision + 1);
         // A fresh id per load: unlike the revision counter it can never
         // collide with a show some Runner cached from an earlier life of
         // this Director.
@@ -1110,7 +1193,6 @@ impl Core {
             document,
         });
         self.dirty.notify_one();
-        Ok(())
     }
 
     /// Current cluster overview.
@@ -1346,6 +1428,91 @@ impl Director {
         for task in self.tasks {
             task.abort();
             let _ = task.await;
+        }
+    }
+}
+
+/// Where a show records which edits it has had applied, per editor:
+/// `{ "<editor id>": [<edit number>, <revision>] }`.
+pub const APPLIED: &str = "_applied";
+/// Editors remembered in `_applied`.
+const MAX_EDITORS: usize = 64;
+
+/// A Producer's edit tag `{ "by": <editor id>, "n": <edit number> }`, if it
+/// is one (it comes from the network: anything else is ignored).
+fn edit_tag(tag: Option<serde_json::Value>) -> Option<(String, u64)> {
+    let tag = tag?;
+    let by = tag.get("by")?.as_str()?;
+    let n = tag.get("n")?.as_u64()?;
+    (!by.is_empty() && by.len() <= 64).then(|| (by.to_string(), n))
+}
+
+/// The number of the last edit by `by` applied to `document` (0: none).
+fn applied_number(document: &serde_json::Value, by: &str) -> u64 {
+    document
+        .get(APPLIED)
+        .and_then(|a| a.get(by))
+        .and_then(|v| v.get(0))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Check a show document and bring it up to date, without the state lock:
+/// depth limit, ids for every list element, older forms converted, parsed
+/// and validated. Returns it with its parsed form.
+fn prepare_show(
+    mut document: serde_json::Value,
+) -> Result<(serde_json::Value, ShowDocument), String> {
+    if !document.is_object() {
+        return Err("load_show: the show document must be a JSON object".into());
+    }
+    // Stored and sent to everyone: it must stay readable.
+    if lc_proto::edit::depth(&document) > lc_proto::edit::MAX_DOCUMENT_DEPTH {
+        return Err(format!(
+            "load_show: the show is nested deeper than {} levels",
+            lc_proto::edit::MAX_DOCUMENT_DEPTH
+        ));
+    }
+    // Edits address list elements by id: make sure every one has one.
+    lc_proto::edit::ensure_ids(&mut document);
+    migrate_track_free_run(&mut document);
+    // Refuse what no Runner could render, here, with a message for the
+    // operator — instead of distributing it and failing on every node.
+    // (Unknown fields are allowed and preserved: the document is stored and
+    // forwarded as received.)
+    let parsed: ShowDocument =
+        serde_json::from_value(document.clone()).map_err(|e| format!("load_show: {e}"))?;
+    parsed.validate().map_err(|e| format!("load_show: {e}"))?;
+    Ok((document, parsed))
+}
+
+/// Free run used to be a track setting (a free-running track looped). It is
+/// now per cue: convert, so that what the Producer shows and what the
+/// Runners do are the same thing.
+fn migrate_track_free_run(document: &mut serde_json::Value) {
+    let convert = |tracks: Option<&mut serde_json::Value>| {
+        for track in tracks.and_then(|t| t.as_array_mut()).into_iter().flatten() {
+            if track.get("free_run").and_then(serde_json::Value::as_bool) != Some(true) {
+                continue;
+            }
+            for cue in track
+                .get_mut("cues")
+                .and_then(|c| c.as_array_mut())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(cue) = cue.as_object_mut() {
+                    cue.insert("free_run".into(), true.into());
+                    cue.insert("loop".into(), true.into());
+                }
+            }
+            track["free_run"] = false.into();
+        }
+    };
+    convert(document.get_mut("tracks"));
+    if let Some(tasks) = document.get_mut("tasks").and_then(|t| t.as_array_mut()) {
+        for task in tasks {
+            convert(task.get_mut("tracks"));
         }
     }
 }

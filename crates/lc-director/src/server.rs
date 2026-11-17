@@ -201,6 +201,7 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
         let mut status_tick = interval_at(Instant::now() + STATUS_PERIOD, STATUS_PERIOD);
         status_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_heard = Instant::now();
+        let mut last_presence = Instant::now() - PRESENCE_INTERVAL;
 
         // ---- main loop ---------------------------------------------------
         loop {
@@ -259,7 +260,14 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                         Err(ReadError::Link(e)) => return Err(e),
                         Ok(Some(ClientMessage::Ping)) => send(&mut socket, &ServerMessage::Pong).await?,
                         Ok(Some(ClientMessage::Health(health))) => core.health(conn, health),
-                        Ok(Some(ClientMessage::Presence(presence))) => core.presence(conn, presence),
+                        // Relayed to everyone: at most a few a second, so a
+                        // chatty client cannot flood the others.
+                        Ok(Some(ClientMessage::Presence(presence))) => {
+                            if last_presence.elapsed() >= PRESENCE_INTERVAL {
+                                last_presence = Instant::now();
+                                core.presence(conn, presence);
+                            }
+                        }
                         Ok(Some(ClientMessage::Logs { lines })) => core.runner_logs(conn, lines),
                         Ok(Some(ClientMessage::Preview { outputs })) => core.runner_preview(conn, outputs),
                         Ok(Some(ClientMessage::Hello(_))) => {
@@ -270,7 +278,9 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                             // A refused edit is answered with its tag, so the
                             // Producer drops exactly that edit.
                             let edit = match &command {
-                                Command::EditShow { tag, .. } => tag.clone(),
+                                Command::EditShow { tag, .. } | Command::LoadShow { tag, .. } => {
+                                    tag.clone()
+                                }
                                 _ => None,
                             };
                             match core.command_on(command, timeline.as_deref()) {
@@ -302,6 +312,9 @@ fn show_message(show: crate::ShowDoc) -> ServerMessage {
         document: show.document,
     }
 }
+
+/// Shortest interval between two presence messages relayed for one client.
+const PRESENCE_INTERVAL: Duration = Duration::from_millis(200);
 
 fn error(message: &str) -> ServerMessage {
     ServerMessage::Error {

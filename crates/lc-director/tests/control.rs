@@ -115,6 +115,7 @@ async fn invalid_commands_are_refused_without_dropping_the_link() {
         },
         Command::LoadShow {
             document: serde_json::json!("not an object"),
+            tag: None,
         },
     ];
     for command in bad {
@@ -176,6 +177,7 @@ async fn state_survives_a_restart_but_comes_back_paused() {
         .core()
         .command(Command::LoadShow {
             document: serde_json::json!({"name": "demo"}),
+            tag: None,
         })
         .unwrap();
     first
@@ -307,6 +309,7 @@ async fn shows_are_matched_by_id_not_by_revision() {
         .core()
         .command(Command::LoadShow {
             document: document.clone(),
+            tag: None,
         })
         .unwrap();
     let current_id = director.core().show().unwrap().id;
@@ -353,7 +356,10 @@ async fn director_with_show(document: serde_json::Value) -> Director {
     let director = start().await;
     director
         .core()
-        .command(Command::LoadShow { document })
+        .command(Command::LoadShow {
+            document,
+            tag: None,
+        })
         .unwrap();
     director
 }
@@ -583,6 +589,7 @@ async fn a_task_that_leaves_and_returns_keeps_rising_epochs() {
     // The task disappears from the show (deleted)…
     core.command(Command::LoadShow {
         document: serde_json::json!({}),
+        tag: None,
     })
     .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -595,6 +602,7 @@ async fn a_task_that_leaves_and_returns_keeps_rising_epochs() {
     // a Runner, a Producer — only accepts states with a higher epoch.
     core.command(Command::LoadShow {
         document: with_task,
+        tag: None,
     })
     .unwrap();
     core.command_on(Command::Play, Some("intro")).unwrap();
@@ -762,8 +770,37 @@ async fn two_producers_editing_at_once_both_keep_their_changes() {
     }
     assert_eq!(last["tracks"][0]["cues"][0]["x"], 500);
     assert_eq!(last["stage"]["displays"][0]["warp_corners"][2][0], 0.9);
-    // Each show carries the tag of the edit that made it.
-    assert!(["alice", "bob"].contains(&last["_edit"]["by"].as_str().unwrap()));
+    // The show records, per editor, the last edit applied.
+    assert_eq!(last["_applied"]["alice"][0], 1);
+    assert_eq!(last["_applied"]["bob"][0], 1);
+
+    // An edit sent again (after a reconnect) is not applied a second time:
+    // here it would undo Bob's newer change.
+    bob.send(&edit(
+        serde_json::json!([{ "op": "set",
+            "path": ["tracks", { "id": "t1" }, "cues", { "id": "c1" }, "x"], "value": 700 }]),
+        "bob2",
+    ))
+    .await
+    .unwrap();
+    alice
+        .send(&ClientMessage::Command {
+            command: Command::EditShow {
+                ops: serde_json::from_value(serde_json::json!([{ "op": "set",
+                    "path": ["tracks", { "id": "t1" }, "cues", { "id": "c1" }, "x"], "value": 1 }]))
+                .unwrap(),
+                tag: Some(serde_json::json!({ "by": "alice", "n": 1 })),
+            },
+            timeline: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        director.core().show().unwrap().document["tracks"][0]["cues"][0]["x"],
+        700,
+        "Alice's re-sent edit 1 was ignored"
+    );
 
     // Presence goes to the other Producers, not to Runners; leaving says so.
     alice
@@ -817,6 +854,7 @@ async fn an_edit_without_a_show_or_that_breaks_it_is_refused() {
         .core()
         .command(Command::LoadShow {
             document: serde_json::json!({ "tracks": [ { "cues": [ { "x": 1 } ] } ] }),
+            tag: None,
         })
         .unwrap();
     // Ids were assigned on load, so the cue can be addressed.
@@ -834,5 +872,25 @@ async fn an_edit_without_a_show_or_that_breaks_it_is_refused() {
     let err = director.core().command(edit(bad)).unwrap_err();
     assert!(err.starts_with("edit_show"), "{err}");
     assert_eq!(director.core().show().unwrap().document, doc, "unchanged");
+
+    // An edit that would give two cues one id is refused whole.
+    let dup = serde_json::json!([{ "op": "insert", "path": ["tracks"],
+        "value": { "id": "t9", "cues": [ { "id": cue } ] } }]);
+    let err = director.core().command(edit(dup)).unwrap_err();
+    assert!(err.contains("same id"), "{err}");
+
+    // An older show with a free-running track is converted on load.
+    director
+        .core()
+        .command(Command::LoadShow {
+            document: serde_json::json!({ "tracks": [ { "id": "t", "free_run": true,
+                "cues": [ { "id": "c" } ] } ] }),
+            tag: None,
+        })
+        .unwrap();
+    let doc = director.core().show().unwrap().document;
+    assert_eq!(doc["tracks"][0]["free_run"], false);
+    assert_eq!(doc["tracks"][0]["cues"][0]["free_run"], true);
+    assert_eq!(doc["tracks"][0]["cues"][0]["loop"], true);
     director.shutdown().await;
 }

@@ -120,6 +120,39 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await A.waitForTimeout(800);
   assert(await B.evaluate(() => S.doc.name) === 'after refusal', 'the next edit after a refusal arrives');
 
+  // An edit that arrived, but whose confirmation was lost with the
+  // connection, is sent again on reconnect — and must not overwrite what
+  // someone else changed in the meantime.
+  await A.evaluate(() => {
+    const ws = S.ws;
+    const handler = ws.onmessage;
+    ws.onmessage = (ev) => { if (JSON.parse(ev.data).type === 'show') { ws.onmessage = handler; ws.close(); } else handler(ev); };
+    edit(() => { S.doc.name = 'alice'; }); sendDoc();
+  });
+  await A.waitForTimeout(300);
+  await B.evaluate(() => edit(() => { S.doc.name = 'bob, later'; }));
+  await A.waitForTimeout(2500);
+  const n3 = await Promise.all([A, B].map((p) => p.evaluate(() => S.doc.name)));
+  assert(n3[0] === 'bob, later' && n3[1] === 'bob, later', 'a re-sent edit does not overwrite a newer one: ' + JSON.stringify(n3));
+
+  // Alice types into a cue's inspector while Bob moves that cue to another
+  // track: her edit still lands on the cue.
+  await A.evaluate(() => edit(() => {
+    const o = tlObj(MAIN);
+    o.tracks.push({ id: 'ta', name: 'TA', cues: [{ id: 'mc', name: 'm', source: { type: 'color', rgba: [1, 0, 0, 1] }, start_s: 0, duration_s: 5, in_s: 0, x: 0, y: 0, w: 10, h: 10, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0 }] });
+    o.tracks.push({ id: 'tb', name: 'TB', cues: [] });
+  }));
+  await A.waitForTimeout(800);
+  await A.evaluate(() => select({ type: 'cue', id: 'mc' }));
+  const nameInput = A.locator('#inspector input[type=text]').first();
+  await nameInput.fill('renamed by alice');
+  await B.evaluate(() => edit(() => { const o = tlObj(MAIN); const a = o.tracks.find((t) => t.id === 'ta'), b = o.tracks.find((t) => t.id === 'tb'); b.cues.push(a.cues.pop()); }));
+  await A.waitForTimeout(800);
+  await nameInput.press('Tab');
+  await A.waitForTimeout(800);
+  const moved = await B.evaluate(() => { const t = tlObj(MAIN).tracks.find((x) => x.id === 'tb'); return t.cues[0]?.name; });
+  assert(moved === 'renamed by alice', 'an inspector edit reaches a cue someone else moved meanwhile: ' + moved);
+
   // Alice leaves: Bob stops showing her.
   await A.context().close(); await B.waitForTimeout(1500);
   assert(await B.evaluate(() => S.others.size) === 0, 'a user who leaves disappears');

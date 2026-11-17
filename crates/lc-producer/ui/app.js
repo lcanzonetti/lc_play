@@ -94,7 +94,7 @@ const S = {
   doc: null,            // the show document being edited
   lastSent: '',         // JSON of the document as last sent/received: what the next edit is computed against
   dirty: false,         // there are edits the Director has not received
-  holdForeign: false,   // a whole show we sent is on its way: ignore older ones until it is back
+  holdN: 0,             // a whole show we sent (New, Open) as edit n: ignore shows until it is in
   server: null,         // the show as the Director last sent it (the shared truth)
   pending: [],          // our edits sent but not yet seen back: [{ n, ops }]
   replaceNext: false,   // the next send replaces the show for everyone (New, Open)
@@ -449,9 +449,9 @@ function diffInto(a, b, path, out) {
 function applyOps(doc, ops) {
   const find = (list, id) => (Array.isArray(list) && typeof id === 'string' && id ? list.findIndex((e) => isObj(e) && e.id === id) : -1);
   const own = (o, k) => isObj(o) && Object.hasOwn(o, k);
-  // Ids are unique in the whole show (edit.rs: id_exists).
-  const exists = (v, id) => (Array.isArray(v) ? v.some((e) => exists(e, id))
-    : isObj(v) ? Object.entries(v).some(([k, x]) => (KEYED.has(k) && Array.isArray(x) && x.some((e) => isObj(e) && e.id === id)) || exists(x, id))
+  // Ids are unique among all lists of a kind (edit.rs: id_exists).
+  const exists = (v, kind, id) => (Array.isArray(v) ? v.some((e) => exists(e, kind, id))
+    : isObj(v) ? Object.entries(v).some(([k, x]) => (k === kind && Array.isArray(x) && x.some((e) => isObj(e) && e.id === id)) || exists(x, kind, id))
     : false);
   const walk = (path, create) => {
     let here = doc;
@@ -477,7 +477,7 @@ function applyOps(doc, ops) {
   const placeAfter = (list, after) => (after == null ? 0 : (find(list, after) < 0 ? list.length : find(list, after) + 1));
   for (const op of ops) {
     const path = op.path || [], last = path[path.length - 1], parent = path.slice(0, -1);
-    if (path[0] === '_edit') continue; // the Director's tag
+    if (path[0] === '_edit' || path[0] === '_applied') continue; // the Director's records
     if (op.op === 'set') {
       if (!path.length) { doc = clone(op.value); continue; }
       const p = walk(parent, last);
@@ -487,7 +487,8 @@ function applyOps(doc, ops) {
       const p = walk(parent);
       if (own(p, last)) delete p[last];
     } else if (op.op === 'insert') {
-      if (exists(doc, op.value?.id)) continue;
+      const kind = [...path].reverse().find((p) => typeof p === 'string');
+      if (exists(doc, kind, op.value?.id)) continue;
       let list = walk(path);
       if (list === undefined && typeof last === 'string') { const p = walk(parent, last); if (isObj(p)) list = p[last] = []; }
       if (!Array.isArray(list) || find(list, op.value?.id) >= 0) continue;
@@ -505,15 +506,29 @@ function applyOps(doc, ops) {
 /** Make `old` equal to `next`, keeping the identity of every object (and
  *  of every list element with the same id) that exists in both. Returns
  *  what should replace `old` (itself, when the kinds match). */
-function reconcile(old, next) {
+function reconcile(old, next, kind = null, index = null) {
+  // Every list element of the old show by kind and id, wherever it is: an
+  // object someone moved to another list (a cue to another track) keeps its
+  // identity too.
+  if (!index) {
+    index = new Map();
+    const walk = (v, k) => {
+      if (Array.isArray(v)) { for (const e of v) { if (KEYED.has(k) && isObj(e) && e.id) index.set(`${k}\u0000${e.id}`, e); walk(e, null); } }
+      else if (isObj(v)) for (const [kk, x] of Object.entries(v)) walk(x, kk);
+    };
+    walk(old, null);
+  }
   if (isObj(old) && isObj(next)) {
     for (const k of Object.keys(old)) if (!Object.hasOwn(next, k)) delete old[k];
-    for (const [k, v] of Object.entries(next)) old[k] = Object.hasOwn(old, k) ? reconcile(old[k], v) : v;
+    for (const [k, v] of Object.entries(next)) old[k] = Object.hasOwn(old, k) ? reconcile(old[k], v, k, index) : reconcile(undefined, v, k, index);
     return old;
   }
-  if (Array.isArray(old) && Array.isArray(next) && keyedList(old) && keyedList(next)) {
-    const byId = new Map(old.map((e) => [e.id, e]));
-    const merged = next.map((e) => (byId.has(e.id) ? reconcile(byId.get(e.id), e) : e));
+  if (Array.isArray(next) && KEYED.has(kind) && keyedList(next)) {
+    const merged = next.map((e) => {
+      const was = index.get(`${kind}\u0000${e.id}`);
+      return was ? reconcile(was, e, null, index) : e;
+    });
+    if (!Array.isArray(old)) return merged;
     old.splice(0, old.length, ...merged);
     return old;
   }
@@ -589,18 +604,17 @@ function onMessage(msg) {
         // never received, or it came back with no show at all (restarted
         // without saved state), ours is the one to keep: send it, and do not
         // let the Director's older copy overwrite it in the meantime.
-        if (msg.show_revision == null || S.holdForeign) {
+        if (msg.show_revision == null || S.holdN) {
           // It has no show, or the whole show we sent (New, Open) may have
           // been lost on the way: send ours, whole.
-          S.holdForeign = false;
           S.pending = [];
           S.replaceNext = true;
           sendDoc(true);
         } else {
           // Edits that were on their way when the link dropped may not have
-          // arrived: send them again (they address objects by id, so one
-          // that did arrive changes nothing the second time), then any made
-          // while offline.
+          // arrived: send them again. The Director applies each edit number
+          // only once, so one that did arrive is ignored. Then any made while
+          // offline.
           for (const p of S.pending) command({ type: 'edit_show', ops: p.ops, tag: { by: S.clientId, n: p.n } });
           if (S.dirty || (S.doc && JSON.stringify(S.doc) !== S.lastSent)) sendDoc(true);
           if (S.deferredShow) rebase();
@@ -618,15 +632,17 @@ function onMessage(msg) {
       break;
     case 'show': {
       // Every show the Director sends is the shared truth, whoever changed
-      // it. Our own edits come back tagged ({by, n}): those that have
-      // arrived are no longer pending. The rest are re-applied on top.
-      const tag = msg.document._edit;
-      delete msg.document._edit;
-      if (S.holdForeign && tag?.by !== S.clientId) break; // a whole show of ours is on its way
-      if (tag?.by === S.clientId) {
-        S.pending = S.pending.filter((p) => p.n > tag.n);
-        if (tag.n >= S.editN) S.holdForeign = false;
+      // it. It records the number of our last edit it has applied
+      // (`_applied`): those edits are no longer pending; the rest are
+      // re-applied on top.
+      const applied = msg.document._applied?.[S.clientId]?.[0] ?? 0;
+      delete msg.document._applied;
+      delete msg.document._edit; // older Directors
+      if (S.holdN) {
+        if (applied < S.holdN) break; // our whole show is not in yet
+        S.holdN = 0;
       }
+      S.pending = S.pending.filter((p) => p.n > applied);
       S.server = msg.document;
       if (!S.doc) { S.doc = normalize(clone(S.server)); S.lastSent = JSON.stringify(S.doc); refreshAll(); reconcileAssets(); break; }
       rebase();
@@ -663,11 +679,10 @@ function onMessage(msg) {
       if (msg.name === S.logRunner) renderLog();
       break;
     case 'error':
-      // If it was our document that was refused, no echo will come.
-      S.holdForeign = false;
       if (msg.edit?.by === S.clientId) {
-        // That edit was refused (it would have made the show invalid): drop
-        // it — only it — and show the shared show with the rest on top.
+        // One of our edits (or our whole show) was refused: drop it — only
+        // it — and show the shared show with the rest on top.
+        if (msg.edit.n === S.holdN) S.holdN = 0;
         S.pending = S.pending.filter((p) => p.n !== msg.edit.n);
         rebase();
       }
@@ -772,8 +787,8 @@ function sendDoc(force = false) {
     // show for everyone.
     S.replaceNext = false;
     S.pending = [];
-    S.holdForeign = true;
-    command({ type: 'load_show', document: { ...S.doc, _edit: tag } });
+    S.holdN = tag.n;
+    command({ type: 'load_show', document: S.doc, tag });
   } else {
     // Only what changed since the last send, as operations.
     const ops = diffDoc(JSON.parse(S.lastSent), S.doc);
@@ -2317,6 +2332,7 @@ $('#file-open').onchange = async (e) => {
   try {
     const doc = normalize(JSON.parse(await file.text()));
     delete doc._edit;
+    delete doc._applied;
     if (S.others.size && !(await ask(`Open ${file.name}? It replaces the show for every user working on it.`))) return;
     S.replaceNext = true;
     edit(() => { S.doc = doc; S.sel = null; S.tl = MAIN; });

@@ -111,11 +111,16 @@ pub enum Command {
     /// distributes it to every Runner.
     LoadShow {
         document: serde_json::Value,
+        /// The sender's edit tag `{ by, n }` (see `EditShow`), recorded as
+        /// applied with the show.
+        #[serde(default)]
+        tag: Option<serde_json::Value>,
     },
     /// Change part of the show (see [`crate::edit`]): what Producers send,
-    /// so that several can edit at once. `tag` is copied into the resulting
-    /// document as `_edit`, so the sender recognises its own edit when the
-    /// show comes back.
+    /// so that several can edit at once. `tag` is `{ "by": <editor id>,
+    /// "n": <edit number, increasing> }`: the show records the last `n`
+    /// applied per editor in `_applied`, so an edit sent twice is applied
+    /// once and the sender can tell which of its edits have arrived.
     EditShow {
         ops: Vec<crate::edit::EditOp>,
         #[serde(default)]

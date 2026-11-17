@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 
 /// Most operations one edit may carry, and the deepest path: generous for a
 /// show, but bounded (they come from the network).
-pub const MAX_OPS: usize = 20_000;
+pub const MAX_OPS: usize = 2_000;
 pub const MAX_DEPTH: usize = 16;
 /// Deepest a show document may be nested. A show needs about 8 levels; JSON
 /// parsers stop at 128, and a document deeper than that could be stored but
@@ -121,7 +121,8 @@ pub fn apply(doc: &mut Value, ops: &[EditOp]) -> Result<Applied, String> {
 }
 
 fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
-    // `_edit` is the Director's confirmation tag: nobody may write it.
+    // `_applied` (and the former `_edit`) are the Director's record of
+    // which edits it has applied: nobody may write them.
     let path = match op {
         EditOp::Set { path, .. }
         | EditOp::Unset { path }
@@ -129,7 +130,7 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
         | EditOp::Remove { path }
         | EditOp::Move { path, .. } => path,
     };
-    if matches!(path.first(), Some(Step::Key(k)) if k == "_edit") {
+    if matches!(path.first(), Some(Step::Key(k)) if k == "_edit" || k == "_applied") {
         return false;
     }
     match op {
@@ -172,11 +173,18 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
             }
         }
         EditOp::Insert { path, after, value } => {
-            // Ids are unique in the whole show: an element that exists
-            // anywhere is not inserted again (two people moving one cue to
-            // two different tracks would otherwise duplicate it).
-            if id_exists(doc, id_of(value).unwrap_or_default()) {
-                return false;
+            // Ids are unique among all lists of a kind (all `cues`, all
+            // `tracks`, …): an element that exists anywhere is not inserted
+            // again (two people moving one cue to two different tracks would
+            // otherwise duplicate it).
+            let kind = path.iter().rev().find_map(|s| match s {
+                Step::Key(k) => Some(k.as_str()),
+                Step::Id { .. } => None,
+            });
+            if let Some(kind) = kind {
+                if id_exists(doc, kind, id_of(value).unwrap_or_default()) {
+                    return false;
+                }
             }
             // A list that does not exist yet (an older document) is created.
             if walk(doc, path, None).is_none() {
@@ -232,17 +240,56 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
     }
 }
 
-/// Whether some element of a keyed list anywhere in `doc` has this id.
-fn id_exists(doc: &Value, id: &str) -> bool {
+/// Whether some element of a list called `kind` anywhere in `doc` has
+/// this id.
+fn id_exists(doc: &Value, kind: &str, id: &str) -> bool {
     match doc {
         Value::Object(map) => map.iter().any(|(k, v)| {
-            (KEYED_LISTS.contains(&k.as_str())
+            (k == kind
                 && v.as_array()
                     .is_some_and(|l| l.iter().any(|e| id_of(e) == Some(id))))
-                || id_exists(v, id)
+                || id_exists(v, kind, id)
         }),
-        Value::Array(list) => list.iter().any(|v| id_exists(v, id)),
+        Value::Array(list) => list.iter().any(|v| id_exists(v, kind, id)),
         _ => false,
+    }
+}
+
+/// How many list elements share their id with an earlier element of the
+/// same kind (all `cues` lists together, all `tracks`, …). The Director
+/// refuses an edit that makes this grow: two cues with one id would be
+/// indistinguishable to every edit, selection and Runner.
+pub fn duplicate_ids(doc: &Value) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = 0;
+    count_duplicates(doc, &mut seen, &mut duplicates);
+    duplicates
+}
+
+fn count_duplicates<'a>(
+    v: &'a Value,
+    seen: &mut std::collections::HashSet<(&'a str, &'a str)>,
+    duplicates: &mut usize,
+) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                if KEYED_LISTS.contains(&k.as_str()) {
+                    for e in child.as_array().into_iter().flatten() {
+                        if let Some(id) = id_of(e) {
+                            if !seen.insert((k.as_str(), id)) {
+                                *duplicates += 1;
+                            }
+                        }
+                    }
+                }
+                count_duplicates(child, seen, duplicates);
+            }
+        }
+        Value::Array(list) => list
+            .iter()
+            .for_each(|e| count_duplicates(e, seen, duplicates)),
+        _ => {}
     }
 }
 
@@ -551,6 +598,28 @@ mod tests {
         assert_eq!(r.skipped, 2);
         assert!(d.get("_edit").is_none());
         assert_eq!(d["tracks"][1]["id"], "t2");
+    }
+
+    #[test]
+    fn ids_are_unique_per_kind_not_across_kinds() {
+        // A cue may share its id with an asset; moving it still works.
+        let mut d = json!({ "assets": [ { "id": "intro" } ],
+            "tracks": [ { "id": "t1", "cues": [ { "id": "intro" } ] }, { "id": "t2", "cues": [] } ] });
+        let r = apply(&mut d, &ops(json!([
+            { "op": "remove", "path": ["tracks", { "id": "t1" }, "cues", { "id": "intro" }] },
+            { "op": "insert", "path": ["tracks", { "id": "t2" }, "cues"], "value": { "id": "intro" } }
+        ]))).unwrap();
+        assert_eq!(r.skipped, 0);
+        assert_eq!(d["tracks"][1]["cues"][0]["id"], "intro");
+        assert_eq!(duplicate_ids(&d), 0);
+    }
+
+    #[test]
+    fn nested_duplicates_are_counted() {
+        // Re-inserting a deleted track whose cue now lives elsewhere.
+        let d = json!({ "tracks": [ { "id": "t1", "cues": [ { "id": "c1" } ] },
+                                    { "id": "t2", "cues": [ { "id": "c1" } ] } ] });
+        assert_eq!(duplicate_ids(&d), 1);
     }
 
     #[test]

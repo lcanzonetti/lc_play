@@ -365,6 +365,7 @@ async fn a_restarted_runner_resumes_from_its_cache_without_a_director() {
         .core()
         .command(Command::LoadShow {
             document: document.clone(),
+            tag: None,
         })
         .unwrap();
     director

@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             Command::LoadShow {
                 document: serde_json::from_str(&text)
                     .with_context(|| format!("{} is not valid JSON", file.display()))?,
+                tag: None,
             }
         }
     };

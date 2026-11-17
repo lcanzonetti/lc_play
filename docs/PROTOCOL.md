@@ -74,8 +74,8 @@ Commands:
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
-| `load_show` | `document` (JSON object) | new show revision, distributed to Runners; replaces the show for everyone |
-| `edit_show` | `ops` (list of edit operations), `tag` (copied into the result as `_edit`) | applies the operations to the current show, then as `load_show`; see below |
+| `load_show` | `document` (JSON object), optional `tag` | new show revision, distributed to Runners; replaces the show for everyone |
+| `edit_show` | `ops` (list of edit operations), `tag` `{ "by": <editor id>, "n": <edit number> }` | applies the operations to the current show, then as `load_show`; see below |
 | `status` | — | Director replies with `cluster` |
 
 `edit_show` is how Producers edit, so that several can work on one show at
@@ -94,21 +94,28 @@ A path step is a field name, or `{ "id": … }` for the element of a list
 id. `after: null` inserts or moves to the start; an `after` that no longer
 exists, to the end. The Director applies edits in the order they arrive;
 operations whose target someone else has deleted meanwhile are skipped, and
-for the same field the later edit wins. Ids are unique in the whole show: an
-`insert` of an id that exists anywhere is skipped (so a cue moved to two
-tracks at once is not duplicated), a `set` of a list element must keep its
-id, and nothing may write `_edit`. If the result is not a valid show, or is
+for the same field the later edit wins. Ids are unique among all lists of a
+kind (all `cues` lists together, all `tracks`, …): an `insert` of an id that
+exists in a list of that kind is skipped (so a cue moved to two tracks at
+once is not duplicated), an edit that would still leave two elements of a
+kind with one id is refused, a `set` of a list element must keep its id, and
+nothing may write `_applied`. Edits are limited to 2000 operations. If the result is not a valid show, or is
 nested deeper than 64 levels, the whole edit is refused: `{ "type": "error",
 "message": "edit_show: …", "edit": <its tag> }`. Every element of those lists
 gets an id on load if it has none (`auto-<n>`).
 
-The resulting `show` carries the edit's `tag` as `_edit` (`{ "by": <client
-id>, "n": <edit number> }`): a Producer drops its own edits up to `n` from
+Each editor numbers its edits 1, 2, 3, …; the show records the last number
+applied per editor in `_applied` (`{ "<editor id>": [n, revision] }`, the 64
+most recent editors). An edit whose number is not above the recorded one is
+ignored — it was already applied — so edits can safely be sent again after a
+reconnect. A Producer drops its own edits up to its recorded number from
 those it still has pending, and shows the Director's show with the rest
-applied on top.
+applied on top. When a show is loaded, a track-level `free_run` (older shows)
+is converted to per-cue `free_run` + `loop`.
 
-A Producer re-sends its unconfirmed edits after reconnecting (they are
-id-addressed, so one that had arrived changes nothing the second time).
+A Producer re-sends its unconfirmed edits after reconnecting (one that had
+arrived is recognised by its number and ignored). Presence is relayed at
+most five times a second per client.
 
 Producers also send `{ "type": "presence", "name": "Alice", "color":
 "#ff6b6b", "selection": { "type": "cue", "id": "c1" }, "dragging": false }`
