@@ -477,8 +477,14 @@ transparent until its first frame is in.
 (BC1/DXT1, BC3/DXT5, BC7), mostly wrapped in Snappy. The Runner reads the
 QuickTime sample table, so every frame is addressed directly in the file;
 two worker threads read and unpack the next few frames in the direction of
-playback (chunked frames are unpacked in parallel), and the render thread
-uploads the wanted one as a BCn texture that the GPU samples directly. Hap
+playback (chunked frames are unpacked in parallel) and copy each into one of
+the layer's mapped upload buffers (eight, rows padded to 256 bytes); the
+render thread only unmaps the wanted one and records a buffer-to-texture
+copy, submitted ahead of the frame, into a BCn texture that the GPU samples
+directly. The buffer is mapped again once that frame has been submitted and
+the GPU is done with it. (Copying on the render thread with
+`Queue::write_texture` cost 0.5–0.8 ms per MB on a laptop: 12–16 ms of a
+16.7 ms frame with a 10K and two 4K layers.) Hap
 Q's scaled YCoCg is converted in the shader. Seeking, looping and reverse
 playback cost nothing extra. Measured here: unpacking a 9976×2176 frame
 takes 1–2 ms (test pattern; real footage compresses less and takes longer);

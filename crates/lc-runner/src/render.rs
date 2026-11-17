@@ -39,7 +39,7 @@ use glam::{Mat3, Vec2, Vec3};
 use wgpu::util::DeviceExt as _;
 use winit::window::Window;
 
-use crate::content::{Content, TextureFactory};
+use crate::content::{Content, TextureFactory, Uploads};
 use crate::show::{Output, Show};
 use crate::vsync::{PresentTracker, RefreshClock};
 
@@ -132,6 +132,9 @@ pub struct Gpu {
 
     quad_vbo: wgpu::Buffer,
     quad_ibo: wgpu::Buffer,
+
+    /// Copies recorded by contents for the next frame (see [`Uploads`]).
+    uploads: std::cell::RefCell<Uploads>,
 }
 
 impl Gpu {
@@ -380,7 +383,14 @@ impl Gpu {
             sampler,
             quad_vbo,
             quad_ibo,
+            uploads: Default::default(),
         })
+    }
+
+    /// The copies contents recorded for this frame (texture uploads), to be
+    /// submitted ahead of it.
+    pub fn take_uploads(&self) -> Option<wgpu::CommandBuffer> {
+        self.uploads.borrow_mut().take()
     }
 
     /// Create a surface for an additional window (outputs after the first).
@@ -777,7 +787,12 @@ impl Gpu {
                 draw_order,
             );
         }
-        self.queue.submit(Some(encoder.finish()));
+        // The frame's texture uploads first, in the same submission.
+        self.queue.submit(
+            self.take_uploads()
+                .into_iter()
+                .chain(Some(encoder.finish())),
+        );
     }
 
     /// Put a rendered frame on screen. `target` is the refresh it was
@@ -1022,6 +1037,7 @@ impl Gpu {
         TextureFactory {
             device: &self.device,
             queue: &self.queue,
+            uploads: &self.uploads,
             layout: &self.texture_bgl,
             sampler: &self.sampler,
             max_dimension: self.max_texture_dimension(),
@@ -1429,7 +1445,8 @@ mod tests {
             },
             size,
         );
-        gpu.queue.submit(Some(enc.finish()));
+        gpu.queue
+            .submit(gpu.take_uploads().into_iter().chain(Some(enc.finish())));
 
         readback
             .slice(..)
@@ -1540,6 +1557,103 @@ mod tests {
             assert_close(px, srgb, tolerance, format);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HAP playback through the upload buffers: 40 frames (five times the
+    /// ring) at a width whose block rows need padding, each one reaching the
+    /// output in turn, and the picture changing exactly when the clip does.
+    #[test]
+    fn hap_playback_cycles_its_upload_buffers() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        if !gpu.supports_bc() {
+            eprintln!("SKIPPED: no BC texture support on this adapter");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lcplay-gpu-ring-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for format in ["hap", "hap_q"] {
+            // 2 s red, then 2 s blue, at 10 fps; 68 px wide: 17 blocks.
+            let path = dir.join(format!("{format}.mov"));
+            let made = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(["-f", "lavfi", "-i", "color=red:s=68x52:r=10:d=2"])
+                .args(["-f", "lavfi", "-i", "color=blue:s=68x52:r=10:d=2"])
+                .args(["-filter_complex", "[0][1]concat=n=2:v=1"])
+                .args(["-c:v", "hap", "-format", format])
+                .arg(&path)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !made {
+                eprintln!("SKIPPED: no ffmpeg with a HAP encoder");
+                return;
+            }
+            let show = video_show(&path.to_string_lossy());
+            let factory = gpu.factory();
+            let mut contents = vec![content::build(&show.layers[0], &factory).unwrap()];
+            for frame in 0..40 {
+                let t = frame as f64 / 10.0 + 0.05;
+                // Render until this frame is the one in the texture (it is
+                // decoded in the background).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let px = loop {
+                    contents[0].update(t, &factory);
+                    let px = render_contents(&gpu, &show, 0, 64, 64, &contents)[32 * 64 + 32];
+                    if !contents[0].late() && contents[0].ready() {
+                        break px;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{format}: frame {frame} never arrived"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                };
+                let (want, name) = if frame < 20 {
+                    ([0xFF, 0, 0], "red")
+                } else {
+                    ([0, 0, 0xFF], "blue")
+                };
+                assert_close(px, want, 0.04, &format!("{format} frame {frame} ({name})"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Render-thread time to bring a new HAP frame into its texture (the
+    /// `update` that delivers it), on a file given in `LCPLAY_BENCH_HAP`:
+    /// `LCPLAY_BENCH_HAP=big.mov cargo test -p lc-runner --release -- --ignored --nocapture bench_hap_update`
+    #[test]
+    #[ignore]
+    fn bench_hap_update() {
+        let Ok(path) = std::env::var("LCPLAY_BENCH_HAP") else {
+            return;
+        };
+        let Some(gpu) = gpu_or_skip() else { return };
+        let show = video_show(&path);
+        let factory = gpu.factory();
+        let mut c = content::build(&show.layers[0], &factory).unwrap();
+        let mut times = Vec::new();
+        for frame in 0..120 {
+            let t = frame as f64 / 25.0 + 0.001;
+            loop {
+                let start = std::time::Instant::now();
+                c.update(t, &factory);
+                let took = start.elapsed();
+                gpu.queue.submit(gpu.take_uploads());
+                if c.ready() && !c.late() {
+                    times.push(took.as_secs_f64() * 1e3);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+        println!(
+            "update delivering a frame: median {:.3} ms, p90 {:.3} ms, max {:.3} ms",
+            at(0.5),
+            at(0.9),
+            at(1.0)
+        );
     }
 
     #[test]

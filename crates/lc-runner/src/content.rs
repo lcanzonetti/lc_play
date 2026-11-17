@@ -119,10 +119,32 @@ impl Content for StaticContent {
     }
 }
 
+/// GPU copies recorded by contents during `update` (e.g. a HAP frame from
+/// its upload buffer into its texture), submitted with the next frame, ahead
+/// of it, in the same submission ([`crate::render::Gpu::take_uploads`]).
+#[derive(Default)]
+pub struct Uploads {
+    encoder: Option<wgpu::CommandEncoder>,
+    /// Batches submitted so far; the one being recorded has this number.
+    submitted: u64,
+}
+
+impl Uploads {
+    /// The recorded copies, if any, to submit now. Counts the batch as
+    /// submitted: the caller submits it.
+    pub fn take(&mut self) -> Option<wgpu::CommandBuffer> {
+        let encoder = self.encoder.take()?;
+        self.submitted += 1;
+        Some(encoder.finish())
+    }
+}
+
 /// Everything the content layer needs from the GPU side to build textures.
 pub struct TextureFactory<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
+    /// Copies to submit with the next frame (see [`Uploads`]).
+    pub uploads: &'a std::cell::RefCell<Uploads>,
     /// Bind group layout for scene group(1) (planes + sampler).
     pub layout: &'a wgpu::BindGroupLayout,
     pub sampler: &'a wgpu::Sampler,
@@ -133,6 +155,27 @@ pub struct TextureFactory<'a> {
 }
 
 impl TextureFactory<'_> {
+    /// Record GPU work to run before the next frame is drawn, in the same
+    /// submission. Returns the batch it belongs to: it has been submitted
+    /// once [`uploads_submitted`](Self::uploads_submitted) is greater.
+    pub fn record_upload(&self, record: impl FnOnce(&mut wgpu::CommandEncoder)) -> u64 {
+        let mut uploads = self.uploads.borrow_mut();
+        let batch = uploads.submitted;
+        let encoder = uploads.encoder.get_or_insert_with(|| {
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("uploads"),
+                })
+        });
+        record(encoder);
+        batch
+    }
+
+    /// How many batches of recorded uploads have been submitted.
+    pub fn uploads_submitted(&self) -> u64 {
+        self.uploads.borrow().submitted
+    }
+
     /// An empty texture to be filled later (`write_texture`).
     pub fn texture(
         &self,

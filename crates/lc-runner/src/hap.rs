@@ -17,9 +17,32 @@
 //!   renderer: "frame N, moving forward"
 //!       │
 //!   workers (threads): read frames N, N+1, N+2 … from disk, unpack Snappy
-//!       │  (chunks of one frame in parallel)
-//!   ready frames ──▶ renderer uploads frame N to the texture ──▶ GPU samples
+//!       │  (chunks of one frame in parallel) into ordinary memory, then copy
+//!       │  the texture into a mapped GPU upload buffer
+//!   ready frames ──▶ renderer records "copy buffer → texture" ──▶ GPU samples
 //! ```
+//!
+//! ### Upload buffers
+//!
+//! Getting a frame to the GPU means copying its texture data (4 MB for a 4K
+//! DXT1 frame, 11 MB for 10K) into memory the GPU can read. Done on the
+//! render thread (`Queue::write_texture`), that copy cost about 0.5–0.8 ms
+//! per MB on a laptop — three HAP layers took 12–16 ms of a 16.7 ms frame.
+//! So each layer has a small ring of upload buffers ([`SLOTS`]), kept mapped
+//! while they are free:
+//!
+//! ```text
+//!   free (mapped) ──worker writes frame──▶ ready ──renderer: unmap, record
+//!        ▲                                          copy, submit with frame
+//!        └──── mapped again once the GPU has copied it ◀──────┘
+//! ```
+//!
+//! Workers write into a buffer only after unpacking into ordinary memory:
+//! upload memory is write-combined, fast to write in order and very slow to
+//! read, and Snappy reads back what it has written. Rows are padded to the
+//! pitch the GPU copy requires (256 bytes). The render thread only unmaps
+//! and records the copy; the mapping is requested again after the frame
+//! that copied from the buffer has been submitted.
 //!
 //! Every frame is addressed directly in the file ([`crate::mov`]), so seeks,
 //! loops and reverse playback are as cheap as playing forward.
@@ -31,6 +54,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -118,6 +142,63 @@ fn texture_len(format: HapFormat, width: u32, height: u32) -> usize {
     width.div_ceil(4) as usize * height.div_ceil(4) as usize * format.block_bytes()
 }
 
+/// Upload buffers per playing layer: the prefetch window, a frame per
+/// worker, and the ones the GPU is still copying from.
+const SLOTS: usize = 8;
+
+/// Bytes per row of 4×4 blocks in an upload buffer: the row of the texture,
+/// padded to the alignment GPU buffer-to-texture copies require.
+fn upload_pitch(format: HapFormat, width: u32) -> u32 {
+    let row = width.div_ceil(4) * format.block_bytes() as u32;
+    row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
+/// Copy texture rows of `row` bytes from `src` into `dst`, where they are
+/// `pitch` bytes apart (the padding is left as it is: the GPU ignores it).
+/// Written in order, as write-combined upload memory wants.
+fn copy_rows(src: &[u8], dst: &mut [u8], row: usize, pitch: usize) {
+    if row == pitch {
+        dst[..src.len()].copy_from_slice(src);
+        return;
+    }
+    for (s, d) in src.chunks_exact(row).zip(dst.chunks_exact_mut(pitch)) {
+        d[..row].copy_from_slice(s);
+    }
+}
+
+/// The mapped memory of an upload buffer, owned by exactly one party at a
+/// time (the free list, a worker, the ready list).
+///
+/// It stays valid until the render thread unmaps the buffer, which it does
+/// only once this value has come back to it (from the ready list) or every
+/// worker has stopped: wgpu (24) keeps a buffer's mapping until `unmap`; the
+/// view the pointer was taken from is dropped at once, its drop being
+/// bookkeeping only (`CoreBufferMappedRange` has an empty `Drop`).
+struct Mapped {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: plain memory, with a single owner at any time (see above).
+unsafe impl Send for Mapped {}
+
+impl Mapped {
+    /// The mapped memory of `buffer`, which must be mapped for writing.
+    fn of(buffer: &wgpu::Buffer) -> Mapped {
+        let mut view = buffer.slice(..).get_mapped_range_mut();
+        let bytes = view.as_mut();
+        Mapped {
+            ptr: NonNull::new(bytes.as_mut_ptr()).expect("mapped memory"),
+            len: bytes.len(),
+        }
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        // SAFETY: valid and exclusively ours (see the type's docs).
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
 /// What the decoding workers share with the renderer.
 struct Shared {
     state: Mutex<Sched>,
@@ -127,31 +208,19 @@ struct Shared {
 struct Sched {
     /// The frames wanted soonest, in order (the one on screen first).
     wanted: Vec<i64>,
-    /// Decoded texture data, by frame.
-    ready: BTreeMap<i64, Vec<u8>>,
+    /// Decoded frames, by frame: the upload buffer (slot) holding each.
+    ready: BTreeMap<i64, (usize, Mapped)>,
+    /// Upload buffers that are mapped and free to fill.
+    free: Vec<(usize, Mapped)>,
     /// Frames a worker is busy with.
     busy: HashSet<i64>,
     /// Frames that failed to decode (reported once, not retried).
     failed: HashSet<i64>,
-    /// Texture-sized buffers to decode into again. Allocating and zeroing a
-    /// fresh one per frame (8 MB at 4K HAP Q) cost about as much as a third
-    /// of the decompression itself; every decode overwrites the whole
-    /// buffer (the chunk sizes are checked to add up to it), so none needs
-    /// clearing.
-    spare: Vec<Vec<u8>>,
     stop: bool,
 }
 
-/// Buffers kept for reuse per video: the prefetch window plus a margin.
-const SPARE_BUFFERS: usize = 8;
-
-/// Keep a texture buffer for the next decode (up to `SPARE_BUFFERS`).
-fn recycle(st: &mut Sched, buffer: Vec<u8>) {
-    // A stopped layer keeps nothing.
-    if !st.stop && st.spare.len() < SPARE_BUFFERS {
-        st.spare.push(buffer);
-    }
-}
+/// Map callbacks report here: (generation of the buffers, slot).
+type MappedSlots = Arc<Mutex<Vec<(u64, usize)>>>;
 
 /// A HAP video layer.
 pub struct HapContent {
@@ -164,6 +233,16 @@ pub struct HapContent {
     sampling: Sampling,
     shared: Arc<Shared>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    /// The upload buffers while playing (empty when idle), by slot.
+    uploads: Vec<wgpu::Buffer>,
+    /// Bumped whenever `uploads` is made anew: a map callback of an older
+    /// buffer must not be taken for one of the new ones.
+    generation: u64,
+    /// Slots whose copy to the texture was recorded, with the upload batch
+    /// it is in; mapped again once that batch has been submitted.
+    in_flight: Vec<(usize, u64)>,
+    /// Slots whose mapping has completed (from the map callbacks).
+    mapped: MappedSlots,
     /// Frame now in the texture.
     shown: Option<i64>,
     /// Last frame asked for, to tell the direction of playback.
@@ -216,7 +295,7 @@ impl HapContent {
                 state: Mutex::new(Sched {
                     wanted: Vec::new(),
                     ready: BTreeMap::new(),
-                    spare: Vec::new(),
+                    free: Vec::new(),
                     busy: HashSet::new(),
                     failed: HashSet::new(),
                     stop: false,
@@ -224,18 +303,45 @@ impl HapContent {
                 wake: Condvar::new(),
             }),
             workers: Vec::new(),
+            uploads: Vec::new(),
+            generation: 0,
+            in_flight: Vec::new(),
+            mapped: Arc::default(),
             shown: None,
             last_want: None,
             step: 1,
         }
     }
 
-    /// Start the decoding workers (they stop again in `idle`).
-    fn start_workers(&mut self) {
+    /// Start the decoding workers, with their upload buffers (both go again
+    /// in `idle`).
+    fn start_workers(&mut self, gpu: &TextureFactory) {
         if !self.workers.is_empty() {
             return;
         }
-        self.shared.state.lock().unwrap().stop = false;
+        let pitch = upload_pitch(self.format, self.track.width);
+        let size = pitch as u64 * self.track.height.div_ceil(4) as u64;
+        self.generation += 1;
+        self.uploads = (0..SLOTS)
+            .map(|_| {
+                gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("hap-upload"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                })
+            })
+            .collect();
+        {
+            let mut st = self.shared.state.lock().unwrap();
+            st.stop = false;
+            st.free = self
+                .uploads
+                .iter()
+                .enumerate()
+                .map(|(slot, buffer)| (slot, Mapped::of(buffer)))
+                .collect();
+        }
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         // Two frame-level workers keep the pipeline full; each also unpacks
         // the chunks of its frame in parallel.
@@ -254,7 +360,7 @@ impl HapContent {
                 .name("lc-hap".into())
                 .spawn(move || {
                     crate::priority::background_thread();
-                    worker(shared, track, path, format, chunk_threads)
+                    worker(shared, track, path, format, chunk_threads, pitch)
                 });
             match spawned {
                 Ok(handle) => self.workers.push(handle),
@@ -267,9 +373,6 @@ impl HapContent {
         {
             let mut st = self.shared.state.lock().unwrap();
             st.stop = true;
-            st.ready.clear();
-            // An idle layer holds no texture buffers (8 MB each at 4K HAP Q).
-            st.spare = Vec::new();
             // A frame that failed (a read error) gets another chance later.
             st.failed.clear();
         }
@@ -277,10 +380,54 @@ impl HapContent {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
-        // A worker that was mid-frame may have handed in its result since.
+        // No worker writes any more: the mapped memory can go, then the
+        // buffers (an idle layer holds none: 4–11 MB each at 4K–10K).
+        {
+            let mut st = self.shared.state.lock().unwrap();
+            st.ready.clear();
+            st.free.clear();
+        }
+        self.uploads.clear();
+        self.in_flight.clear();
+        self.mapped.lock().unwrap().clear();
+    }
+
+    /// Give upload buffers back to the workers: request the mapping of those
+    /// the GPU has been asked to copy from (their frame is submitted), and
+    /// hand out those whose mapping has completed.
+    fn reclaim_uploads(&mut self, gpu: &TextureFactory) {
+        let submitted = gpu.uploads_submitted();
+        let (generation, uploads, mapped) = (self.generation, &self.uploads, &self.mapped);
+        self.in_flight.retain(|&(slot, batch)| {
+            if batch >= submitted {
+                return true; // its copy is not submitted yet
+            }
+            let done = mapped.clone();
+            // Completes once the GPU has finished with the buffer; the
+            // callback runs in a later submit or poll on this thread.
+            uploads[slot]
+                .slice(..)
+                .map_async(wgpu::MapMode::Write, move |result| {
+                    if result.is_ok() {
+                        done.lock().unwrap().push((generation, slot));
+                    }
+                });
+            false
+        });
+        let ready: Vec<usize> = std::mem::take(&mut *self.mapped.lock().unwrap())
+            .into_iter()
+            .filter(|&(g, _)| g == generation)
+            .map(|(_, slot)| slot)
+            .collect();
+        if ready.is_empty() {
+            return;
+        }
         let mut st = self.shared.state.lock().unwrap();
-        st.ready.clear();
-        st.spare = Vec::new();
+        for slot in ready {
+            st.free.push((slot, Mapped::of(&self.uploads[slot])));
+        }
+        drop(st);
+        self.shared.wake.notify_all();
     }
 
     /// The frames to have ready, soonest first: the wanted one, then the
@@ -332,6 +479,7 @@ fn worker(
     path: String,
     format: HapFormat,
     chunk_threads: usize,
+    pitch: u32,
 ) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
@@ -340,12 +488,16 @@ fn worker(
             return;
         }
     };
-    let len = texture_len(format, track.width, track.height);
+    let row = track.width.div_ceil(4) as usize * format.block_bytes();
+    // Unpacked here, in ordinary memory, then copied to the upload buffer.
+    // Every decode overwrites all of it (the chunk sizes are checked to add
+    // up to it), so it is allocated once.
+    let mut texture = vec![0u8; texture_len(format, track.width, track.height)];
     let mut packet = Vec::new();
     loop {
-        // Pick the soonest wanted frame nobody has or is working on, and a
-        // buffer to decode it into.
-        let (frame, mut out) = {
+        // Pick the soonest wanted frame nobody has or is working on, and an
+        // upload buffer to put it in.
+        let (frame, (slot, mut mapped)) = {
             let mut st = shared.state.lock().unwrap();
             loop {
                 if st.stop {
@@ -355,12 +507,13 @@ fn worker(
                     !st.ready.contains_key(f) && !st.busy.contains(f) && !st.failed.contains(f)
                 });
                 match next {
-                    Some(f) => {
+                    Some(f) if !st.free.is_empty() => {
                         st.busy.insert(f);
-                        let buffer = st.spare.pop().filter(|b| b.len() == len);
-                        break (f, buffer.unwrap_or_else(|| vec![0u8; len]));
+                        break (f, st.free.pop().expect("not empty"));
                     }
-                    None => st = shared.wake.wait(st).unwrap(),
+                    // Nothing to do, or every buffer taken: wait for the
+                    // renderer.
+                    _ => st = shared.wake.wait(st).unwrap(),
                 }
             }
         };
@@ -373,7 +526,9 @@ fn worker(
             packet.resize(size as usize, 0);
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut packet)?;
-            decode_frame(&packet, format.section_type(), &mut out, chunk_threads)
+            decode_frame(&packet, format.section_type(), &mut texture, chunk_threads)?;
+            copy_rows(&texture, mapped.bytes(), row, pitch as usize);
+            Ok(())
         })();
 
         let mut st = shared.state.lock().unwrap();
@@ -381,17 +536,20 @@ fn worker(
         match result {
             // Keep it only if it is still wanted (playback may have jumped).
             Ok(()) if !st.stop && st.wanted.contains(&frame) => {
-                st.ready.insert(frame, out);
+                st.ready.insert(frame, (slot, mapped));
             }
-            Ok(()) => recycle(&mut st, out),
+            Ok(()) => st.free.push((slot, mapped)),
             Err(e) => {
-                recycle(&mut st, out);
+                st.free.push((slot, mapped));
                 if st.failed.is_empty() {
                     tracing::error!("video '{path}', frame {frame}: {e:#}");
                 }
                 st.failed.insert(frame);
             }
         }
+        drop(st);
+        // A buffer is free again, or a frame ready.
+        shared.wake.notify_all();
     }
 }
 
@@ -409,13 +567,14 @@ impl Content for HapContent {
             self.step = next_stride(self.step, last, want, self.loop_span());
         }
         self.last_want = Some(want);
-        self.start_workers();
+        self.start_workers(gpu);
+        self.reclaim_uploads(gpu);
 
         let window = self.window(want);
         let frame = {
             let mut st = self.shared.state.lock().unwrap();
-            // Drop what is no longer needed, publish what is.
-            // Frames no longer wanted give their buffers back.
+            // Drop what is no longer needed, publish what is. Frames no
+            // longer wanted give their buffers back (still mapped).
             let dropped: Vec<i64> = st
                 .ready
                 .keys()
@@ -424,7 +583,7 @@ impl Content for HapContent {
                 .collect();
             for f in dropped {
                 if let Some(buffer) = st.ready.remove(&f) {
-                    recycle(&mut st, buffer);
+                    st.free.push(buffer);
                 }
             }
             st.wanted = window;
@@ -432,37 +591,48 @@ impl Content for HapContent {
             if self.shown == Some(want) {
                 return;
             }
-            // Taken out, not copied: the texture is about to hold it.
-            st.ready.remove(&want).map(|data| (want, data))
+            st.ready
+                .remove(&want)
+                .map(|(slot, mapped)| (want, slot, mapped))
         };
         // The wanted frame is not decoded yet: keep showing the previous one
         // (never wait — every output on the machine would stall).
-        let Some((index, data)) = frame else {
+        // Its mapped memory came back with it (no worker can write there any
+        // more): unmap, and have the GPU copy the frame into the texture
+        // ahead of drawing it.
+        let Some((index, slot, _mapped)) = frame else {
             return;
         };
+        let buffer = &self.uploads[slot];
+        buffer.unmap();
         let (blocks_w, blocks_h) = (self.track.width.div_ceil(4), self.track.height.div_ceil(4));
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(blocks_w * self.format.block_bytes() as u32),
-                rows_per_image: Some(blocks_h),
-            },
-            wgpu::Extent3d {
-                width: blocks_w * 4,
-                height: blocks_h * 4,
-                depth_or_array_layers: 1,
-            },
-        );
+        let pitch = upload_pitch(self.format, self.track.width);
+        let texture = &self.texture;
+        let batch = gpu.record_upload(|encoder| {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(pitch),
+                        rows_per_image: Some(blocks_h),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: blocks_w * 4,
+                    height: blocks_h * 4,
+                    depth_or_array_layers: 1,
+                },
+            );
+        });
+        self.in_flight.push((slot, batch));
         self.shown = Some(index);
-        // `write_texture` has copied it: the buffer can take the next frame.
-        recycle(&mut self.shared.state.lock().unwrap(), data);
     }
 
     fn idle(&mut self) {
@@ -640,6 +810,15 @@ impl Content for LazyVideo {
         }
     }
 
+    fn ready(&self) -> bool {
+        match &self.state {
+            State::Hap(c) => c.ready(),
+            State::Ffmpeg(c) => c.ready(),
+            State::Failed(_) => true,
+            State::Loading(_) => false,
+        }
+    }
+
     fn late(&self) -> bool {
         match &self.state {
             State::Hap(c) => c.late(),
@@ -763,6 +942,28 @@ mod tests {
         assert_eq!(next_stride(1, 59, 0, Some(60)), 1);
         assert_eq!(next_stride(2, 10, 10, None), 2);
         assert_eq!(next_stride(1, 10, 500, None), 1);
+    }
+
+    #[test]
+    fn upload_rows_are_padded_to_the_copy_alignment() {
+        // 4K DXT1: 960 blocks × 8 bytes, already a multiple of 256.
+        assert_eq!(upload_pitch(HapFormat::Dxt1, 3840), 7680);
+        // 10K DXT1 (9978 px): 2495 blocks × 8 = 19960 → 19968.
+        assert_eq!(upload_pitch(HapFormat::Dxt1, 9978), 19968);
+        // 68 px HAP Q: 17 blocks × 16 = 272 → 512.
+        assert_eq!(upload_pitch(HapFormat::YCoCgDxt5, 68), 512);
+
+        let src: Vec<u8> = (0..30).collect(); // three rows of 10
+        let mut dst = vec![0xEEu8; 3 * 16];
+        copy_rows(&src, &mut dst, 10, 16);
+        for (r, row) in dst.chunks(16).enumerate() {
+            assert_eq!(&row[..10], &src[r * 10..r * 10 + 10]);
+            assert!(row[10..].iter().all(|&b| b == 0xEE), "padding untouched");
+        }
+        // Unpadded: one plain copy.
+        let mut dst = vec![0u8; 30];
+        copy_rows(&src, &mut dst, 10, 10);
+        assert_eq!(dst, src);
     }
 
     #[test]

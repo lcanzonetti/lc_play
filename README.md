@@ -239,7 +239,8 @@ or not, and every display showing one is on the same step.
 ### HAP and the CPU
 
 HAP is decoded by the GPU, but each frame is first decompressed (Snappy)
-and copied by the CPU: measured here, about 2.5–3 ms of one core per frame
+and copied by the CPU — on the decoding threads, into upload buffers the GPU
+copies from, so the render thread does not wait for it: measured here, about 2.5–3 ms of one core per frame
 of 4K HAP Q — 15–20 % of a core per layer at 60 fps, more for footage that
 compresses less well, and double at 8K. A laptop that also runs the Producer
 feels that; a show machine with more cores much less. To lower it: use
