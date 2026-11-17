@@ -176,6 +176,7 @@ pub async fn delete_item(
     // resolves to nothing, so this cannot reach outside the media directory.
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
     tokio::fs::remove_file(&item.abs_path).await?;
+    crate::handlers::proxy::remove_proxies(&state.config.media_dir, &id).await;
     rescan(&state).await;
     tracing::info!(name = %item.name, "asset deleted");
     Ok(Json(serde_json::json!({ "deleted": item.name })))

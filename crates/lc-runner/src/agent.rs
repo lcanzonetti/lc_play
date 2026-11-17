@@ -489,6 +489,9 @@ impl Link {
             }
             // Without a renderer, quitting and restarting are ours to do.
             RunnerAction::Quit if !self.renderer => std::process::exit(0),
+            RunnerAction::Exit if !self.renderer => {
+                std::process::exit(crate::machine::EXIT_FOR_GOOD_CODE)
+            }
             RunnerAction::Restart if !self.renderer => {
                 std::process::exit(crate::machine::RESTART_EXIT_CODE)
             }

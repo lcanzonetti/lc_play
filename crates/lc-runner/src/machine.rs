@@ -11,6 +11,11 @@ use lc_proto::MachineInfo;
 
 /// Exit code by which a Runner asks its supervisor to start it again.
 pub const RESTART_EXIT_CODE: i32 = 75;
+/// Exit code asking the supervisor to end too (`RunnerAction::Exit`).
+pub const EXIT_FOR_GOOD_CODE: i32 = 77;
+/// Environment variable through which the supervisor tells the Runner the
+/// UDP port it waits for start requests on.
+pub const LAUNCHER_PORT_ENV: &str = "LCPLAY_LAUNCHER_PORT";
 
 /// Lines of log kept for the operator.
 const LOG_LINES: usize = 400;
@@ -165,6 +170,9 @@ pub fn describe(local_ip: Option<IpAddr>, allow_power: bool, supervised: bool) -
         mac,
         allow_power,
         supervised,
+        launcher_port: std::env::var(LAUNCHER_PORT_ENV)
+            .ok()
+            .and_then(|p| p.parse().ok()),
     }
 }
 
@@ -211,25 +219,18 @@ pub fn power(reboot: bool) -> anyhow::Result<()> {
 pub fn set_autostart(on: bool) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let exe = std::env::current_exe().context("locating this program")?;
-    // The options of this invocation, without --autostart and its value.
-    let mut args = Vec::new();
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        if a == "--autostart" {
-            it.next();
-        } else if !a.starts_with("--autostart=") {
-            args.push(a);
-        }
-    }
-    let quote = |s: &str| {
-        if s.contains(' ') {
-            format!("\"{s}\"")
-        } else {
-            s.to_string()
-        }
-    };
-    let command_line = std::iter::once(format!("\"{}\"", exe.display()))
-        .chain(args.iter().map(|a| quote(a)))
+    let args = autostart_args(
+        std::env::args_os()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned()),
+    );
+    #[cfg(windows)]
+    let quote = windows_quote;
+    #[cfg(not(windows))]
+    let quote = desktop_quote;
+    let command_line = std::iter::once(exe.display().to_string())
+        .chain(args)
+        .map(|a| quote(&a))
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -287,9 +288,122 @@ pub fn set_autostart(on: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The options to start with at login: these, minus `--autostart` and its
+/// value, with relative paths (the show file, `--cache-dir`) made absolute —
+/// at login the current folder is a different one.
+fn autostart_args(args: impl Iterator<Item = String>) -> Vec<String> {
+    const TAKES_VALUE: [&str; 4] = ["--director", "--name", "--interface", "--cache-dir"];
+    let absolute = |p: &str| {
+        std::path::absolute(p).map_or_else(|_| p.to_string(), |a| a.display().to_string())
+    };
+    let mut out = Vec::new();
+    let mut it = args;
+    while let Some(a) = it.next() {
+        if a == "--autostart" {
+            it.next();
+        } else if a.starts_with("--autostart=") {
+            // dropped
+        } else if a == "--cache-dir" {
+            out.push(a);
+            if let Some(v) = it.next() {
+                out.push(absolute(&v));
+            }
+        } else if let Some(v) = a.strip_prefix("--cache-dir=") {
+            out.push(format!("--cache-dir={}", absolute(v)));
+        } else if TAKES_VALUE.contains(&a.as_str()) {
+            out.push(a);
+            if let Some(v) = it.next() {
+                out.push(v);
+            }
+        } else if !a.starts_with('-') {
+            out.push(absolute(&a)); // the show file
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Quote one argument for a Windows command line, by the rules programs
+/// use to split it (`CommandLineToArgvW`): quotes around anything empty or
+/// with spaces, tabs or quotes; backslashes doubled before a quote.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Quote one argument for the `Exec=` line of a desktop entry.
+#[cfg_attr(windows, allow(dead_code))]
+fn desktop_quote(arg: &str) -> String {
+    let mut out = String::from('"');
+    for c in arg.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_quoting_handles_awkward_arguments() {
+        assert_eq!(windows_quote("plain"), "plain");
+        assert_eq!(windows_quote(""), "\"\"");
+        // A trailing backslash must not escape the closing quote.
+        assert_eq!(windows_quote("D:\\LC Play\\"), "\"D:\\LC Play\\\\\"");
+        assert_eq!(windows_quote("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn autostart_keeps_options_and_makes_paths_absolute() {
+        let args = [
+            "--autostart",
+            "on",
+            "--name",
+            "left",
+            "--cache-dir",
+            "rel",
+            "show.json",
+        ]
+        .map(String::from);
+        let out = autostart_args(args.into_iter());
+        assert_eq!(out[0..2], ["--name", "left"]);
+        assert_eq!(out[2], "--cache-dir");
+        assert!(std::path::Path::new(&out[3]).is_absolute());
+        assert!(std::path::Path::new(&out[4]).is_absolute());
+        assert_eq!(out.len(), 5);
+    }
 
     #[test]
     fn colour_codes_are_stripped() {

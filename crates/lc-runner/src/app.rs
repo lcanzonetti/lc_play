@@ -224,6 +224,11 @@ impl App {
                     self.exit_code = 0;
                     event_loop.exit();
                 }
+                RunnerAction::Exit => {
+                    tracing::info!("exiting for good on the operator's request");
+                    self.exit_code = crate::machine::EXIT_FOR_GOOD_CODE;
+                    event_loop.exit();
+                }
                 RunnerAction::Restart => {
                     tracing::info!("restarting on the operator's request");
                     self.exit_code = crate::machine::RESTART_EXIT_CODE;

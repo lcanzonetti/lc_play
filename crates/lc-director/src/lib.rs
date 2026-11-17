@@ -737,7 +737,6 @@ impl Core {
         }
     }
 
-    /// Send a Wake-on-LAN packet to a Runner's computer.
     /// Ask the supervisor of a closed Runner to start it again: a UDP
     /// message to the computer it last reported from (see
     /// `lc_proto::StartRunner`).
@@ -757,10 +756,14 @@ impl Core {
         if matching.is_empty() {
             return Err(format!("no runner called '{runner}' has ever connected"));
         }
-        let targets: Vec<(NodeId, String)> = matching
+        let targets: Vec<(NodeId, String, u16)> = matching
             .iter()
             .filter(|k| !online(k))
-            .filter_map(|k| Some((k.node_id.clone(), k.machine.as_ref()?.ip.clone())))
+            .filter_map(|k| {
+                let m = k.machine.as_ref()?;
+                let port = m.launcher_port.unwrap_or(lc_proto::LAUNCHER_PORT);
+                Some((k.node_id.clone(), m.ip.clone(), port))
+            })
             .collect();
         drop(st);
         if targets.is_empty() {
@@ -768,24 +771,42 @@ impl Core {
                 "start '{runner}': it is running already, or its address is not known yet"
             ));
         }
-        let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))
-            .map_err(|e| format!("start '{runner}': {e}"))?;
-        for (node_id, ip) in targets {
+        let (mut sent, mut last_error) = (0, String::new());
+        for (node_id, ip, port) in targets {
             let msg = serde_json::to_vec(&lc_proto::StartRunner {
                 start_runner: node_id,
             })
             .expect("serialisable");
-            // Twice: it is UDP, and starting twice is harmless.
-            for _ in 0..2 {
-                socket
-                    .send_to(&msg, (ip.as_str(), lc_proto::LAUNCHER_PORT))
-                    .map_err(|e| format!("start '{runner}' at {ip}: {e}"))?;
+            let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+                last_error = format!("start '{runner}': '{ip}' is not an address");
+                continue;
+            };
+            // From a socket of the same family as the address.
+            let any: std::net::IpAddr = if addr.is_ipv4() {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED.into()
+            };
+            let result = std::net::UdpSocket::bind((any, 0)).and_then(|socket| {
+                // Twice: it is UDP, and a second request is ignored.
+                socket.send_to(&msg, (addr, port))?;
+                socket.send_to(&msg, (addr, port))
+            });
+            match result {
+                Ok(_) => {
+                    tracing::info!("asked the supervisor at {ip}:{port} to start '{runner}'");
+                    sent += 1;
+                }
+                Err(e) => last_error = format!("start '{runner}' at {ip}: {e}"),
             }
-            tracing::info!("asked the supervisor at {ip} to start '{runner}'");
+        }
+        if sent == 0 {
+            return Err(last_error);
         }
         Ok(())
     }
 
+    /// Send a Wake-on-LAN packet to a Runner's computer.
     fn wake_runner(&self, runner: &str) -> Result<(), String> {
         let st = self.state();
         // By name (every Runner of that name) or by node id.

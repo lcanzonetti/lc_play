@@ -196,8 +196,13 @@ target/release/lc-runner --director 10.0.0.1:7401 --name left --allow-power
 `lc-runner` runs under a small supervisor (the same program): **Restart**
 from the Producer brings it back, and it restarts itself after a crash. When
 the Runner is closed (its window, or **Quit**), the supervisor keeps waiting,
-and **Start** in the Runners window opens it again; closing the supervisor's
-console window ends it for good. `lc-runner --autostart on` (with the
+and **Start** in the Runners window opens it again; **Exit** (or closing the
+supervisor's console window) ends both for good. Launching `lc-runner` again
+while its supervisor waits simply starts the Runner (one supervisor per
+Runner). The supervisor listens on UDP 7406 (further Runners on the same
+computer on a free port, which they report): on Windows, allow `lc-runner`
+through the firewall on the show network, or **Start** silently does
+nothing. `lc-runner --autostart on` (with the
 options it should start with) makes it start at login, so a reboot does not
 leave it closed either; `--autostart off` undoes that.
 

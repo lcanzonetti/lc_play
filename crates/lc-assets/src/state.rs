@@ -28,6 +28,11 @@ pub struct AppState {
     /// One lock per item whose preview proxy is being made, so that two
     /// requests for it start one ffmpeg, not two.
     pub proxy_jobs: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Proxies made at the same time (their own limit: a show full of new
+    /// videos must not hold up thumbnails and probes for minutes).
+    pub proxy_slots: Arc<Semaphore>,
+    /// Items no proxy could be made for, with the (size, mtime) tried.
+    pub proxy_failed: Arc<Mutex<HashMap<String, (u64, u64)>>>,
 }
 
 impl AppState {
@@ -40,6 +45,8 @@ impl AppState {
             probes: Arc::default(),
             thumbs: Arc::default(),
             proxy_jobs: Arc::default(),
+            proxy_slots: Arc::new(Semaphore::new(crate::handlers::proxy::PROXY_JOBS)),
+            proxy_failed: Arc::default(),
         }
     }
 }

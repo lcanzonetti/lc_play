@@ -1074,7 +1074,12 @@ function previewFor(cue, asset) {
       // plays in any web view whatever the original's codec (HAP, ProRes),
       // and is far lighter to decode than a 4K original.
       p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: asset.url.replace('/stream/', '/proxy/') });
-      p.node.addEventListener('error', () => (p.failed = true));
+      // No proxy (no H.264 encoder on the Asset Manager, a read-only media
+      // folder): try the original once — plain H.264 plays as it is.
+      p.node.addEventListener('error', () => {
+        if (p.node.src.includes('/proxy/')) p.node.src = asset.url;
+        else p.failed = true;
+      });
     } else {
       p.node = new Image();
       p.node.onerror = () => (p.failed = true);
@@ -1828,7 +1833,8 @@ function renderRunners(force = false) {
           : act('Standby', 'Close its outputs; it stays connected', () => runnerAction(name, 'standby', `Put ${name} in standby? Its outputs close until resumed.`)),
         act('Restart', machine?.supervised ? 'Restart the Runner program' : 'Not supervised: Restart will only stop it',
           () => runnerAction(name, 'restart', `Restart the Runner program on ${name}? Its outputs go dark for a few seconds.`)),
-        act('Quit', 'Stop the Runner program', () => runnerAction(name, 'quit', `Stop the Runner program on ${name}? It can only be started again on that computer${machine?.allow_power ? ' or by rebooting it' : ''}.`)),
+        act('Quit', 'Close the Runner program; Start (here) opens it again', () => runnerAction(name, 'quit', `Close the Runner program on ${name}? It can be started again from here with Start.`)),
+        act('Exit', 'Close the Runner program for good: it can then only be started on its computer', () => runnerAction(name, 'exit', `Close the Runner program on ${name} for good? It can then only be started again on that computer${machine?.allow_power ? ' or by rebooting it' : ''}.`)),
         act('Reboot', power ? 'Restart the computer' : noPower,
           () => runnerAction(name, 'reboot', `Restart the computer ${machine?.hostname || name}?`), { disabled: !power }),
         act('Power off', power ? 'Shut the computer down' : noPower,

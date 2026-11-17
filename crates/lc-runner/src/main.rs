@@ -236,25 +236,51 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the Runner as a child process and keep it running.
+/// Supervise the Runner: start it as a worker process, restart it after a
+/// crash or on request, and — when it was closed (its window, or Quit from
+/// the Producer) — wait for the Producer's Start to open it again.
 ///
-/// The supervisor is this same program, doing nothing but starting the real
-/// Runner (with `--worker`) and watching it:
-///
-/// * exits normally (the operator chose Quit, or closed a window with Esc):
-///   the supervisor ends too;
-/// * asks to be restarted (the operator chose Restart): started again at
-///   once;
-/// * crashes (a GPU driver reset, a bug): started again after a pause that
-///   grows if it keeps crashing, so a broken setup does not spin.
-///
-/// The child is tied to the supervisor through its stdin: if the supervisor
-/// is killed, the pipe closes and the child exits (see
-/// [`exit_with_supervisor`]). That works the same on Windows, where killing
-/// a process does not kill its children.
+/// * One supervisor per Runner folder (a lock file held for its lifetime).
+///   Launching `lc-runner` again while one exists asks that one to start
+///   the Runner (if it is waiting) instead of making a second one.
+/// * It listens for start requests on UDP 7406 — or, if another Runner on
+///   this computer has that, on any free port — for its whole life, and
+///   tells the Runner which, so the Director knows where to send.
+/// * `Exit` from the Producer, or closing this process, ends it for good.
 fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
-    use lc_runner::machine::RESTART_EXIT_CODE;
+    use lc_runner::machine::{EXIT_FOR_GOOD_CODE, LAUNCHER_PORT_ENV, RESTART_EXIT_CODE};
     use std::process::{Command, Stdio};
+
+    let me: Option<lc_proto::NodeId> = read_node_id(state_dir);
+    let lock_path = state_dir.join("supervisor.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .context("opening the supervisor lock")?;
+    if lock.try_lock().is_err() {
+        // Another supervisor runs this Runner: ask it to start the Runner
+        // (harmless if it is running), and leave it at that.
+        let port = std::fs::read_to_string(state_dir.join("launcher-port"))
+            .ok()
+            .and_then(|p| p.trim().parse::<u16>().ok());
+        if let (Some(port), Some(me)) = (port, &me) {
+            let msg = serde_json::to_vec(&lc_proto::StartRunner {
+                start_runner: me.clone(),
+            })?;
+            let socket = std::net::UdpSocket::bind(("127.0.0.1", 0))?;
+            socket.send_to(&msg, ("127.0.0.1", port))?;
+        }
+        println!("This Runner is already running (or waiting to be started): asked it to start.");
+        return Ok(());
+    }
+
+    let launcher = std::net::UdpSocket::bind(("0.0.0.0", lc_proto::LAUNCHER_PORT))
+        .or_else(|_| std::net::UdpSocket::bind(("0.0.0.0", 0)))
+        .context("listening for start requests")?;
+    let port = launcher.local_addr()?.port();
+    let _ = std::fs::write(state_dir.join("launcher-port"), port.to_string());
 
     let exe = std::env::current_exe().context("locating this program")?;
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -264,6 +290,7 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
         let mut child = Command::new(&exe)
             .args(&args)
             .arg("--worker")
+            .env(LAUNCHER_PORT_ENV, port.to_string())
             .stdin(Stdio::piped())
             .spawn()
             .context("starting the runner")?;
@@ -271,10 +298,14 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
         let _tie = child.stdin.take();
         let status = child.wait().context("waiting for the runner")?;
         match status.code() {
+            Some(EXIT_FOR_GOOD_CODE) => {
+                tracing::info!("supervisor: exiting on the operator's request");
+                return Ok(());
+            }
             // Closed (its window, or Quit from the Producer): stay here and
             // wait to be started again from the Producer.
             Some(0) => {
-                wait_for_start(state_dir);
+                wait_for_start(&launcher, me.as_ref().or(read_node_id(state_dir).as_ref()));
                 backoff = Duration::from_secs(1);
             }
             Some(RESTART_EXIT_CODE) => {
@@ -298,44 +329,40 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
-/// The Runner has been closed: wait until the Director asks for it to be
-/// started again (`lc_proto::StartRunner` on UDP `LAUNCHER_PORT`, for this
-/// Runner's node id). Closing this process (its console window, Task
-/// Manager) ends it for good.
-fn wait_for_start(state_dir: &std::path::Path) {
+/// This Runner's node id, as it saved it.
+fn read_node_id(state_dir: &std::path::Path) -> Option<lc_proto::NodeId> {
+    std::fs::read(state_dir.join("node_id.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// The Runner has been closed: wait until a start request for it arrives
+/// (`lc_proto::StartRunner`, for this Runner's node id).
+fn wait_for_start(socket: &std::net::UdpSocket, me: Option<&lc_proto::NodeId>) {
     tracing::info!(
         "supervisor: the runner is closed; it can be started again from the Producer \
          (Runners window → Start). Close this window to stop it for good."
     );
-    // Our identity, as the Runner saved it.
-    let me: Option<lc_proto::NodeId> = std::fs::read(state_dir.join("node_id.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok());
-    let mut warned = false;
+    let mut buf = [0u8; 512];
+    // Requests that arrived while the Runner was running are stale.
+    let _ = socket.set_nonblocking(true);
+    while socket.recv_from(&mut buf).is_ok() {}
+    let _ = socket.set_nonblocking(false);
     loop {
-        let socket = match std::net::UdpSocket::bind(("0.0.0.0", lc_proto::LAUNCHER_PORT)) {
-            Ok(s) => s,
-            Err(e) => {
-                if !warned {
-                    tracing::error!(
-                        "supervisor: cannot listen on UDP {} ({e}); retrying",
-                        lc_proto::LAUNCHER_PORT
-                    );
-                    warned = true;
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                let Ok(req) = serde_json::from_slice::<lc_proto::StartRunner>(&buf[..n]) else {
+                    continue;
+                };
+                // Without a known identity (never connected yet), any
+                // request for this machine will do.
+                if me.is_none_or(|id| *id == req.start_runner) {
+                    tracing::info!("supervisor: start requested from {from}");
+                    return;
                 }
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
             }
-        };
-        let mut buf = [0u8; 512];
-        while let Ok((n, from)) = socket.recv_from(&mut buf) {
-            let Ok(req) = serde_json::from_slice::<lc_proto::StartRunner>(&buf[..n]) else {
-                continue;
-            };
-            if me.as_ref().is_none_or(|id| *id == req.start_runner) {
-                tracing::info!("supervisor: start requested from {from}");
-                return;
-            }
+            // E.g. an oversized datagram (Windows): ignore and go on.
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
 }

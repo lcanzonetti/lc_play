@@ -71,7 +71,7 @@ Commands:
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
-| `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP 7406) to the address that Runner last reported; its supervisor, waiting since the Runner was closed, starts it |
+| `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP, to the address and `launcher_port` that Runner last reported, default 7406); its supervisor, waiting since the Runner was closed, starts it |
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
@@ -127,7 +127,8 @@ Producers and controllers — never to Runners — as `{ "type": "presence",
 Producer disconnects.
 
 Runner actions: `reload_outputs` (close and rebuild the outputs), `restart`
-and `quit` (the Runner program), `standby` / `resume` (close / reopen the
+and `quit` (the Runner program; after `quit` its supervisor waits for
+`start_runner`), `exit` (the Runner and its supervisor), `standby` / `resume` (close / reopen the
 outputs, staying connected), `reboot` and `power_off` (the computer; only if
 the Runner was started with `--allow-power`), `send_logs` (it replies with
 `logs`), `send_preview` (it replies with `preview`).
@@ -199,7 +200,7 @@ frame-lock counter), `vblank` (the first output's refresh, which the Director
 builds the grid from), `downloads` (media being copied into its cache:
 `name`, `done` and `total` bytes, `bytes_per_s`, and `error` / `retry_in_s`
 while waiting to retry), and `machine`: `hostname`, `os`,
-`version`, `ip`, `mac`, `allow_power`, `supervised`. `cluster` carries
+`version`, `ip`, `mac`, `allow_power`, `supervised`, `launcher_port`. `cluster` carries
 `known_runners`: every Runner the Director has seen (`name`, `node_id`,
 `machine`, `online`), so offline ones can be listed and woken.
 `runner_logs` / `runner_preview` are relayed to Producers and controllers,

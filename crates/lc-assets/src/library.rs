@@ -121,9 +121,8 @@ impl Library {
         for entry in WalkDir::new(&self.root)
             .follow_links(true)
             .into_iter()
-            // Hidden folders hold the Asset Manager's own files (preview
-            // proxies), not media.
-            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+            // The Asset Manager's own folder (preview proxies) is not media.
+            .filter_entry(|e| e.depth() == 0 || e.file_name() != crate::handlers::proxy::PROXY_DIR)
             .filter_map(|e| e.ok())
         {
             if !entry.file_type().is_file() {

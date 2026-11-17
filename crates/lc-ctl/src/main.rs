@@ -150,13 +150,14 @@ async fn main() -> anyhow::Result<()> {
             let action = match action.as_str() {
                 "restart" => A::Restart,
                 "quit" => A::Quit,
+                "exit" => A::Exit,
                 "standby" => A::Standby,
                 "resume" => A::Resume,
                 "reboot" => A::Reboot,
                 "poweroff" => A::PowerOff,
                 "reload" => A::ReloadOutputs,
                 other => bail!(
-                    "unknown runner action '{other}' (restart, quit, standby, resume, reboot, poweroff, reload, start)"
+                    "unknown runner action '{other}' (restart, quit, standby, resume, reboot, poweroff, reload, start, exit)"
                 ),
             };
             Command::RunnerAction { runner, action }

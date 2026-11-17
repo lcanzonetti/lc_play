@@ -168,8 +168,12 @@ pub enum RunnerAction {
     ReloadOutputs,
     /// Restart the Runner program.
     Restart,
-    /// Stop the Runner program.
+    /// Stop the Runner program. Its supervisor stays, waiting for a
+    /// `start_runner`.
     Quit,
+    /// Stop the Runner program and its supervisor: it can only be started
+    /// again on its computer.
+    Exit,
     /// Close the outputs but stay connected (screens go to the desktop or
     /// dark), until `Resume`.
     Standby,
@@ -299,6 +303,9 @@ pub struct MachineInfo {
     pub allow_power: bool,
     /// Whether a supervisor restarts it (`Restart` brings it back).
     pub supervised: bool,
+    /// UDP port its supervisor listens on for `start_runner` (default 7406).
+    #[serde(default)]
+    pub launcher_port: Option<u16>,
 }
 
 /// How well a Runner's clock is locked to the Director's.

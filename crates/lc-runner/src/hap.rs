@@ -464,6 +464,8 @@ impl HapContent {
             let mut st = self.shared.state.lock().unwrap();
             st.stop = true;
             st.ready.clear();
+            // An idle layer holds no texture buffers (8 MB each at 4K HAP Q).
+            st.spare = Vec::new();
             // A frame that failed (a read error) gets another chance later.
             st.failed.clear();
         }
