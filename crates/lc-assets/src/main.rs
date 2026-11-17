@@ -41,6 +41,9 @@ async fn main() {
     let config = Config::from_env();
     tracing::info!(?config, "starting lc-assets");
 
+    // Before the library: it picks the folder of optimised files, which the
+    // library scan leaves out.
+    let optimizer = optimize::Optimizer::new(&config.media_dir, &config.ffmpeg);
     let library = library::from_config(&config);
 
     // Kick off the initial + periodic background scan.
@@ -48,7 +51,7 @@ async fn main() {
 
     let cors = config.cors.clone();
     let bind = config.bind;
-    let state = AppState::new(config, library);
+    let state = AppState::new(config, library, optimizer);
     optimize::spawn(state.clone());
 
     let mut app = Router::new()

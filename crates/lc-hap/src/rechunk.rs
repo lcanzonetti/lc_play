@@ -90,8 +90,24 @@ fn push_section(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
 pub fn encode_frame(texture: &[u8], tex: Texture, chunks: usize, snappy: bool) -> Vec<u8> {
     let blocks = texture.len() / tex.block_bytes;
     let chunks = chunks.clamp(1, 64).min(blocks.max(1));
-    let per = blocks.div_ceil(chunks) * tex.block_bytes;
-    let parts: Vec<&[u8]> = texture.chunks(per.max(1)).collect();
+    // Exactly `chunks` parts, as even as blocks allow: the first
+    // `blocks % chunks` parts get one block more. (Rounding the part size up
+    // instead could give fewer parts than asked, and a file that never
+    // matches its rule.)
+    let (base, extra) = (blocks / chunks, blocks % chunks);
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(chunks);
+    let mut rest = texture;
+    for i in 0..chunks {
+        let n = (base + usize::from(i < extra)) * tex.block_bytes;
+        let n = if i + 1 == chunks {
+            rest.len()
+        } else {
+            n.min(rest.len())
+        };
+        let (part, tail) = rest.split_at(n);
+        parts.push(part);
+        rest = tail;
+    }
     // Compress the parts in parallel: this is the slow step.
     let packed: Vec<(u8, Vec<u8>)> = std::thread::scope(|s| {
         let jobs: Vec<_> = parts

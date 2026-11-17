@@ -261,21 +261,29 @@ with Snappy; HAP Q for ordinary video, HAP Alpha for ProRes with alpha,
 HAP files re-chunked, HAP Q Alpha kept as it is.
 
 - **Originals are kept.** Converted copies go in `Optimized\` in the media
-  folder, with the same sub-folders and names (`.mov`). The settings and a
-  record of what was made are in `.lcplay\`.
+  folder, with the same sub-folders and names (`.mov`). If the media folder
+  already had an `Optimized` folder of your own, they go in
+  `Optimized (LC Play)\` instead (chosen once, logged at start-up). Two
+  originals that would get the same name (`clip.mp4` and `clip.mov`) get
+  two copies: the second gets a `~tag`. The settings and a record of what
+  was made are in `.lcplay\`. Converted copies have no audio.
 - **Re-chunking HAP is lossless**: the compressed texture is kept bit for
   bit, only its split into chunks and the Snappy setting change — fast,
   and no quality is lost. A HAP file already stored as asked is used as it
   is. (HAP Q Alpha holds two textures; it can only be kept.)
-- New and changed files are converted as they appear, one at a time; the
+- New and changed files are converted as they appear (once their size has
+  stood still for 10 s), one at a time; the
   Assets window shows progress, and the result or the error on each file.
   Changing the map applies to files converted from then on; **Save and
   apply to existing files** converts again those made with other settings
   (and retries failures), and **↻** on an asset converts that one again.
 - The show follows: once a file's optimised copy is ready the Producer
-  points the show at it, and Runners download it. Until then they play
-  the original — a cue added before the conversion finished is downloaded
-  twice.
+  points the show at it (not an undo step), and Runners download it. They
+  keep playing the version they have until the new one has arrived — a cue
+  added before the conversion finished is downloaded twice, but never goes
+  blank. Deleting an original (also in Explorer) removes its copy.
+- A conversion that makes no progress for 5 minutes is stopped and
+  reported as failed.
 - Other formats go through ffmpeg's HAP encoder, which needs ffmpeg built
   with Snappy (the usual Windows builds are). Sizes are padded to a
   multiple of 4 pixels.
@@ -296,8 +304,9 @@ Asset Manager is fetched again. A file copied into `assets\` by hand, under
 its Asset Manager name and with the right size, is used without
 downloading — big shows can be pre-loaded from a disk. Names Windows cannot
 store are cleaned (`?` → `_`, `CON` → `_CON`); two assets that end up with
-the same name get a `~tag` suffix. Files from older versions
-(`<id>-<size>.<ext>`) are no longer used and can be deleted.
+the same name (in any letter case) get a `~tag` suffix. Files from older
+versions (`<id>-<size>.<ext>`), old versions that were still open when
+replaced, and downloads cut short a day or more ago are deleted at start-up.
 
 To put it elsewhere (a separate media drive, for instance), in order of
 priority:

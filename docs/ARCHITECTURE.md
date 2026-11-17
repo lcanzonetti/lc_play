@@ -416,9 +416,11 @@ disk; until the file has arrived the cue shows a placeholder. An index in the
 cache (`.lcplay-index.json`: asset id → URL, size, file) says which version
 each file is, so a new version at the same name is fetched again; the
 renderer's content key includes the file's size and modification time, so
-what was loaded from the old version is reloaded. If Windows will not
-replace a file that is still open, the new version goes beside it under a
-`~tag` name.
+what was loaded from the old version is reloaded. While a new version
+downloads, the cache answers with the newest version it has of the same
+asset, so cues do not go blank. If Windows will not replace a file that is
+still open, the new version goes beside it under a `~tag` name, and the old
+one is listed (`.lcplay-superseded.json`) and deleted later.
 
 Asset ids are derived from the file name, **not** from the content. When a
 file is replaced under the same name, or its optimised copy is (re)made, an
@@ -440,7 +442,9 @@ background job at a time: HAP → re-chunk goes through `lc_hap::rechunk`
 block boundaries, Snappy per chunk where it helps, write a new QuickTime
 file with the same timing); everything else through ffmpeg's HAP encoder
 (`-c:v hap -format … -chunks N -compressor snappy|none`), padded to a
-multiple of 4. Output is written hidden and renamed when complete. The
+multiple of 4; its messages are read as they come, and a run with no
+progress report for 5 minutes is stopped. HAP sources are recognised by
+their codec tag (ffprobe names no codec for HAP R). Output is written hidden and renamed when complete. The
 manifest (`.lcplay/optimized.json`) records per source path the version it
 was made from (size, mtime), the rule, the output and failures, so nothing
 is redone or retried in a loop; a re-optimise marks the record stale and the

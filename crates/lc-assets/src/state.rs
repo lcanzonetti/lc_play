@@ -38,9 +38,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config, library: Arc<Library>) -> Self {
+    pub fn new(
+        config: Config,
+        library: Arc<Library>,
+        optimizer: Arc<crate::optimize::Optimizer>,
+    ) -> Self {
         let slots = Arc::new(Semaphore::new(config.max_transcodes));
-        let optimizer = crate::optimize::Optimizer::new(&config.media_dir, &config.ffmpeg);
         AppState {
             config: Arc::new(config),
             library,

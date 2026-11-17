@@ -958,9 +958,13 @@ function reconcileAssets() {
     .map((a) => [a, S.library.find((i) => i.id === a.id)])
     .filter(([a, item]) => item && facts(assetFacts(item)) !== facts(a));
   if (!stale.length) return;
-  edit(() => {
-    for (const [a, item] of stale) Object.assign(a, assetFacts(item));
-  });
+  // Not an undo step: it is the Asset Manager's change, not the user's —
+  // undoing it would point Runners back at a file that is gone, and
+  // recording it would wipe the user's redo history every time a file is
+  // optimised. Undo steps hold operations, so the user's own steps still
+  // undo correctly around it.
+  for (const [a, item] of stale) Object.assign(a, assetFacts(item));
+  afterChange(false);
   toast(`${stale.map(([a]) => a.name).join(', ')}: new version on the Asset Manager — show updated.`, true);
 }
 

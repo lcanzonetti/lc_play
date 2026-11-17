@@ -35,8 +35,69 @@ use tokio::process::Command;
 use crate::library::{MediaItem, MediaKind};
 use crate::state::AppState;
 
-/// Folder of the optimised files, in the media folder.
+/// Folder of the optimised files, in the media folder — unless the media
+/// folder already had an `Optimized` folder of its own (see
+/// [`choose_output_dir`]).
 pub const OPTIMIZED_DIR: &str = "Optimized";
+/// The name used when `Optimized` is already taken by the user's media.
+pub const OPTIMIZED_DIR_ALT: &str = "Optimized (LC Play)";
+
+/// The output folder this Asset Manager uses, chosen once at start-up (the
+/// library scan must leave it out from the first scan on).
+static OUTPUT_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The name of the folder optimised files go in.
+pub fn output_dir_name() -> &'static str {
+    OUTPUT_DIR.get().map_or(OPTIMIZED_DIR, String::as_str)
+}
+
+/// Pick the output folder: `Optimized`, unless the media folder already has
+/// a top-level folder of that name (in any letter case — Windows does not
+/// tell them apart) holding the user's own media from before LC Play made
+/// one. The choice is stored, so it never changes afterwards.
+fn choose_output_dir(media_dir: &Path) -> String {
+    let stored = media_dir.join(OWN_DIR).join("output-dir");
+    if let Ok(name) = std::fs::read_to_string(&stored) {
+        let name = name.trim();
+        if name == OPTIMIZED_DIR || name == OPTIMIZED_DIR_ALT {
+            return name.to_string();
+        }
+    }
+    let users_own = std::fs::read_dir(media_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(OPTIMIZED_DIR)
+                && std::fs::read_dir(e.path()).is_ok_and(|mut d| d.next().is_some())
+        });
+    // A manifest means the folder is ours (made before this choice was
+    // stored).
+    let ours = media_dir.join(OWN_DIR).join("optimized.json").exists();
+    let name = if users_own && !ours {
+        tracing::warn!(
+            "the media folder already has an '{OPTIMIZED_DIR}' folder: optimised files go in \
+             '{OPTIMIZED_DIR_ALT}' instead"
+        );
+        OPTIMIZED_DIR_ALT
+    } else {
+        OPTIMIZED_DIR
+    };
+    if let Err(e) = std::fs::create_dir_all(media_dir.join(OWN_DIR))
+        .and_then(|()| std::fs::write(&stored, name))
+    {
+        tracing::warn!("cannot store the optimisation folder name: {e}");
+    }
+    name.to_string()
+}
+
+/// A source that changed this recently may still be being copied in: wait.
+const SETTLE: Duration = Duration::from_secs(10);
+/// ffmpeg reports progress twice a second: this long without a report and
+/// it is taken as hung, and stopped.
+const STALL: Duration = Duration::from_secs(300);
 /// Folder of the Asset Manager's own files (settings, manifest).
 pub const OWN_DIR: &str = ".lcplay";
 
@@ -74,8 +135,18 @@ impl Source {
         Source::Other,
     ];
 
-    /// From ffprobe's codec name, codec tag and pixel format.
+    /// From ffprobe's codec name, codec tag and pixel format. The HAP tags
+    /// come first: ffprobe gives no codec name for variants its decoder does
+    /// not know (HAP R, `Hap7`).
     pub fn classify(codec: &str, tag: &str, pix_fmt: &str) -> Source {
+        match tag {
+            "Hap1" => return Source::Hap,
+            "Hap5" | "HapA" => return Source::HapAlpha,
+            "HapY" => return Source::HapQ,
+            "Hap7" => return Source::HapR,
+            "HapM" => return Source::HapQAlpha,
+            _ => {}
+        }
         match codec {
             "h264" => Source::H264,
             "hevc" => Source::Hevc,
@@ -204,7 +275,7 @@ pub struct Record {
     pub output: Option<String>,
     pub output_size: u64,
     pub error: Option<String>,
-    /// When the output was made (seconds since 1970): part of its URL, so a
+    /// When the output was made (milliseconds since 1970): part of its URL, so a
     /// re-optimised file is a new version to Runners even at the same size.
     #[serde(default)]
     pub made: u64,
@@ -223,6 +294,11 @@ pub struct Optimizer {
     manifest: Mutex<BTreeMap<String, Record>>,
     /// Item path → progress in ‰, while its job runs.
     running: Mutex<HashMap<String, Arc<AtomicU32>>>,
+    /// Item path → (size, when first seen at that size): a file is
+    /// optimised once its size has stood still for [`SETTLE`].
+    seen: Mutex<HashMap<String, (u64, std::time::Instant)>>,
+    /// The output folder (see [`choose_output_dir`]).
+    out_dir: String,
 }
 
 /// An item's optimisation, as the library listing reports it.
@@ -254,8 +330,12 @@ impl Optimizer {
         let own = media_dir.join(OWN_DIR);
         let mut settings: Settings = read_json(&own.join("optimize.json")).unwrap_or_default();
         settings.sanitize();
+        let out_dir = choose_output_dir(media_dir);
+        let _ = OUTPUT_DIR.set(out_dir.clone());
         let manifest = read_json(&own.join("optimized.json")).unwrap_or_default();
         Arc::new(Optimizer {
+            seen: Mutex::new(HashMap::new()),
+            out_dir,
             media_dir: media_dir.to_path_buf(),
             ffmpeg: ffmpeg.to_string(),
             settings: Mutex::new(settings),
@@ -398,11 +478,65 @@ impl Optimizer {
         }
     }
 
-    /// Where the optimised version of `path` goes.
-    fn output_path(path: &str) -> String {
-        let p = Path::new(path).with_extension("mov");
-        format!("{OPTIMIZED_DIR}/{}", p.to_string_lossy().replace('\\', "/"))
+    /// Where the optimised version of `path` goes: the same path under the
+    /// output folder, with `.mov` — and, if another file already owns that
+    /// name (`clip.mp4` and `clip.mov` side by side; or names differing only
+    /// in letter case, one file on Windows), a tag from the source path.
+    fn output_for(&self, path: &str) -> String {
+        let base = output_path(&self.out_dir, path);
+        let taken = self.manifest.lock().unwrap().iter().any(|(other, r)| {
+            other != path
+                && r.output
+                    .as_deref()
+                    .is_some_and(|o| o.to_lowercase() == base.to_lowercase())
+        });
+        if taken {
+            let stem = base.strip_suffix(".mov").unwrap_or(&base);
+            format!("{stem}~{:08x}.mov", fnv1a(path))
+        } else {
+            base
+        }
     }
+
+    /// Drop the records (and outputs) of sources that are gone — deleted
+    /// outside the Asset Manager, e.g. in Explorer.
+    fn prune(&self, library: &crate::library::Library) {
+        let gone: Vec<String> = self
+            .manifest
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|p| library.get_by_path(p).is_none() && !self.media_dir.join(p).exists())
+            .cloned()
+            .collect();
+        for path in gone {
+            tracing::info!("'{path}' is gone: removing its optimised version");
+            self.forget(&path);
+        }
+    }
+
+    /// `true` once `item`'s size has not changed for [`SETTLE`].
+    fn settled(&self, item: &MediaItem) -> bool {
+        let mut seen = self.seen.lock().unwrap();
+        let now = std::time::Instant::now();
+        let entry = seen.entry(item.path.clone()).or_insert((item.size, now));
+        if entry.0 != item.size {
+            *entry = (item.size, now);
+        }
+        now.duration_since(entry.1) >= SETTLE
+    }
+}
+
+/// `<output folder>/<path with .mov>`.
+fn output_path(out_dir: &str, path: &str) -> String {
+    let p = Path::new(path).with_extension("mov");
+    format!("{out_dir}/{}", p.to_string_lossy().replace('\\', "/"))
+}
+
+fn fnv1a(s: &str) -> u32 {
+    s.bytes().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ b as u32).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// Watch the library and optimise what needs it, one file at a time.
@@ -420,11 +554,12 @@ pub fn spawn(state: AppState) {
 /// Optimise the next file that needs it, if any (and wait for it).
 async fn step(state: &AppState) -> anyhow::Result<()> {
     let opt = state.optimizer.clone();
+    opt.prune(&state.library);
     if !opt.settings.lock().unwrap().enabled {
         return Ok(());
     }
     for item in state.library.list() {
-        if item.kind != MediaKind::Video {
+        if item.kind != MediaKind::Video || !opt.settled(&item) {
             continue;
         }
         let mtime = mtime_of(&item.abs_path).await;
@@ -482,7 +617,7 @@ async fn run_job(
             .lock()
             .unwrap()
             .insert(item.path.clone(), progress.clone());
-        let out_rel = Optimizer::output_path(&item.path);
+        let out_rel = opt.output_for(&item.path);
         let out = opt.media_dir.join(&out_rel);
         let tmp = out.with_file_name(format!(
             ".{}.part.mov",
@@ -506,7 +641,7 @@ async fn run_job(
                 record.output_size = size;
                 record.made = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
+                    .map_or(0, |d| d.as_millis() as u64);
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -514,6 +649,18 @@ async fn run_job(
                 record.error = Some(format!("{e:#}"));
             }
         }
+    }
+    // Deleted (or replaced) while the job ran: the result is of no use.
+    let current = tokio::fs::metadata(&item.abs_path).await.ok();
+    if current.is_none_or(|m| m.len() != item.size) || mtime_of(&item.abs_path).await != mtime {
+        if let Some(out) = &record.output {
+            let _ = std::fs::remove_file(opt.media_dir.join(out));
+        }
+        tracing::info!(
+            "'{}' changed while it was optimised: will be redone",
+            item.path
+        );
+        return;
     }
     // An older output of this file (other rule) is not needed any more.
     let previous = opt
@@ -577,9 +724,38 @@ async fn make(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    // Read ffmpeg's messages as they come, keeping the last few KB for the
+    // error report: unread, a damaged source that logs an error per frame
+    // fills the pipe and ffmpeg (and with it every job) stops.
+    let stderr = child.stderr.take();
+    let messages = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut kept = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = stderr.read(&mut buf).await {
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > 8192 {
+                    kept.drain(..kept.len() - 8192);
+                }
+            }
+        }
+        String::from_utf8_lossy(&kept).trim().to_string()
+    });
     if let Some(stdout) = child.stdout.take() {
         let mut lines = tokio::io::BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            let line = match tokio::time::timeout(STALL, lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(_) => break,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    anyhow::bail!(
+                        "ffmpeg made no progress for {} minutes and was stopped",
+                        STALL.as_secs() / 60
+                    );
+                }
+            };
             if let Some(us) = line
                 .strip_prefix("out_time_us=")
                 .and_then(|v| v.parse::<f64>().ok())
@@ -593,12 +769,9 @@ async fn make(
             }
         }
     }
-    let out = child.wait_with_output().await?;
-    anyhow::ensure!(
-        out.status.success(),
-        "ffmpeg: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    let status = child.wait().await?;
+    let messages = messages.await.unwrap_or_default();
+    anyhow::ensure!(status.success(), "ffmpeg: {messages}");
     Ok(())
 }
 
@@ -715,6 +888,8 @@ mod tests {
         );
         assert_eq!(Source::classify("hap", "HapY", ""), Source::HapQ);
         assert_eq!(Source::classify("hap", "HapM", ""), Source::HapQAlpha);
+        // ffprobe gives no codec name for HAP R.
+        assert_eq!(Source::classify("", "Hap7", ""), Source::HapR);
         assert_eq!(Source::classify("vp9", "", ""), Source::Other);
     }
 
@@ -762,9 +937,65 @@ mod tests {
     #[test]
     fn optimised_files_keep_their_names_under_optimized() {
         assert_eq!(
-            Optimizer::output_path("Show A/intro.mp4"),
+            output_path("Optimized", "Show A/intro.mp4"),
             "Optimized/Show A/intro.mov"
         );
-        assert_eq!(Optimizer::output_path("clip.mov"), "Optimized/clip.mov");
+        assert_eq!(output_path("Optimized", "clip.mov"), "Optimized/clip.mov");
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lcplay-opt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn two_sources_with_one_stem_get_two_outputs() {
+        let dir = scratch("stem");
+        let opt = Optimizer::new(&dir, "ffmpeg");
+        let record = |output: &str| Record {
+            size: 1,
+            mtime: 1,
+            source: Source::H264,
+            rule: Settings::default().rule(Source::H264),
+            output: Some(output.into()),
+            output_size: 1,
+            error: None,
+            made: 1,
+            stale: false,
+        };
+        opt.manifest
+            .lock()
+            .unwrap()
+            .insert("clip.mp4".into(), record("Optimized/clip.mov"));
+        // Its own output stays its own…
+        assert_eq!(opt.output_for("clip.mp4"), "Optimized/clip.mov");
+        // …and another source gets another name, in any letter case.
+        let other = opt.output_for("clip.mov");
+        assert!(
+            other.starts_with("Optimized/clip~") && other.ends_with(".mov"),
+            "{other}"
+        );
+        assert_ne!(
+            opt.output_for("CLIP.mov").to_lowercase(),
+            "optimized/clip.mov"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_users_own_optimized_folder_is_left_alone() {
+        let dir = scratch("own");
+        std::fs::create_dir_all(dir.join("optimized")).unwrap();
+        std::fs::write(dir.join("optimized/mine.mp4"), b"x").unwrap();
+        assert_eq!(choose_output_dir(&dir), OPTIMIZED_DIR_ALT);
+        // The choice sticks.
+        std::fs::remove_dir_all(dir.join("optimized")).unwrap();
+        assert_eq!(choose_output_dir(&dir), OPTIMIZED_DIR_ALT);
+
+        let dir = scratch("fresh");
+        assert_eq!(choose_output_dir(&dir), OPTIMIZED_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

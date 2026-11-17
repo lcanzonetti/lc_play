@@ -35,6 +35,9 @@ use serde::{Deserialize, Serialize};
 
 /// The version index, in the cache folder.
 const INDEX_FILE: &str = ".lcplay-index.json";
+/// Old versions that could not be deleted when replaced (still open, on
+/// Windows): deleted at the next start, or after the next download.
+const SUPERSEDED_FILE: &str = ".lcplay-superseded.json";
 
 /// What the index records about one asset's file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +66,11 @@ pub struct AssetCache {
     index_lock: Mutex<()>,
     /// Asset version (see [`version_key`]) → what we know about it.
     entries: Mutex<HashMap<String, Entry>>,
+    /// Asset id → the newest version on disk. Played while a newer one
+    /// downloads, so a re-optimised or replaced file does not turn its cues
+    /// into placeholders for the length of a download. Locked after
+    /// `entries`.
+    current: Mutex<HashMap<String, PathBuf>>,
     /// Incremented whenever an asset becomes available (or should be asked
     /// for again), so the renderer knows to look again.
     generation: AtomicU64,
@@ -86,8 +94,13 @@ struct Progress {
 
 enum Entry {
     Ready(PathBuf),
-    /// A download thread is on it (or waiting to retry).
-    Pending,
+    /// A download thread is on it (or waiting to retry), for asset `id`,
+    /// into `target` (relative to the cache folder): a name no other asset
+    /// may take meanwhile.
+    Pending {
+        id: String,
+        target: String,
+    },
 }
 
 impl AssetCache {
@@ -95,14 +108,91 @@ impl AssetCache {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             tracing::error!("cannot create asset cache {}: {e}", dir.display());
         }
-        Arc::new(AssetCache {
+        let cache = Arc::new(AssetCache {
             dir,
             index_lock: Mutex::new(()),
             entries: Mutex::new(HashMap::new()),
+            current: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
             failures: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
-        })
+        });
+        cache.clean_up();
+        cache
+    }
+
+    /// Remove what earlier runs left behind: superseded versions, files
+    /// named the old way (`<id>-<size>.<ext>`, before readable names) that
+    /// the index does not know, and downloads cut short a day or more ago.
+    /// Never a file the index knows, and never one copied in by hand.
+    fn clean_up(&self) {
+        self.delete_superseded(None);
+        let index = self.read_index();
+        let known: std::collections::HashSet<String> =
+            index.values().map(|e| e.file.to_lowercase()).collect();
+        let Ok(top) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in top.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|t| t.is_file())
+                && old_style_name(&name)
+                && !known.contains(&name.to_lowercase())
+            {
+                tracing::info!("removing '{name}' (cache file of an older version)");
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let day = Duration::from_secs(24 * 3600);
+        for path in walk(&self.dir) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let old = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day));
+            if name.starts_with('.') && name.ends_with(".part") && old {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// Delete the superseded versions that can be deleted now, adding
+    /// `also` to the list first; keep the others listed.
+    fn delete_superseded(&self, also: Option<String>) {
+        let _guard = self.index_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let list_path = self.dir.join(SUPERSEDED_FILE);
+        let mut list: Vec<String> = std::fs::read(&list_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        list.extend(also);
+        if list.is_empty() {
+            return;
+        }
+        let index = self.read_index();
+        list.retain(|file| {
+            // Taken over by an asset since (a name re-used): not ours to delete.
+            if index.values().any(|e| e.file.eq_ignore_ascii_case(file)) {
+                return false;
+            }
+            let path = self.dir.join(file);
+            path.exists() && std::fs::remove_file(&path).is_err()
+        });
+        let written = if list.is_empty() {
+            std::fs::remove_file(&list_path).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+        } else {
+            serde_json::to_vec(&list)
+                .map_err(std::io::Error::other)
+                .and_then(|json| std::fs::write(&list_path, json))
+        };
+        if let Err(e) = written {
+            tracing::warn!("cannot update the list of old asset versions: {e}");
+        }
     }
 
     /// Downloads in progress or waiting to retry, for the health report.
@@ -135,13 +225,20 @@ impl AssetCache {
     }
 
     /// Local path of `asset`, if it is in the cache. If it is not, a
-    /// download is started (once) and `None` is returned.
+    /// download is started (once) and `None` is returned — or, if an older
+    /// version of the same asset is here, that one, until the new one has
+    /// arrived.
     pub fn local_path(self: &Arc<Self>, asset: &Asset) -> Option<PathBuf> {
         let key = version_key(asset);
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         match entries.get(&key) {
-            Some(Entry::Ready(path)) => return Some(path.clone()),
-            Some(Entry::Pending) => return None,
+            // Still there? (A file can be removed under us: replaced by a
+            // newer version, or by hand.)
+            Some(Entry::Ready(path)) if path.is_file() => return Some(path.clone()),
+            Some(Entry::Ready(_)) => {
+                entries.remove(&key);
+            }
+            Some(Entry::Pending { .. }) => return self.older_version(&asset.id),
             None => {}
         }
 
@@ -154,12 +251,18 @@ impl AssetCache {
             on_disk.is_some() && (asset.size == 0 || on_disk == Some(asset.size))
         };
         let preferred = local_name(asset);
-        // Another asset already has that name (two names the file system
-        // cannot tell apart): this one gets a suffix.
+        // Another asset already has that name — on disk, or being
+        // downloaded to it — in any letter case (one file on Windows): this
+        // one gets a suffix.
         let claimed = |file: &str| {
+            let file = file.to_lowercase();
             index
                 .iter()
-                .any(|(id, e)| *id != asset.id && e.file == file)
+                .any(|(id, e)| *id != asset.id && e.file.to_lowercase() == file)
+                || entries.values().any(|e| {
+                    matches!(e, Entry::Pending { id, target }
+                        if *id != asset.id && target.to_lowercase() == file)
+                })
         };
         let target = if claimed(&preferred) {
             with_suffix(&preferred, &short_hash(&asset.id))
@@ -183,23 +286,46 @@ impl AssetCache {
         if let Some(file) = known {
             let path = self.dir.join(file);
             entries.insert(key, Entry::Ready(path.clone()));
+            self.lock_current().insert(asset.id.clone(), path.clone());
             return Some(path);
         }
+        // An older version on disk (from an earlier run): played meanwhile.
+        if let Some(e) = index.get(&asset.id) {
+            let path = self.dir.join(&e.file);
+            if path.is_file() {
+                self.lock_current().entry(asset.id.clone()).or_insert(path);
+            }
+        }
 
-        entries.insert(key.clone(), Entry::Pending);
-        let (cache, asset, thread_key) = (self.clone(), asset.clone(), key.clone());
+        entries.insert(
+            key.clone(),
+            Entry::Pending {
+                id: asset.id.clone(),
+                target: target.clone(),
+            },
+        );
+        let (cache, owned, thread_key) = (self.clone(), asset.clone(), key.clone());
         let spawned = std::thread::Builder::new()
             .name("lc-asset".into())
             .spawn(move || {
                 crate::priority::background_thread();
-                cache.fetch(&asset, &thread_key, &target)
+                cache.fetch(&owned, &thread_key, &target)
             });
         if let Err(e) = spawned {
             // Not `Pending` forever: the next request tries again.
             tracing::error!("cannot start a download thread: {e}");
             entries.remove(&key);
         }
-        None
+        self.older_version(&asset.id)
+    }
+
+    fn lock_current(&self) -> std::sync::MutexGuard<'_, HashMap<String, PathBuf>> {
+        self.current.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The newest version of asset `id` on disk, if any.
+    fn older_version(&self, id: &str) -> Option<PathBuf> {
+        self.lock_current().get(id).filter(|p| p.is_file()).cloned()
     }
 
     fn read_index(&self) -> Index {
@@ -275,12 +401,33 @@ impl AssetCache {
             Ok(file) => {
                 tracing::info!("asset '{}' ready as {file}", asset.name);
                 self.record(asset, &file);
-                // The version it replaces is not needed any more (if it is
-                // still open, it stays until the next replacement).
-                if let Some(old) = previous.filter(|old| *old != file) {
-                    let _ = std::fs::remove_file(self.dir.join(old));
+                let path = self.dir.join(&file);
+                // The version it replaces is not needed any more. Whatever
+                // still points at it is forgotten; if it is still open
+                // (Windows), it is listed and deleted later.
+                let old = previous.filter(|old| *old != file).or_else(|| {
+                    // Played meanwhile from another name (an earlier
+                    // fallback beside an open file).
+                    self.lock_current()
+                        .get(&asset.id)
+                        .filter(|p| **p != path)
+                        .and_then(|p| p.strip_prefix(&self.dir).ok())
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                });
+                if let Some(old) = old {
+                    let old_path = self.dir.join(&old);
+                    entries.retain(|_, e| !matches!(e, Entry::Ready(p) if *p == old_path));
+                    if std::fs::remove_file(&old_path).is_err() && old_path.exists() {
+                        self.delete_superseded(Some(old));
+                    } else {
+                        self.delete_superseded(None);
+                    }
                 }
-                entries.insert(name.to_string(), Entry::Ready(self.dir.join(&file)));
+                // Other versions recorded at this very path now have this
+                // content: forget them, so none is taken for this one.
+                entries.retain(|_, e| !matches!(e, Entry::Ready(p) if *p == path));
+                entries.insert(name.to_string(), Entry::Ready(path.clone()));
+                self.lock_current().insert(asset.id.clone(), path);
                 self.progress
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -334,6 +481,37 @@ impl AssetCache {
         }
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// `<hex id>-<size>[.<ext>]`: how files were named before readable names.
+fn old_style_name(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(s, _)| s);
+    let Some((id, size)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    id.len() >= 2
+        && id.len() % 2 == 0
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !size.is_empty()
+        && size.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Every file under `dir`, recursively.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(entry.path()),
+                Ok(t) if t.is_file() => files.push(entry.path()),
+                _ => {}
+            }
+        }
+    }
+    files
 }
 
 /// Identifies one version of an asset: the same file at another URL (e.g.
@@ -525,6 +703,16 @@ mod tests {
     }
 
     #[test]
+    fn old_style_cache_files_are_recognised() {
+        assert!(old_style_name("636c6970-594087.mp4"));
+        assert!(old_style_name("abcd-1"));
+        assert!(!old_style_name("intro.mov"));
+        assert!(!old_style_name("show-2024.mov"));
+        assert!(!old_style_name("ABCD-12.mov"));
+        assert!(!old_style_name("abc-12.mov"), "odd length: not a hex id");
+    }
+
+    #[test]
     fn local_names_are_the_asset_managers_and_safe() {
         assert_eq!(
             local_name(&asset("a", "Optimized/Show A/intro.mov", 1)),
@@ -609,6 +797,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn pending(cache: &AssetCache, asset: &Asset) -> bool {
+        matches!(
+            cache.entries.lock().unwrap().get(&version_key(asset)),
+            Some(Entry::Pending { .. })
+        )
+    }
+
     #[test]
     fn a_file_already_on_disk_is_used_without_downloading() {
         let dir = std::env::temp_dir().join(format!("lcplay-assets-test-{}", std::process::id()));
@@ -625,12 +820,14 @@ mod tests {
         assert_eq!(cache.local_path(&asset), Some(dir.join("Show/a.png")));
         assert_eq!(cache.read_index()["id1"].file, "Show/a.png");
 
-        // Same id, different size: not this file.
+        // Same id, different size: not this file — a download starts (and
+        // the version that is here plays meanwhile).
         let changed = Asset {
             size: 4,
             ..asset.clone()
         };
-        assert_eq!(cache.local_path(&changed), None);
+        assert_eq!(cache.local_path(&changed), Some(dir.join("Show/a.png")));
+        assert!(pending(&cache, &changed));
         // Same size, another URL (re-optimised): not this file either, now
         // that the index knows which version it is.
         let fresh = AssetCache::new(dir.clone());
@@ -638,7 +835,8 @@ mod tests {
             url: "http://127.0.0.1:1/none?v=2".into(),
             ..asset.clone()
         };
-        assert_eq!(fresh.local_path(&moved), None);
+        assert_eq!(fresh.local_path(&moved), Some(dir.join("Show/a.png")));
+        assert!(pending(&fresh, &moved));
         // While the known version still is.
         let fresh = AssetCache::new(dir.clone());
         assert_eq!(fresh.local_path(&asset), Some(dir.join("Show/a.png")));
@@ -677,10 +875,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lcplay-assets-names-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = AssetCache::new(dir.clone());
+        // Until this very version is here (not an older one played
+        // meanwhile).
         let wait = |a: &Asset| {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(p) = cache.local_path(a) {
+                let p = cache.local_path(a);
+                if let (Some(p), false) = (p, pending(&cache, a)) {
                     return p;
                 }
                 assert!(Instant::now() < deadline, "download never finished");
@@ -697,6 +898,9 @@ mod tests {
             url: url("bbbb"),
             ..asset("B", "x*.mov", 4)
         };
+        // Asked for together: B must not take A's name while A downloads.
+        assert_eq!(cache.local_path(&a), None);
+        assert_eq!(cache.local_path(&b), None);
         let pa = wait(&a);
         let pb = wait(&b);
         assert_eq!(pa, dir.join("x_.mov"));
@@ -709,9 +913,19 @@ mod tests {
             size: 5,
             ..a.clone()
         };
+        // While it downloads, the old version keeps playing.
+        assert_eq!(cache.local_path(&a2), Some(dir.join("x_.mov")));
         assert_eq!(wait(&a2), dir.join("x_.mov"));
         assert_eq!(std::fs::read(dir.join("x_.mov")).unwrap(), b"aaaaa");
         assert_eq!(cache.read_index()["A"].size, 5);
+        // The old version's entry went with its file: it is not taken for
+        // the new content now under that name.
+        assert!(cache
+            .entries
+            .lock()
+            .unwrap()
+            .get(&version_key(&a))
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

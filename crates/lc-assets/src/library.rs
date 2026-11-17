@@ -126,13 +126,14 @@ impl Library {
             // file is a property of its original.
             .filter_entry(|e| {
                 e.depth() != 1
+                    // Any letter case: one folder on Windows.
                     || ![
                         crate::handlers::proxy::PROXY_DIR,
-                        crate::optimize::OPTIMIZED_DIR,
+                        crate::optimize::output_dir_name(),
                         crate::optimize::OWN_DIR,
                     ]
                     .iter()
-                    .any(|d| e.file_name() == *d)
+                    .any(|d| e.file_name().to_string_lossy().eq_ignore_ascii_case(d))
             })
             .filter_map(|e| e.ok())
         {
