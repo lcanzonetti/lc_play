@@ -37,6 +37,10 @@
 //!        └──── mapped again once the GPU has copied it ◀──────┘
 //! ```
 //!
+//! The buffers are made by the workers, one at a time as they need them
+//! (up to [`SLOTS`]): wgpu fills a new mapped buffer with zeros, 4–11 MB
+//! each, which took 100–200 ms for eight 10K buffers on the render thread.
+//!
 //! Workers write into a buffer only after unpacking into ordinary memory:
 //! upload memory is write-combined, fast to write in order and very slow to
 //! read, and Snappy reads back what it has written. Rows are padded to the
@@ -212,6 +216,12 @@ struct Sched {
     ready: BTreeMap<i64, (usize, Mapped)>,
     /// Upload buffers that are mapped and free to fill.
     free: Vec<(usize, Mapped)>,
+    /// Upload buffers made so far (slots `0..created`), up to [`SLOTS`].
+    created: usize,
+    /// Buffers a worker has made, for the renderer to keep: (slot, buffer).
+    /// Taken in the same lock as a ready frame, so a frame's buffer is
+    /// always known to the renderer by the time it takes the frame.
+    made: Vec<(usize, wgpu::Buffer)>,
     /// Frames a worker is busy with.
     busy: HashSet<i64>,
     /// Frames that failed to decode (reported once, not retried).
@@ -233,8 +243,9 @@ pub struct HapContent {
     sampling: Sampling,
     shared: Arc<Shared>,
     workers: Vec<std::thread::JoinHandle<()>>,
-    /// The upload buffers while playing (empty when idle), by slot.
-    uploads: Vec<wgpu::Buffer>,
+    /// The upload buffers while playing (empty when idle), by slot; made by
+    /// the workers.
+    uploads: Vec<Option<wgpu::Buffer>>,
     /// Bumped whenever `uploads` is made anew: a map callback of an older
     /// buffer must not be taken for one of the new ones.
     generation: u64,
@@ -296,6 +307,8 @@ impl HapContent {
                     wanted: Vec::new(),
                     ready: BTreeMap::new(),
                     free: Vec::new(),
+                    created: 0,
+                    made: Vec::new(),
                     busy: HashSet::new(),
                     failed: HashSet::new(),
                     stop: false,
@@ -313,35 +326,20 @@ impl HapContent {
         }
     }
 
-    /// Start the decoding workers, with their upload buffers (both go again
-    /// in `idle`).
+    /// Start the decoding workers; they make the upload buffers as they
+    /// need them (both go again in `idle`).
     fn start_workers(&mut self, gpu: &TextureFactory) {
         if !self.workers.is_empty() {
             return;
         }
         let pitch = upload_pitch(self.format, self.track.width);
-        let size = pitch as u64 * self.track.height.div_ceil(4) as u64;
+        let uploads = Uploads {
+            device: gpu.device.clone(),
+            size: pitch as u64 * self.track.height.div_ceil(4) as u64,
+            pitch,
+        };
         self.generation += 1;
-        self.uploads = (0..SLOTS)
-            .map(|_| {
-                gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("hap-upload"),
-                    size,
-                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: true,
-                })
-            })
-            .collect();
-        {
-            let mut st = self.shared.state.lock().unwrap();
-            st.stop = false;
-            st.free = self
-                .uploads
-                .iter()
-                .enumerate()
-                .map(|(slot, buffer)| (slot, Mapped::of(buffer)))
-                .collect();
-        }
+        self.shared.state.lock().unwrap().stop = false;
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         // Two frame-level workers keep the pipeline full; each also unpacks
         // the chunks of its frame in parallel.
@@ -350,17 +348,18 @@ impl HapContent {
         let workers = 2.min(cores);
         let chunk_threads = (cores / workers).clamp(1, 8);
         for _ in 0..workers {
-            let (shared, track, path, format) = (
+            let (shared, track, path, format, uploads) = (
                 self.shared.clone(),
                 self.track.clone(),
                 self.path.clone(),
                 self.format,
+                uploads.clone(),
             );
             let spawned = std::thread::Builder::new()
                 .name("lc-hap".into())
                 .spawn(move || {
                     crate::priority::background_thread();
-                    worker(shared, track, path, format, chunk_threads, pitch)
+                    worker(shared, track, path, format, chunk_threads, uploads)
                 });
             match spawned {
                 Ok(handle) => self.workers.push(handle),
@@ -386,6 +385,8 @@ impl HapContent {
             let mut st = self.shared.state.lock().unwrap();
             st.ready.clear();
             st.free.clear();
+            st.made.clear();
+            st.created = 0;
         }
         self.uploads.clear();
         self.in_flight.clear();
@@ -406,6 +407,8 @@ impl HapContent {
             // Completes once the GPU has finished with the buffer; the
             // callback runs in a later submit or poll on this thread.
             uploads[slot]
+                .as_ref()
+                .expect("a recorded buffer is known")
                 .slice(..)
                 .map_async(wgpu::MapMode::Write, move |result| {
                     if result.is_ok() {
@@ -424,7 +427,10 @@ impl HapContent {
         }
         let mut st = self.shared.state.lock().unwrap();
         for slot in ready {
-            st.free.push((slot, Mapped::of(&self.uploads[slot])));
+            let buffer = self.uploads[slot]
+                .as_ref()
+                .expect("a mapped buffer is known");
+            st.free.push((slot, Mapped::of(buffer)));
         }
         drop(st);
         self.shared.wake.notify_all();
@@ -473,13 +479,43 @@ fn prefetch_window(want: i64, step: i64, total: i64, first: i64, loops: bool) ->
     frames
 }
 
+/// What a worker needs to make upload buffers.
+#[derive(Clone)]
+struct Uploads {
+    device: wgpu::Device,
+    size: u64,
+    pitch: u32,
+}
+
+impl Uploads {
+    /// A new upload buffer, mapped. (wgpu fills it with zeros: the slow part,
+    /// kept off the render thread.)
+    fn make(&self) -> (wgpu::Buffer, Mapped) {
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hap-upload"),
+            size: self.size,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let mapped = Mapped::of(&buffer);
+        (buffer, mapped)
+    }
+}
+
+/// Where a worker puts the frame it took on.
+enum Slot {
+    Free(usize, Mapped),
+    /// None free, fewer than `SLOTS` made: make this one.
+    New(usize),
+}
+
 fn worker(
     shared: Arc<Shared>,
     track: Arc<VideoTrack>,
     path: String,
     format: HapFormat,
     chunk_threads: usize,
-    pitch: u32,
+    uploads: Uploads,
 ) {
     let mut file = match File::open(&path) {
         Ok(f) => f,
@@ -497,7 +533,7 @@ fn worker(
     loop {
         // Pick the soonest wanted frame nobody has or is working on, and an
         // upload buffer to put it in.
-        let (frame, (slot, mut mapped)) = {
+        let (frame, slot) = {
             let mut st = shared.state.lock().unwrap();
             loop {
                 if st.stop {
@@ -509,12 +545,26 @@ fn worker(
                 match next {
                     Some(f) if !st.free.is_empty() => {
                         st.busy.insert(f);
-                        break (f, st.free.pop().expect("not empty"));
+                        let (slot, mapped) = st.free.pop().expect("not empty");
+                        break (f, Slot::Free(slot, mapped));
+                    }
+                    Some(f) if st.created < SLOTS => {
+                        st.busy.insert(f);
+                        st.created += 1;
+                        break (f, Slot::New(st.created - 1));
                     }
                     // Nothing to do, or every buffer taken: wait for the
                     // renderer.
                     _ => st = shared.wake.wait(st).unwrap(),
                 }
+            }
+        };
+        let (slot, mut mapped) = match slot {
+            Slot::Free(slot, mapped) => (slot, mapped),
+            Slot::New(slot) => {
+                let (buffer, mapped) = uploads.make();
+                shared.state.lock().unwrap().made.push((slot, buffer));
+                (slot, mapped)
             }
         };
 
@@ -527,7 +577,7 @@ fn worker(
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut packet)?;
             decode_frame(&packet, format.section_type(), &mut texture, chunk_threads)?;
-            copy_rows(&texture, mapped.bytes(), row, pitch as usize);
+            copy_rows(&texture, mapped.bytes(), row, uploads.pitch as usize);
             Ok(())
         })();
 
@@ -587,6 +637,13 @@ impl Content for HapContent {
                 }
             }
             st.wanted = window;
+            // Buffers the workers have made; taken with any ready frame.
+            for (slot, buffer) in st.made.drain(..) {
+                if self.uploads.len() <= slot {
+                    self.uploads.resize(slot + 1, None);
+                }
+                self.uploads[slot] = Some(buffer);
+            }
             self.shared.wake.notify_all();
             if self.shown == Some(want) {
                 return;
@@ -603,7 +660,7 @@ impl Content for HapContent {
         let Some((index, slot, _mapped)) = frame else {
             return;
         };
-        let buffer = &self.uploads[slot];
+        let buffer = self.uploads[slot].as_ref().expect("taken with its frame");
         buffer.unmap();
         let (blocks_w, blocks_h) = (self.track.width.div_ceil(4), self.track.height.div_ceil(4));
         let pitch = upload_pitch(self.format, self.track.width);

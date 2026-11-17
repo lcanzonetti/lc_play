@@ -1632,12 +1632,15 @@ mod tests {
         let factory = gpu.factory();
         let mut c = content::build(&show.layers[0], &factory).unwrap();
         let mut times = Vec::new();
+        // Every update, including the one that starts the layer.
+        let mut slowest = std::time::Duration::ZERO;
         for frame in 0..120 {
             let t = frame as f64 / 25.0 + 0.001;
             loop {
                 let start = std::time::Instant::now();
                 c.update(t, &factory);
                 let took = start.elapsed();
+                slowest = slowest.max(took);
                 gpu.queue.submit(gpu.take_uploads());
                 if c.ready() && !c.late() {
                     times.push(took.as_secs_f64() * 1e3);
@@ -1649,10 +1652,12 @@ mod tests {
         times.sort_by(f64::total_cmp);
         let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
         println!(
-            "update delivering a frame: median {:.3} ms, p90 {:.3} ms, max {:.3} ms",
+            "update delivering a frame: median {:.3} ms, p90 {:.3} ms, max {:.3} ms; \
+             slowest update of all (start included) {:.3} ms",
             at(0.5),
             at(0.9),
-            at(1.0)
+            at(1.0),
+            slowest.as_secs_f64() * 1e3
         );
     }
 
