@@ -25,11 +25,17 @@ pub async fn stream_media(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
+    serve_file(&item.abs_path, item.mime.clone(), &headers).await
+}
 
-    let file = tokio::fs::File::open(&item.abs_path).await?;
+/// Serve a file, honouring `Range` (what lets players seek in it).
+pub(crate) async fn serve_file(
+    path: &std::path::Path,
+    content_type: String,
+    headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let file = tokio::fs::File::open(path).await?;
     let total = file.metadata().await?.len();
-
-    let content_type = item.mime.clone();
 
     match parse_range(headers.get(header::RANGE), total)? {
         // Whole file: 200 OK.

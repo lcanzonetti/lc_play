@@ -140,6 +140,12 @@ pub enum Command {
     WakeRunner {
         runner: String,
     },
+    /// Start the Runner program again on a computer where it was closed
+    /// (its supervisor keeps waiting for this). `runner` is its name or node
+    /// id.
+    StartRunner {
+        runner: String,
+    },
 }
 
 /// One output picture of a Runner, for the operator to see what is on it.

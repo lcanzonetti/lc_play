@@ -738,6 +738,54 @@ impl Core {
     }
 
     /// Send a Wake-on-LAN packet to a Runner's computer.
+    /// Ask the supervisor of a closed Runner to start it again: a UDP
+    /// message to the computer it last reported from (see
+    /// `lc_proto::StartRunner`).
+    fn start_runner(&self, runner: &str) -> Result<(), String> {
+        let st = self.state();
+        let matching: Vec<KnownRunner> = st
+            .known_runners
+            .values()
+            .filter(|k| k.name == runner || k.node_id.0 == runner)
+            .cloned()
+            .collect();
+        let online = |k: &KnownRunner| {
+            st.nodes
+                .values()
+                .any(|n| n.role == Role::Runner && n.node_id == k.node_id)
+        };
+        if matching.is_empty() {
+            return Err(format!("no runner called '{runner}' has ever connected"));
+        }
+        let targets: Vec<(NodeId, String)> = matching
+            .iter()
+            .filter(|k| !online(k))
+            .filter_map(|k| Some((k.node_id.clone(), k.machine.as_ref()?.ip.clone())))
+            .collect();
+        drop(st);
+        if targets.is_empty() {
+            return Err(format!(
+                "start '{runner}': it is running already, or its address is not known yet"
+            ));
+        }
+        let socket = std::net::UdpSocket::bind(("0.0.0.0", 0))
+            .map_err(|e| format!("start '{runner}': {e}"))?;
+        for (node_id, ip) in targets {
+            let msg = serde_json::to_vec(&lc_proto::StartRunner {
+                start_runner: node_id,
+            })
+            .expect("serialisable");
+            // Twice: it is UDP, and starting twice is harmless.
+            for _ in 0..2 {
+                socket
+                    .send_to(&msg, (ip.as_str(), lc_proto::LAUNCHER_PORT))
+                    .map_err(|e| format!("start '{runner}' at {ip}: {e}"))?;
+            }
+            tracing::info!("asked the supervisor at {ip} to start '{runner}'");
+        }
+        Ok(())
+    }
+
     fn wake_runner(&self, runner: &str) -> Result<(), String> {
         let st = self.state();
         // By name (every Runner of that name) or by node id.
@@ -814,6 +862,7 @@ impl Core {
             Command::EditShow { ops, tag } => return self.edit_show(&ops, tag),
             Command::RunnerAction { runner, action } => return self.runner_action(&runner, action),
             Command::WakeRunner { runner } => return self.wake_runner(&runner),
+            Command::StartRunner { runner } => return self.start_runner(&runner),
             // Answered by the connection that asked; nothing to change here.
             Command::Status => return Ok(()),
         };

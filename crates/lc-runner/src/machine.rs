@@ -202,6 +202,91 @@ pub fn power(reboot: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start this Runner when the user logs in, with the options it was given
+/// now (minus `--autostart`), or stop doing so.
+///
+/// Windows: the `LC Play Runner` value under
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Linux: an XDG
+/// autostart entry. Per user, no administrator rights needed.
+pub fn set_autostart(on: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let exe = std::env::current_exe().context("locating this program")?;
+    // The options of this invocation, without --autostart and its value.
+    let mut args = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--autostart" {
+            it.next();
+        } else if !a.starts_with("--autostart=") {
+            args.push(a);
+        }
+    }
+    let quote = |s: &str| {
+        if s.contains(' ') {
+            format!("\"{s}\"")
+        } else {
+            s.to_string()
+        }
+    };
+    let command_line = std::iter::once(format!("\"{}\"", exe.display()))
+        .chain(args.iter().map(|a| quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    #[cfg(windows)]
+    {
+        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let mut cmd = std::process::Command::new("reg");
+        if on {
+            cmd.args([
+                "add",
+                key,
+                "/v",
+                "LC Play Runner",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &command_line,
+                "/f",
+            ]);
+        } else {
+            cmd.args(["delete", key, "/v", "LC Play Runner", "/f"]);
+        }
+        let status = cmd.status().context("running reg.exe")?;
+        anyhow::ensure!(status.success() || !on, "reg.exe failed ({status})");
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")))
+            .context("no home folder")?
+            .join("autostart");
+        let file = dir.join("lc-play-runner.desktop");
+        if on {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                &file,
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=LC Play Runner\nExec={command_line}\n"
+                ),
+            )?;
+        } else {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+    println!(
+        "LC Play Runner {} start at login{}",
+        if on { "will" } else { "will no longer" },
+        if on {
+            format!(": {command_line}")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

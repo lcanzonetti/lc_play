@@ -71,7 +71,7 @@ enum Action {
         runner: String,
     },
     /// Act on a Runner (by name): restart, quit, standby, resume, reboot,
-    /// poweroff.
+    /// poweroff, start (start it again after it was closed).
     Runner {
         runner: String,
         action: String,
@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
             runner,
             action: lc_proto::RunnerAction::ReloadOutputs,
         },
+        Action::Runner { runner, action } if action == "start" => Command::StartRunner { runner },
         Action::Runner { runner, action } => {
             use lc_proto::RunnerAction as A;
             let action = match action.as_str() {
@@ -155,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                 "poweroff" => A::PowerOff,
                 "reload" => A::ReloadOutputs,
                 other => bail!(
-                    "unknown runner action '{other}' (restart, quit, standby, resume, reboot, poweroff, reload)"
+                    "unknown runner action '{other}' (restart, quit, standby, resume, reboot, poweroff, reload, start)"
                 ),
             };
             Command::RunnerAction { runner, action }
@@ -205,7 +206,10 @@ async fn main() -> anyhow::Result<()> {
     // (and an Error, if the command was refused, arrives before it).
     let scheduled = !matches!(
         command,
-        Command::LoadShow { .. } | Command::RunnerAction { .. } | Command::WakeRunner { .. }
+        Command::LoadShow { .. }
+            | Command::RunnerAction { .. }
+            | Command::WakeRunner { .. }
+            | Command::StartRunner { .. }
     );
     let (mut conn, welcome) = connect(args.director.as_deref()).await?;
     conn.send(&ClientMessage::Command {

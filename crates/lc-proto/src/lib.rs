@@ -55,6 +55,17 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_CONTROL_PORT: u16 = 7401;
 /// Default UDP port of the Director's clock-sync responder.
 pub const DEFAULT_SYNC_PORT: u16 = 7402;
+/// UDP port a Runner's supervisor listens on while the Runner itself is
+/// closed, for a [`StartRunner`] request from the Director.
+pub const LAUNCHER_PORT: u16 = 7406;
+
+/// "Start the Runner program again", sent by the Director (UDP, JSON) to
+/// the supervisor of a Runner that was closed. The supervisor acts only on
+/// its own node id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartRunner {
+    pub start_runner: NodeId,
+}
 
 /// One nanosecond-resolution second, to keep conversions readable.
 pub const NANOS_PER_SEC: i64 = 1_000_000_000;

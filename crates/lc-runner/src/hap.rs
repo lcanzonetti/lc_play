@@ -332,7 +332,23 @@ struct Sched {
     busy: HashSet<i64>,
     /// Frames that failed to decode (reported once, not retried).
     failed: HashSet<i64>,
+    /// Texture-sized buffers to decode into again. Allocating and zeroing a
+    /// fresh one per frame (8 MB at 4K HAP Q) cost about as much as a third
+    /// of the decompression itself; every decode overwrites the whole
+    /// buffer (the chunk sizes are checked to add up to it), so none needs
+    /// clearing.
+    spare: Vec<Vec<u8>>,
     stop: bool,
+}
+
+/// Buffers kept for reuse per video: the prefetch window plus a margin.
+const SPARE_BUFFERS: usize = 8;
+
+/// Keep a texture buffer for the next decode (up to `SPARE_BUFFERS`).
+fn recycle(st: &mut Sched, buffer: Vec<u8>) {
+    if st.spare.len() < SPARE_BUFFERS {
+        st.spare.push(buffer);
+    }
 }
 
 /// A HAP video layer.
@@ -398,6 +414,7 @@ impl HapContent {
                 state: Mutex::new(Sched {
                     wanted: Vec::new(),
                     ready: BTreeMap::new(),
+                    spare: Vec::new(),
                     busy: HashSet::new(),
                     failed: HashSet::new(),
                     stop: false,
@@ -516,8 +533,9 @@ fn worker(
     let len = texture_len(format, track.width, track.height);
     let mut packet = Vec::new();
     loop {
-        // Pick the soonest wanted frame nobody has or is working on.
-        let frame = {
+        // Pick the soonest wanted frame nobody has or is working on, and a
+        // buffer to decode it into.
+        let (frame, mut out) = {
             let mut st = shared.state.lock().unwrap();
             loop {
                 if st.stop {
@@ -529,14 +547,15 @@ fn worker(
                 match next {
                     Some(f) => {
                         st.busy.insert(f);
-                        break f;
+                        let buffer = st.spare.pop().filter(|b| b.len() == len);
+                        break (f, buffer.unwrap_or_else(|| vec![0u8; len]));
                     }
                     None => st = shared.wake.wait(st).unwrap(),
                 }
             }
         };
 
-        let result = (|| -> anyhow::Result<Vec<u8>> {
+        let result = (|| -> anyhow::Result<()> {
             let &(offset, size) = track
                 .frames
                 .get(frame as usize)
@@ -544,20 +563,19 @@ fn worker(
             packet.resize(size as usize, 0);
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut packet)?;
-            let mut out = vec![0u8; len];
-            decode_frame(&packet, format, &mut out, chunk_threads)?;
-            Ok(out)
+            decode_frame(&packet, format, &mut out, chunk_threads)
         })();
 
         let mut st = shared.state.lock().unwrap();
         st.busy.remove(&frame);
         match result {
             // Keep it only if it is still wanted (playback may have jumped).
-            Ok(data) if st.wanted.contains(&frame) => {
-                st.ready.insert(frame, data);
+            Ok(()) if st.wanted.contains(&frame) => {
+                st.ready.insert(frame, out);
             }
-            Ok(_) => {}
+            Ok(()) => recycle(&mut st, out),
             Err(e) => {
+                recycle(&mut st, out);
                 if st.failed.is_empty() {
                     tracing::error!("video '{path}', frame {frame}: {e:#}");
                 }
@@ -587,7 +605,18 @@ impl Content for HapContent {
         let frame = {
             let mut st = self.shared.state.lock().unwrap();
             // Drop what is no longer needed, publish what is.
-            st.ready.retain(|f, _| window.contains(f));
+            // Frames no longer wanted give their buffers back.
+            let dropped: Vec<i64> = st
+                .ready
+                .keys()
+                .copied()
+                .filter(|f| !window.contains(f))
+                .collect();
+            for f in dropped {
+                if let Some(buffer) = st.ready.remove(&f) {
+                    recycle(&mut st, buffer);
+                }
+            }
             st.wanted = window;
             self.shared.wake.notify_all();
             if self.shown == Some(want) {
@@ -622,6 +651,8 @@ impl Content for HapContent {
             },
         );
         self.shown = Some(index);
+        // `write_texture` has copied it: the buffer can take the next frame.
+        recycle(&mut self.shared.state.lock().unwrap(), data);
     }
 
     fn idle(&mut self) {

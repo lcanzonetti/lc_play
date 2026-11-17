@@ -154,8 +154,11 @@ outputs (after warp and blend — what the projector gets), **Log** its recent
 log, **Reload outputs**, **Standby / Resume** (close the outputs, stay
 connected), **Restart** and **Quit** the Runner program, **Reboot** and
 **Power off** the computer (only if the Runner was started with
-`--allow-power`), **Wake** (Wake-on-LAN, for an offline Runner that was
-connected before), **RDP / VNC** (open this computer's remote-desktop client
+`--allow-power`), **Start** (start the Runner program again after it was
+closed — its supervisor waits for this), **Wake** (Wake-on-LAN, for an
+offline Runner that was connected before), **Test** next to each display
+(moving test lines on that display — kind and rate in the display's
+inspector), **RDP / VNC** (open this computer's remote-desktop client
 on it; the Runner's computer must have Remote Desktop or a VNC server
 enabled, and this only works from the Producer's own machine). RDP uses
 Windows' own `mstsc`. VNC needs a VNC viewer on the Producer's computer:
@@ -191,7 +194,17 @@ target/release/lc-runner --director 10.0.0.1:7401 --name left --allow-power
 ```
 
 `lc-runner` runs under a small supervisor (the same program): **Restart**
-from the Producer brings it back, and it restarts itself after a crash.
+from the Producer brings it back, and it restarts itself after a crash. When
+the Runner is closed (its window, or **Quit**), the supervisor keeps waiting,
+and **Start** in the Runners window opens it again; closing the supervisor's
+console window ends it for good. `lc-runner --autostart on` (with the
+options it should start with) makes it start at login, so a reboot does not
+leave it closed either; `--autostart off` undoes that.
+
+Started with no options, `lc-runner` looks for the Director by itself (its
+multicast beacon, else this computer); `runner.director` and `runner.name` in
+`lcplay.json` next to the programs set them for a machine. `--demo` plays
+the built-in example show without a Director.
 `--allow-power` lets the Producer reboot and shut down that computer —
 anyone on the show network could, so only use it on a closed network. For
 Wake-on-LAN, enable it in the computer's BIOS/UEFI and network adapter
@@ -203,7 +216,32 @@ Runners download media from. `--discover` can replace `--director` where
 multicast works.
 
 Default ports: discovery UDP 7400 (multicast 239.255.76.67), control TCP 7401,
-clock sync UDP 7402, assets HTTP 7403, Producer HTTP 7404, OSC UDP 7405.
+clock sync UDP 7402, assets HTTP 7403, Producer HTTP 7404, OSC UDP 7405,
+Runner start requests UDP 7406.
+
+### Display test patterns
+
+A display's inspector has a **Test pattern**: *Moving lines* (a vertical
+and a horizontal line sweeping across the display, one step per frame — a
+smooth sweep means every frame reached the screen once; judder, repeats and
+drops show at a glance) or *Frame counter* (the sync-test pattern), at a
+rate you set (normally the refresh rate, or the content's frame rate). It is
+drawn by that display's Runner over the content, fitted to that display and
+on it only, and runs on the cluster clock — it moves whether the show plays
+or not, and every display showing one is on the same step.
+
+### HAP and the CPU
+
+HAP is decoded by the GPU, but each frame is first decompressed (Snappy)
+and copied by the CPU: measured here, about 2.5–3 ms of one core per frame
+of 4K HAP Q — 15–20 % of a core per layer at 60 fps, more for footage that
+compresses less well, and double at 8K. A laptop that also runs the Producer
+feels that; a show machine with more cores much less. To lower it: encode
+with chunks (`-chunks 8`: decompressed on several cores), use plain HAP
+(half the data of HAP Q) where its quality is enough, or encode without
+Snappy (`-compressor none`): no decompression at all, at the price of
+larger files (8 MB per 4K HAP Q frame, ≈ 500 MB/s at 60 fps — fast NVMe
+only).
 
 ### Where a Runner keeps its files
 

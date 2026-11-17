@@ -94,6 +94,16 @@ pub fn install_dir() -> Option<PathBuf> {
     exe.parent().map(Path::to_path_buf)
 }
 
+/// A string from the `runner` section of the settings file next to the
+/// programs (`lcplay.json`): `dir`, `name`, `director`.
+pub fn runner_setting(key: &str) -> Option<String> {
+    let install = install_dir()?;
+    let text = std::fs::read_to_string(install.join(SETTINGS_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let s = value.get("runner")?.get(key)?.as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
 /// `runner.dir` from the settings file in `install`, if there is one.
 fn settings_runner_dir(install: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(install.join(SETTINGS_FILE)).ok()?;

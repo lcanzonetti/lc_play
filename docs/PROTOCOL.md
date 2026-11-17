@@ -71,6 +71,7 @@ Commands:
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
+| `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP 7406) to the address that Runner last reported; its supervisor, waiting since the Runner was closed, starts it |
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
@@ -310,6 +311,9 @@ broadcasts them back. Other tools may ignore it.
   frame, and a white flash on the first frame of each second.
 * The first track is in front.
 * `runner` is a Runner's `--name`; empty means any Runner.
+* A display's `test_pattern` (optional): `{ "kind": "lines" | "counter",
+  "fps": 60 }` — drawn by its Runner over the content, on that display only,
+  on the cluster clock.
 * A Runner downloads `url` once and caches it under `id` + `size`.
 * `tasks` are auxiliary timelines: same shape as the main one (`tracks`,
   `duration_s`, `control_cues`), each with its own transport, drawn in front
@@ -357,6 +361,7 @@ Bundles are accepted; their time tags are ignored.
 | `GET /stream/{id}` | the file, with `Range` support |
 | `GET /thumb/{id}` | small PNG |
 | `GET /transcode/{id}` | on-the-fly transcode for browser preview |
+| `GET /proxy/{id}` | a 640-pixel H.264 preview copy of a video, made on first request (stored in `.lcplay-proxies` in the media folder, which is not listed), served with `Range` — what the Producer's stage preview plays |
 
 `kind` is `video`, `image` or `audio`. By default browsers may use the
 server only from pages served on port 7404 (the Producer); `POST`/`DELETE`

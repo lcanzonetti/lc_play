@@ -36,9 +36,16 @@ use winit::event_loop::EventLoop;
     about = "LC Play Runner: synchronised multi-output playback node"
 )]
 struct Args {
-    /// Show file to render instead of the Director's show. Without a
-    /// Director and without a file, the bundled example is used.
+    /// Show file to render instead of the Director's show.
     show: Option<PathBuf>,
+    /// Play the bundled example show, without a Director (a quick check
+    /// that the graphics work).
+    #[arg(long)]
+    demo: bool,
+    /// Start this Runner when the user logs in (`on`), or not (`off`), with
+    /// the other options given here; then exit.
+    #[arg(long, value_parser = ["on", "off"])]
+    autostart: Option<String>,
     /// Director control address, `host:port`. The robust choice for a fixed
     /// installation.
     #[arg(long, conflicts_with = "discover")]
@@ -49,9 +56,10 @@ struct Args {
     /// Run the cluster agent only: no window, no GPU.
     #[arg(long)]
     headless: bool,
-    /// Name shown to operators.
-    #[arg(long, default_value = "runner")]
-    name: String,
+    /// Name shown to operators (default: `runner.name` in `lcplay.json`,
+    /// else "runner").
+    #[arg(long)]
+    name: Option<String>,
     /// The Runner's folder: downloaded media (`assets`), the last show, its
     /// identity and log. Default: `lc-runner` in the LC Play install folder
     /// (or as set in `lcplay.json` / `LCPLAY_RUNNER_DIR`).
@@ -82,20 +90,28 @@ fn main() -> anyhow::Result<()> {
         // Also kept in memory, for the operator to read from the Producer.
         .with_writer(lc_runner::machine::LogWriter)
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
     lc_runner::machine::log_panics();
+    if let Some(on) = args.autostart.take() {
+        return lc_runner::machine::set_autostart(on == "on");
+    }
+    let name = args
+        .name
+        .clone()
+        .or_else(|| lc_runner::folders::runner_setting("name"))
+        .unwrap_or_else(|| "runner".into());
     // The log also goes to a file next to the cache, so that what happened
     // before a crash or restart can still be read from the Producer. The
     // supervisor writes there too (it reports the crashes); the Runner itself
     // reads the end of the file back when it starts.
     // Kept across restarts: see `folders.rs` for where, and why.
-    let folders = lc_runner::folders::runner_folders(args.cache_dir.clone(), &args.name);
+    let folders = lc_runner::folders::runner_folders(args.cache_dir.clone(), &name);
     let log_file = folders.state.join("runner.log");
     let is_supervisor = !args.worker && !args.no_supervise;
     lc_runner::machine::persist_log(&log_file, !is_supervisor);
 
     if is_supervisor {
-        return supervise();
+        return supervise(&folders.state);
     }
     if args.worker {
         exit_with_supervisor();
@@ -106,15 +122,25 @@ fn main() -> anyhow::Result<()> {
         interface: args.interface,
         ..Default::default()
     };
+    // Where the Director is: as told; else as in the settings file; else
+    // find it — by its beacon, or on this computer. Only a show file or
+    // --demo runs without one.
     let director = match (&args.director, args.discover) {
         (Some(addr), _) => Some(DirectorAddr::Static(resolve(addr)?)),
         (None, true) => Some(DirectorAddr::Discover(discovery)),
-        (None, false) => None,
+        (None, false) => match lc_runner::folders::runner_setting("director") {
+            Some(addr) => Some(DirectorAddr::Static(resolve(&addr)?)),
+            None if args.show.is_some() || args.demo => None,
+            None => Some(DirectorAddr::Auto(
+                discovery,
+                SocketAddr::from(([127, 0, 0, 1], lc_proto::DEFAULT_CONTROL_PORT)),
+            )),
+        },
     };
 
     if args.headless {
         let director = director.context("--headless needs --director <host:port> or --discover")?;
-        let mut cfg = AgentConfig::new(args.name, director);
+        let mut cfg = AgentConfig::new(name, director);
         cfg.cache_dir = Some(folders.state.clone());
         cfg.announce = Some(discovery);
         cfg.allow_power = args.allow_power;
@@ -125,14 +151,16 @@ fn main() -> anyhow::Result<()> {
     // ---- windowed ----------------------------------------------------------
     let local_clock: Arc<dyn LocalClock> = Arc::new(MonotonicClock::new());
 
-    // Which show? An explicit file wins; otherwise the Director's; with
-    // neither, the bundled example (so `cargo run` shows something).
-    let local_show = match (&args.show, &director) {
+    // Which show? An explicit file wins; then the bundled example with
+    // --demo; otherwise the Director's.
+    let local_show = match (&args.show, args.demo) {
         (Some(path), _) => Some(load_show(path)?),
-        (None, Some(_)) => None,
-        (None, None) => Some(load_show(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/show.json").as_ref(),
-        )?),
+        // Built into the program: it works wherever it is installed.
+        (None, true) => Some(
+            Show::from_json(include_str!("../examples/show.json"))
+                .context("the bundled example show")?,
+        ),
+        (None, false) => None,
     };
 
     // What a local show file asks for until (unless) a Director says otherwise.
@@ -160,7 +188,7 @@ fn main() -> anyhow::Result<()> {
         folders.assets.display()
     );
     let assets_dir = folders.assets.clone();
-    let runner_name = args.name.clone();
+    let runner_name = name.clone();
 
     // The agent lives on its own small runtime; the main thread belongs to
     // the window system (a winit requirement on some platforms). `_runtime`
@@ -172,7 +200,7 @@ fn main() -> anyhow::Result<()> {
                 .thread_name("lc-agent")
                 .enable_all()
                 .build()?;
-            let mut cfg = AgentConfig::new(args.name, director);
+            let mut cfg = AgentConfig::new(name, director);
             cfg.cache_dir = Some(folders.state.clone());
             cfg.announce = Some(discovery);
             cfg.local_clock = local_clock;
@@ -224,7 +252,7 @@ fn main() -> anyhow::Result<()> {
 /// is killed, the pipe closes and the child exits (see
 /// [`exit_with_supervisor`]). That works the same on Windows, where killing
 /// a process does not kill its children.
-fn supervise() -> anyhow::Result<()> {
+fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
     use lc_runner::machine::RESTART_EXIT_CODE;
     use std::process::{Command, Stdio};
 
@@ -243,7 +271,12 @@ fn supervise() -> anyhow::Result<()> {
         let _tie = child.stdin.take();
         let status = child.wait().context("waiting for the runner")?;
         match status.code() {
-            Some(0) => return Ok(()),
+            // Closed (its window, or Quit from the Producer): stay here and
+            // wait to be started again from the Producer.
+            Some(0) => {
+                wait_for_start(state_dir);
+                backoff = Duration::from_secs(1);
+            }
             Some(RESTART_EXIT_CODE) => {
                 tracing::info!("supervisor: restarting the runner");
                 backoff = Duration::from_secs(1);
@@ -260,6 +293,48 @@ fn supervise() -> anyhow::Result<()> {
                 );
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// The Runner has been closed: wait until the Director asks for it to be
+/// started again (`lc_proto::StartRunner` on UDP `LAUNCHER_PORT`, for this
+/// Runner's node id). Closing this process (its console window, Task
+/// Manager) ends it for good.
+fn wait_for_start(state_dir: &std::path::Path) {
+    tracing::info!(
+        "supervisor: the runner is closed; it can be started again from the Producer \
+         (Runners window → Start). Close this window to stop it for good."
+    );
+    // Our identity, as the Runner saved it.
+    let me: Option<lc_proto::NodeId> = std::fs::read(state_dir.join("node_id.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let mut warned = false;
+    loop {
+        let socket = match std::net::UdpSocket::bind(("0.0.0.0", lc_proto::LAUNCHER_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                if !warned {
+                    tracing::error!(
+                        "supervisor: cannot listen on UDP {} ({e}); retrying",
+                        lc_proto::LAUNCHER_PORT
+                    );
+                    warned = true;
+                }
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let Ok(req) = serde_json::from_slice::<lc_proto::StartRunner>(&buf[..n]) else {
+                continue;
+            };
+            if me.as_ref().is_none_or(|id| *id == req.start_runner) {
+                tracing::info!("supervisor: start requested from {from}");
+                return;
             }
         }
     }

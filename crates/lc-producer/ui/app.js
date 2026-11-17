@@ -1018,8 +1018,9 @@ async function uploadFiles(files) {
 //   image cue → the image itself (its thumbnail until it has loaded)
 //   video cue → a muted <video>, one per cue, steered to the right time
 //
-// A video the browser cannot decode (ProRes, HAP, …) falls back to its
-// thumbnail; the Runner, which decodes with ffmpeg, still plays it.
+// Videos are previewed from the Asset Manager's preview proxy (a small
+// H.264 copy), so HAP and ProRes play here too; until the proxy is ready,
+// or if it cannot be made, the thumbnail is shown.
 
 const previews = new Map(); // key → { kind, node, thumb, failed }
 
@@ -1069,7 +1070,10 @@ function previewFor(cue, asset) {
     thumb.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
     p = { kind: asset.kind, thumb, failed: false };
     if (asset.kind === 'video') {
-      p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: asset.url });
+      // The Asset Manager's preview proxy (a small H.264 copy, made once):
+      // plays in any web view whatever the original's codec (HAP, ProRes),
+      // and is far lighter to decode than a 4K original.
+      p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: asset.url.replace('/stream/', '/proxy/') });
       p.node.addEventListener('error', () => (p.failed = true));
     } else {
       p.node = new Image();
@@ -1831,6 +1835,10 @@ function renderRunners(force = false) {
           () => runnerAction(name, 'power_off', `Shut down the computer ${machine?.hostname || name}? It can be woken again only if Wake-on-LAN is enabled on it.`), { disabled: !power }),
       );
     } else {
+      actions.append(act('Start', machine?.ip
+        ? `Start the Runner program again on ${machine.hostname || machine.ip} (its supervisor waits for this after the Runner was closed; the computer must be on)`
+        : 'Its network address is not known yet',
+        () => { command({ type: 'start_runner', runner: name }); toast(`Asked ${name} to start.`, true); }, { disabled: !machine?.ip }));
       actions.append(act('Wake', machine?.mac ? `Send a Wake-on-LAN packet to ${machine.mac}` : 'Its network card address is not known yet',
         () => { command({ type: 'wake_runner', runner: name }); toast(`Wake-on-LAN sent to ${name}.`, true); }, { disabled: !machine?.mac }));
     }

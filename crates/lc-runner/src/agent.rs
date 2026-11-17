@@ -64,6 +64,10 @@ pub enum DirectorAddr {
     Static(SocketAddr),
     /// Listen for the Director's multicast beacon.
     Discover(DiscoveryConfig),
+    /// Listen for the beacon; if none is heard, try this address (the
+    /// Director on this computer). What a Runner started with no options
+    /// does, so that it finds the Director by itself.
+    Auto(DiscoveryConfig, SocketAddr),
 }
 
 pub struct AgentConfig {
@@ -277,6 +281,14 @@ impl Link {
                         sleep(BACKOFF_MAX).await;
                         None
                     }
+                }
+            }
+            DirectorAddr::Auto(cfg, fallback) => {
+                match lc_discovery::find(*cfg, Role::Director, DISCOVERY_WAIT).await {
+                    Ok(Some(found)) => found.control_addr().or(Some(*fallback)),
+                    // Nothing heard (or no multicast here): the Director may
+                    // be on this computer.
+                    Ok(None) | Err(_) => Some(*fallback),
                 }
             }
         }

@@ -25,6 +25,9 @@ pub struct AppState {
     pub probes: Arc<Mutex<ProbeCache>>,
     /// Thumbnails (JPEG bytes) by item id, tagged the same way.
     pub thumbs: Arc<Mutex<HashMap<String, (u64, axum::body::Bytes)>>>,
+    /// One lock per item whose preview proxy is being made, so that two
+    /// requests for it start one ffmpeg, not two.
+    pub proxy_jobs: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
             transcode_slots: slots,
             probes: Arc::default(),
             thumbs: Arc::default(),
+            proxy_jobs: Arc::default(),
         }
     }
 }

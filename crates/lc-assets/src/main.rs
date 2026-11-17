@@ -56,6 +56,7 @@ async fn main() {
         .route("/api/items/{id}", get(handlers::browse::get_item))
         .route("/stream/{id}", get(handlers::stream::stream_media))
         .route("/transcode/{id}", get(handlers::transcode::transcode_media))
+        .route("/proxy/{id}", get(handlers::proxy::proxy_media))
         .route("/thumb/{id}", get(handlers::manage::thumbnail))
         .route(
             "/api/items/{id}",
