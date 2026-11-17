@@ -558,9 +558,14 @@ impl Core {
     }
 
     pub fn unregister(&self, conn: u64) {
-        let gone = self.state().nodes.remove(&conn);
-        // The other Producers stop showing that user.
-        if let Some(node) = gone.filter(|n| n.role == Role::Producer) {
+        let mut st = self.state();
+        let gone = st.nodes.remove(&conn);
+        // The other Producers stop showing that user — unless it has already
+        // reconnected (same node id, new connection).
+        let still_here = |id: &NodeId| st.nodes.values().any(|n| &n.node_id == id);
+        let gone = gone.filter(|n| n.role == Role::Producer && !still_here(&n.node_id));
+        drop(st);
+        if let Some(node) = gone {
             self.publish(ServerMessage::Presence {
                 node_id: node.node_id,
                 presence: None,
@@ -570,6 +575,18 @@ impl Core {
 
     /// Relay a Producer's presence to the other Producers.
     pub fn presence(&self, conn: u64, presence: lc_proto::Presence) {
+        // Relayed to everyone: keep it small, and the colour a plain colour
+        // (it ends up in other users' pages).
+        let selection_len = presence
+            .selection
+            .as_ref()
+            .map_or(0, |s| s.to_string().len());
+        let color_ok = presence.color.len() <= 9
+            && presence.color.starts_with('#')
+            && presence.color[1..].chars().all(|c| c.is_ascii_hexdigit());
+        if presence.name.chars().count() > 64 || selection_len > 512 || !color_ok {
+            return;
+        }
         let node = self.state().nodes.get(&conn).cloned();
         if let Some(node) = node.filter(|n| n.role == Role::Producer) {
             self.publish(ServerMessage::Presence {
@@ -1016,8 +1033,12 @@ impl Core {
                 "edit_show: parts of an edit referred to something deleted meanwhile"
             );
         }
-        if let (Some(map), Some(tag)) = (document.as_object_mut(), tag) {
-            map.insert("_edit".into(), tag);
+        // The tag of *this* edit, or none: never an older one left behind.
+        if let Some(map) = document.as_object_mut() {
+            match tag {
+                Some(tag) => map.insert("_edit".into(), tag),
+                None => map.remove("_edit"),
+            };
         }
         self.load_show_locked(&mut st, document)
             .map_err(|e| e.replacen("load_show", "edit_show", 1))
@@ -1035,6 +1056,13 @@ impl Core {
     ) -> Result<(), String> {
         if !document.is_object() {
             return Err("load_show: the show document must be a JSON object".into());
+        }
+        // Stored and sent to everyone: it must stay readable.
+        if lc_proto::edit::depth(&document) > lc_proto::edit::MAX_DOCUMENT_DEPTH {
+            return Err(format!(
+                "load_show: the show is nested deeper than {} levels",
+                lc_proto::edit::MAX_DOCUMENT_DEPTH
+            ));
         }
         // Edits address list elements by id: make sure every one has one.
         lc_proto::edit::ensure_ids(&mut document);

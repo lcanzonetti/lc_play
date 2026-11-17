@@ -353,6 +353,9 @@ function sendPresence() {
   send({ type: 'presence', name: S.user.name, color: S.user.color, selection: S.sel, dragging: !!(drag?.undone || tlDrag?.undone) });
 }
 
+/** A colour from another user, safe to put in a style attribute. */
+const safeColor = (c) => (/^#[0-9a-fA-F]{3,8}$/.test(c || '') ? c : '#888888');
+
 /** Other users who have `sel` (or the object `type`/`id`) selected. */
 function othersOn(type, id) {
   return [...S.others.values()].filter((o) => o.selection?.type === type && o.selection?.id === id);
@@ -393,14 +396,21 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const keyedList = (list) => list.every((e) => isObj(e) && typeof e.id === 'string' && e.id);
 
-/** The operations that turn document `a` into document `b`. */
-function diffDoc(a, b, path = [], out = []) {
+/** The operations that turn document `a` into document `b`. Removals come
+ *  first: a cue moved to another track is a removal and an insertion, and
+ *  the insertion of an id that still exists elsewhere would be skipped. */
+function diffDoc(a, b) {
+  const ops = diffInto(a, b, [], []);
+  return [...ops.filter((o) => o.op === 'remove'), ...ops.filter((o) => o.op !== 'remove')];
+}
+
+function diffInto(a, b, path, out) {
   if (a === b) return out;
   if (isObj(a) && isObj(b)) {
     for (const k of Object.keys(b)) {
       if (b[k] === undefined) continue;
       if (a[k] === undefined) out.push({ op: 'set', path: [...path, k], value: clone(b[k]) });
-      else diffDoc(a[k], b[k], [...path, k], out);
+      else diffInto(a[k], b[k], [...path, k], out);
     }
     for (const k of Object.keys(a)) if (a[k] !== undefined && b[k] === undefined) out.push({ op: 'unset', path: [...path, k] });
     return out;
@@ -427,7 +437,7 @@ function diffDoc(a, b, path = [], out = []) {
       }
       prev = e.id;
     }
-    for (const e of b) if (byId.has(e.id)) diffDoc(byId.get(e.id), e, [...path, { id: e.id }], out);
+    for (const e of b) if (byId.has(e.id)) diffInto(byId.get(e.id), e, [...path, { id: e.id }], out);
     return out;
   }
   if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ op: 'set', path, value: clone(b) });
@@ -437,17 +447,23 @@ function diffDoc(a, b, path = [], out = []) {
 /** Apply operations to `doc` in place, skipping those whose target is gone
  *  (the same rules as the Director's). Returns the document. */
 function applyOps(doc, ops) {
-  const find = (list, id) => (Array.isArray(list) ? list.findIndex((e) => isObj(e) && e.id === id) : -1);
+  const find = (list, id) => (Array.isArray(list) && typeof id === 'string' && id ? list.findIndex((e) => isObj(e) && e.id === id) : -1);
+  const own = (o, k) => isObj(o) && Object.hasOwn(o, k);
+  // Ids are unique in the whole show (edit.rs: id_exists).
+  const exists = (v, id) => (Array.isArray(v) ? v.some((e) => exists(e, id))
+    : isObj(v) ? Object.entries(v).some(([k, x]) => (KEYED.has(k) && Array.isArray(x) && x.some((e) => isObj(e) && e.id === id)) || exists(x, id))
+    : false);
   const walk = (path, create) => {
     let here = doc;
     for (let n = 0; n < path.length; n++) {
       const step = path[n];
       if (typeof step === 'string') {
         if (!isObj(here)) return undefined;
-        if (create && here[step] === undefined) {
+        if (create && !own(here, step)) {
           const next = n + 1 < path.length ? path[n + 1] : create;
           here[step] = typeof next === 'string' ? {} : [];
         }
+        if (!own(here, step)) return undefined;
         here = here[step];
       } else {
         const i = find(here, step.id);
@@ -461,15 +477,17 @@ function applyOps(doc, ops) {
   const placeAfter = (list, after) => (after == null ? 0 : (find(list, after) < 0 ? list.length : find(list, after) + 1));
   for (const op of ops) {
     const path = op.path || [], last = path[path.length - 1], parent = path.slice(0, -1);
+    if (path[0] === '_edit') continue; // the Director's tag
     if (op.op === 'set') {
       if (!path.length) { doc = clone(op.value); continue; }
       const p = walk(parent, last);
       if (typeof last === 'string' && isObj(p)) p[last] = clone(op.value);
-      else if (last && typeof last === 'object') { const i = find(p, last.id); if (i >= 0) p[i] = clone(op.value); }
+      else if (last && typeof last === 'object' && op.value?.id === last.id) { const i = find(p, last.id); if (i >= 0) p[i] = clone(op.value); }
     } else if (op.op === 'unset') {
       const p = walk(parent);
-      if (isObj(p)) delete p[last];
+      if (own(p, last)) delete p[last];
     } else if (op.op === 'insert') {
+      if (exists(doc, op.value?.id)) continue;
       let list = walk(path);
       if (list === undefined && typeof last === 'string') { const p = walk(parent, last); if (isObj(p)) list = p[last] = []; }
       if (!Array.isArray(list) || find(list, op.value?.id) >= 0) continue;
@@ -484,20 +502,46 @@ function applyOps(doc, ops) {
   return doc;
 }
 
+/** Make `old` equal to `next`, keeping the identity of every object (and
+ *  of every list element with the same id) that exists in both. Returns
+ *  what should replace `old` (itself, when the kinds match). */
+function reconcile(old, next) {
+  if (isObj(old) && isObj(next)) {
+    for (const k of Object.keys(old)) if (!Object.hasOwn(next, k)) delete old[k];
+    for (const [k, v] of Object.entries(next)) old[k] = Object.hasOwn(old, k) ? reconcile(old[k], v) : v;
+    return old;
+  }
+  if (Array.isArray(old) && Array.isArray(next) && keyedList(old) && keyedList(next)) {
+    const byId = new Map(old.map((e) => [e.id, e]));
+    const merged = next.map((e) => (byId.has(e.id) ? reconcile(byId.get(e.id), e) : e));
+    old.splice(0, old.length, ...merged);
+    return old;
+  }
+  return next;
+}
+
 /** Show the Director's copy with our pending edits on top. Called when a
  *  show arrives, and after a drag that held one back. */
 function rebase() {
   if (!S.server) return;
+  // Mid-drag nothing may move under the pointer: after the drag.
+  if (drag || tlDrag) { S.deferredShow = true; return; }
   // Local changes not yet turned into an edit go first, so they are kept.
+  // If they cannot be sent (no connection), keep everything as it is until
+  // the connection is back: replacing the show now would lose them.
   if (S.doc && JSON.stringify(S.doc) !== S.lastSent) sendDoc(true);
+  if (S.dirty) { S.deferredShow = true; return; }
   let doc = clone(S.server);
   for (const p of S.pending) doc = applyOps(doc, p.ops);
   const next = normalize(doc);
   const changed = JSON.stringify(next) !== JSON.stringify(S.doc);
-  S.doc = next;
-  S.lastSent = JSON.stringify(S.doc);
   S.deferredShow = false;
   if (!changed) return;
+  // Merge into the objects already on screen rather than replacing them:
+  // the inspector's fields and a drag hold references to them, and must
+  // keep writing into the live show.
+  S.doc = reconcile(S.doc, next);
+  S.lastSent = JSON.stringify(S.doc);
   refreshAll();
   markOthers();
   reconcileAssets();
@@ -545,11 +589,21 @@ function onMessage(msg) {
         // never received, or it came back with no show at all (restarted
         // without saved state), ours is the one to keep: send it, and do not
         // let the Director's older copy overwrite it in the meantime.
-        if (msg.show_revision == null) {
-          S.replaceNext = true; // it has nothing: ours becomes the show
+        if (msg.show_revision == null || S.holdForeign) {
+          // It has no show, or the whole show we sent (New, Open) may have
+          // been lost on the way: send ours, whole.
+          S.holdForeign = false;
+          S.pending = [];
+          S.replaceNext = true;
           sendDoc(true);
-        } else if (S.dirty) {
-          sendDoc(true); // our edits, as operations, on top of its show
+        } else {
+          // Edits that were on their way when the link dropped may not have
+          // arrived: send them again (they address objects by id, so one
+          // that did arrive changes nothing the second time), then any made
+          // while offline.
+          for (const p of S.pending) command({ type: 'edit_show', ops: p.ops, tag: { by: S.clientId, n: p.n } });
+          if (S.dirty || (S.doc && JSON.stringify(S.doc) !== S.lastSent)) sendDoc(true);
+          if (S.deferredShow) rebase();
         }
       } else if (msg.show_revision == null) {
         // First contact with a Director that has no show: start it off with
@@ -574,15 +628,13 @@ function onMessage(msg) {
         if (tag.n >= S.editN) S.holdForeign = false;
       }
       S.server = msg.document;
-      // Mid-drag the dragged object must not jump: apply after the drag.
-      if (drag?.undone || tlDrag?.undone) { S.deferredShow = true; break; }
       if (!S.doc) { S.doc = normalize(clone(S.server)); S.lastSent = JSON.stringify(S.doc); refreshAll(); reconcileAssets(); break; }
       rebase();
       break;
     }
     case 'presence':
       if (msg.node_id === S.clientId) break; // our own, relayed back
-      if (msg.presence) S.others.set(msg.node_id, msg.presence);
+      if (msg.presence) S.others.set(msg.node_id, { ...msg.presence, color: safeColor(msg.presence.color) });
       else S.others.delete(msg.node_id);
       renderUsers(); markOthers();
       if (S.sel) {
@@ -613,11 +665,11 @@ function onMessage(msg) {
     case 'error':
       // If it was our document that was refused, no echo will come.
       S.holdForeign = false;
-      if (msg.message.startsWith('edit_show')) {
-        // Refused (it would have made the show invalid): back to the shared
-        // show, without our unconfirmed edits.
-        S.pending = [];
-        if (S.server) { S.doc = null; S.doc = normalize(clone(S.server)); S.lastSent = JSON.stringify(S.doc); refreshAll(); }
+      if (msg.edit?.by === S.clientId) {
+        // That edit was refused (it would have made the show invalid): drop
+        // it — only it — and show the shared show with the rest on top.
+        S.pending = S.pending.filter((p) => p.n !== msg.edit.n);
+        rebase();
       }
       toast(msg.message);
       break;
@@ -714,8 +766,8 @@ function sendDoc(force = false) {
     S.dirty = true;
     return;
   }
-  const tag = { by: S.clientId, n: ++S.editN };
   if (S.replaceNext || !S.server || !S.lastSent) {
+    const tag = { by: S.clientId, n: ++S.editN };
     // A whole new show (New, Open, or the Director has none): replaces the
     // show for everyone.
     S.replaceNext = false;
@@ -725,7 +777,8 @@ function sendDoc(force = false) {
   } else {
     // Only what changed since the last send, as operations.
     const ops = diffDoc(JSON.parse(S.lastSent), S.doc);
-    if (!ops.length) { S.dirty = false; return; }
+    if (!ops.length) { S.dirty = false; S.lastSent = json; return; }
+    const tag = { by: S.clientId, n: ++S.editN };
     S.pending.push({ n: tag.n, ops });
     command({ type: 'edit_show', ops, tag });
   }
@@ -1587,6 +1640,7 @@ window.addEventListener('mouseup', (e) => {
     $('#stage-wrap').classList.remove('panning');
     if (!drag.moved && drag.deselect) select(null);
     drag = null;
+    if (S.deferredShow) rebase();
     return;
   }
   if (winDrag) saveLayout();

@@ -94,18 +94,26 @@ A path step is a field name, or `{ "id": … }` for the element of a list
 id. `after: null` inserts or moves to the start; an `after` that no longer
 exists, to the end. The Director applies edits in the order they arrive;
 operations whose target someone else has deleted meanwhile are skipped, and
-for the same field the later edit wins. If the result is not a valid show the
-whole edit is refused (`error` starting with `edit_show`). Every element of
-those lists gets an id on load if it has none (`auto-<n>`).
+for the same field the later edit wins. Ids are unique in the whole show: an
+`insert` of an id that exists anywhere is skipped (so a cue moved to two
+tracks at once is not duplicated), a `set` of a list element must keep its
+id, and nothing may write `_edit`. If the result is not a valid show, or is
+nested deeper than 64 levels, the whole edit is refused: `{ "type": "error",
+"message": "edit_show: …", "edit": <its tag> }`. Every element of those lists
+gets an id on load if it has none (`auto-<n>`).
 
 The resulting `show` carries the edit's `tag` as `_edit` (`{ "by": <client
 id>, "n": <edit number> }`): a Producer drops its own edits up to `n` from
 those it still has pending, and shows the Director's show with the rest
 applied on top.
 
+A Producer re-sends its unconfirmed edits after reconnecting (they are
+id-addressed, so one that had arrived changes nothing the second time).
+
 Producers also send `{ "type": "presence", "name": "Alice", "color":
 "#ff6b6b", "selection": { "type": "cue", "id": "c1" }, "dragging": false }`
-(on selection changes and every 3 s). The Director relays it to the other
+(on selection changes and every 3 s; name ≤ 64 characters, colour `#rgb` to
+`#rrggbbaa`, selection ≤ 512 bytes, or it is dropped). The Director relays it to the other
 Producers and controllers — never to Runners — as `{ "type": "presence",
 "node_id": "…", "presence": { … } }`, and with `"presence": null` when that
 Producer disconnects.

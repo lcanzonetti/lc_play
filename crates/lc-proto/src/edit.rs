@@ -25,6 +25,19 @@ use serde_json::{Map, Value};
 /// show, but bounded (they come from the network).
 pub const MAX_OPS: usize = 20_000;
 pub const MAX_DEPTH: usize = 16;
+/// Deepest a show document may be nested. A show needs about 8 levels; JSON
+/// parsers stop at 128, and a document deeper than that could be stored but
+/// never read back (state file, Runners).
+pub const MAX_DOCUMENT_DEPTH: usize = 64;
+
+/// How deeply `v` is nested (a scalar is 0).
+pub fn depth(v: &Value) -> usize {
+    match v {
+        Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+        Value::Array(list) => 1 + list.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
 
 /// One step of a path into the document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +90,7 @@ pub struct Applied {
 /// without id) is refused as a whole, leaving `doc` unchanged.
 pub fn apply(doc: &mut Value, ops: &[EditOp]) -> Result<Applied, String> {
     if ops.len() > MAX_OPS {
-        return Err(format!("edit: more than {MAX_OPS} operations"));
+        return Err(format!("edit_show: more than {MAX_OPS} operations"));
     }
     for op in ops {
         let path = match op {
@@ -88,11 +101,11 @@ pub fn apply(doc: &mut Value, ops: &[EditOp]) -> Result<Applied, String> {
             | EditOp::Move { path, .. } => path,
         };
         if path.len() > MAX_DEPTH {
-            return Err(format!("edit: a path deeper than {MAX_DEPTH}"));
+            return Err(format!("edit_show: a path deeper than {MAX_DEPTH}"));
         }
         if let EditOp::Insert { value, .. } = op {
             if id_of(value).is_none() {
-                return Err("edit: an inserted list element needs an id".into());
+                return Err("edit_show: an inserted list element needs an id".into());
             }
         }
     }
@@ -108,6 +121,17 @@ pub fn apply(doc: &mut Value, ops: &[EditOp]) -> Result<Applied, String> {
 }
 
 fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
+    // `_edit` is the Director's confirmation tag: nobody may write it.
+    let path = match op {
+        EditOp::Set { path, .. }
+        | EditOp::Unset { path }
+        | EditOp::Insert { path, .. }
+        | EditOp::Remove { path }
+        | EditOp::Move { path, .. } => path,
+    };
+    if matches!(path.first(), Some(Step::Key(k)) if k == "_edit") {
+        return false;
+    }
     match op {
         EditOp::Set { path, value } => {
             let Some((last, parent)) = split(path) else {
@@ -123,12 +147,14 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
                     map.insert(k.clone(), value.clone());
                     true
                 }
+                // Replacing a list element keeps its id (a different one
+                // would make two elements share an id).
                 (Step::Id { id }, Value::Array(list)) => match position(list, id) {
-                    Some(i) => {
+                    Some(i) if id_of(value) == Some(id.as_str()) => {
                         list[i] = value.clone();
                         true
                     }
-                    None => false,
+                    _ => false,
                 },
                 _ => false,
             }
@@ -146,6 +172,12 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
             }
         }
         EditOp::Insert { path, after, value } => {
+            // Ids are unique in the whole show: an element that exists
+            // anywhere is not inserted again (two people moving one cue to
+            // two different tracks would otherwise duplicate it).
+            if id_exists(doc, id_of(value).unwrap_or_default()) {
+                return false;
+            }
             // A list that does not exist yet (an older document) is created.
             if walk(doc, path, None).is_none() {
                 let Some((Step::Key(k), parent)) = split(path) else {
@@ -197,6 +229,20 @@ fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
             list.insert(at, element);
             true
         }
+    }
+}
+
+/// Whether some element of a keyed list anywhere in `doc` has this id.
+fn id_exists(doc: &Value, id: &str) -> bool {
+    match doc {
+        Value::Object(map) => map.iter().any(|(k, v)| {
+            (KEYED_LISTS.contains(&k.as_str())
+                && v.as_array()
+                    .is_some_and(|l| l.iter().any(|e| id_of(e) == Some(id))))
+                || id_exists(v, id)
+        }),
+        Value::Array(list) => list.iter().any(|v| id_exists(v, id)),
+        _ => false,
     }
 }
 
@@ -458,6 +504,59 @@ mod tests {
         assert_eq!(d, before);
         let deep: Vec<Step> = (0..20).map(|_| Step::Key("a".into())).collect();
         assert!(apply(&mut d, &[EditOp::Unset { path: deep }]).is_err());
+    }
+
+    #[test]
+    fn a_cue_moved_to_two_tracks_at_once_is_not_duplicated() {
+        let mut d = doc();
+        let mv = |to: &str| {
+            ops(json!([
+                { "op": "remove", "path": ["tracks", { "id": "t1" }, "cues", { "id": "a" }] },
+                { "op": "insert", "path": ["tracks", { "id": to }, "cues"], "value": { "id": "a" } }
+            ]))
+        };
+        apply(
+            &mut d,
+            &ops(json!([{ "op": "insert", "path": ["tracks"], "after": "t2",
+            "value": { "id": "t3", "cues": [] } }])),
+        )
+        .unwrap();
+        apply(&mut d, &mv("t2")).unwrap();
+        let r = apply(&mut d, &mv("t3")).unwrap();
+        assert_eq!(
+            r.applied, 0,
+            "the second move finds 'a' gone and already elsewhere"
+        );
+        let count = d["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["cues"].as_array().unwrap())
+            .filter(|c| c["id"] == "a")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn the_confirmation_tag_and_ids_cannot_be_overwritten() {
+        let mut d = doc();
+        let r = apply(
+            &mut d,
+            &ops(json!([
+                { "op": "set", "path": ["_edit"], "value": { "by": "someone else" } },
+                { "op": "set", "path": ["tracks", { "id": "t2" }], "value": { "id": "t1" } }
+            ])),
+        )
+        .unwrap();
+        assert_eq!(r.skipped, 2);
+        assert!(d.get("_edit").is_none());
+        assert_eq!(d["tracks"][1]["id"], "t2");
+    }
+
+    #[test]
+    fn depth_is_measured() {
+        assert_eq!(depth(&json!(1)), 0);
+        assert_eq!(depth(&json!({ "a": [ { "b": 1 } ] })), 3);
     }
 
     #[test]

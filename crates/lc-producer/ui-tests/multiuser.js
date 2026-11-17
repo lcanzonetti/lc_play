@@ -55,7 +55,10 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
     B.evaluate(() => edit(() => { tlObj(MAIN).tracks.push({ id: 'bobtrack', name: 'Bob track', cues: [] }); S.doc.name = 'Bob named it'; })),
   ]);
   await A.waitForTimeout(1500);
-  const docs = await Promise.all([A, B].map((p) => p.evaluate(() => JSON.stringify(S.doc))));
+  // Compared with sorted keys: the order of fields in an object can differ
+  // between pages (merging keeps an object's existing order) and means nothing.
+  const canon = () => JSON.stringify(S.doc, (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : 1))) : v));
+  const docs = await Promise.all([A, B].map((p) => p.evaluate(canon)));
   const da = JSON.parse(docs[0]);
   assert(docs[0] === docs[1], 'both pages converge on the same show');
   assert(da.stage.displays[0].canvas_rect.x === 123 && da.name === 'Bob named it' && da.tracks.some((t) => t.id === 'bobtrack'), "Alice's and Bob's changes are both in it");
@@ -76,6 +79,46 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   const after = JSON.parse(await B.evaluate(() => JSON.stringify(S.doc)));
   assert(after.stage.displays[0].canvas_rect.x !== 123 && after.tracks.some((t) => t.id === 'bobtrack'), "Alice's undo reverts her edit and keeps Bob's");
   if (process.argv[2]) await B.screenshot({ path: process.argv[2] });
+
+  // Inspector edits keep working after the show has come back (the fields
+  // must write into the live show, not a replaced copy).
+  await A.evaluate(() => select({ type: 'display', id: S.doc.stage.displays[0].id }));
+  const xy = A.locator('#inspector .row.two').nth(0).locator('input');
+  await xy.nth(0).fill('111'); await xy.nth(0).press('Tab'); await A.waitForTimeout(800);
+  await xy.nth(1).fill('222'); await xy.nth(1).press('Tab'); await A.waitForTimeout(800);
+  const r = await B.evaluate(() => S.doc.stage.displays[0].canvas_rect);
+  assert(r.x === 111 && r.y === 222, `two inspector edits in a row both arrive (${r.x}, ${r.y})`);
+
+  // An edit lost with the connection is sent again on reconnect.
+  await A.evaluate(() => {
+    const ws = S.ws, orig = ws.send.bind(ws);
+    ws.send = (d) => { if (d.includes('edit_show')) { ws.send = orig; ws.close(); } else orig(d); };
+    edit(() => { S.doc.name = 'survives a drop'; });
+    sendDoc();
+  });
+  await A.waitForTimeout(2500);
+  assert(await B.evaluate(() => S.doc.name) === 'survives a drop', 'an edit in flight when the link dropped arrives after reconnecting');
+
+  // A whole new show lost with the connection: sent again, nobody stuck.
+  await A.evaluate(() => {
+    const ws = S.ws, orig = ws.send.bind(ws);
+    ws.send = (d) => { if (d.includes('load_show')) { ws.send = orig; ws.close(); } else orig(d); };
+    S.replaceNext = true; edit(() => { S.doc = defaultDoc(); S.doc.name = 'A new show'; }); sendDoc();
+  });
+  await A.waitForTimeout(2500);
+  await B.evaluate(() => edit(() => { S.doc.name = 'B renamed'; }));
+  await A.waitForTimeout(1500);
+  const names = await Promise.all([A, B].map((p) => p.evaluate(() => [S.doc.name, S.holdForeign])));
+  assert(names[0][0] === 'B renamed' && names[1][0] === 'B renamed' && !names[0][1], 'after a lost New both pages follow the shared show: ' + JSON.stringify(names));
+
+  // A refused edit is undone locally, and the next one goes through.
+  await A.evaluate(() => edit(() => { tlObj(MAIN).duration_s = -5; }));
+  await A.waitForTimeout(800);
+  const after2 = await A.evaluate(() => [tlObj(MAIN).duration_s, S.pending.length]);
+  assert(after2[0] > 0 && after2[1] === 0, 'a refused edit is reverted and not kept pending: ' + JSON.stringify(after2));
+  await A.evaluate(() => edit(() => { S.doc.name = 'after refusal'; }));
+  await A.waitForTimeout(800);
+  assert(await B.evaluate(() => S.doc.name) === 'after refusal', 'the next edit after a refusal arrives');
 
   // Alice leaves: Bob stops showing her.
   await A.context().close(); await B.waitForTimeout(1500);

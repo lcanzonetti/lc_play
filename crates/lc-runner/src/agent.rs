@@ -385,7 +385,7 @@ impl Link {
                             }
                             playhead.set_show(show);
                         }
-                        ServerMessage::Error { message } => {
+                        ServerMessage::Error { message, .. } => {
                             tracing::warn!("director reported: {message}");
                         }
                         ServerMessage::Grid { grid } => {

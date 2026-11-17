@@ -267,12 +267,20 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
                         }
                         Ok(Some(ClientMessage::Command { command, timeline })) => {
                             let wants_reply = matches!(command, Command::Status);
+                            // A refused edit is answered with its tag, so the
+                            // Producer drops exactly that edit.
+                            let edit = match &command {
+                                Command::EditShow { tag, .. } => tag.clone(),
+                                _ => None,
+                            };
                             match core.command_on(command, timeline.as_deref()) {
                                 Ok(()) if wants_reply => {
                                     send(&mut socket, &ServerMessage::Cluster(core.status())).await?
                                 }
                                 Ok(()) => {}
-                                Err(message) => send(&mut socket, &error(&message)).await?,
+                                Err(message) => {
+                                    send(&mut socket, &ServerMessage::Error { edit, message }).await?
+                                }
                             }
                         }
                     }
@@ -297,6 +305,7 @@ fn show_message(show: crate::ShowDoc) -> ServerMessage {
 
 fn error(message: &str) -> ServerMessage {
     ServerMessage::Error {
+        edit: None,
         message: message.to_string(),
     }
 }

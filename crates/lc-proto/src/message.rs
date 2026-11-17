@@ -363,7 +363,11 @@ pub enum ServerMessage {
         presence: Option<Presence>,
     },
     /// The Director could not act on a message. Never fatal for the link.
+    /// `edit`: the tag of the refused `edit_show`, so its sender knows which
+    /// of its edits it was.
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit: Option<serde_json::Value>,
         message: String,
     },
     Pong,

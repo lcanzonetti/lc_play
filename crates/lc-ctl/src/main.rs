@@ -269,7 +269,7 @@ async fn request_status(conn: &mut Connection) -> anyhow::Result<ClusterStatus> 
     loop {
         match conn.recv_timeout(Duration::from_secs(3)).await? {
             ServerMessage::Cluster(status) => return Ok(status),
-            ServerMessage::Error { message } => bail!("the Director refused: {message}"),
+            ServerMessage::Error { message, .. } => bail!("the Director refused: {message}"),
             _ => continue,
         }
     }

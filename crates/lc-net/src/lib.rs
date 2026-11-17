@@ -73,7 +73,7 @@ impl Connection {
                     director: w.protocol,
                     ours: PROTOCOL_VERSION,
                 }),
-                ServerMessage::Error { message } => Err(NetError::Refused(message)),
+                ServerMessage::Error { message, .. } => Err(NetError::Refused(message)),
                 other => Err(NetError::UnexpectedReply(format!("{other:?}"))),
             }
         })
