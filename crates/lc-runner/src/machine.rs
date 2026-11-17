@@ -22,8 +22,11 @@ const LOG_LINES: usize = 400;
 
 static LOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
-/// The log file, once [`persist_log`] has opened it.
-static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// The log file, once [`persist_log`] has named it. Opened (in append mode)
+/// for each message rather than kept open: the supervisor and the Runner
+/// both write it, and when one of them rotates it the other must follow to
+/// the new file instead of writing into the renamed one.
+static LOG_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Largest log file kept before it is rotated (to `runner.log.1`).
 const LOG_FILE_MAX: u64 = 5 << 20;
@@ -79,7 +82,7 @@ pub fn persist_log(path: &std::path::Path, load_previous: bool) {
         .append(true)
         .open(path);
     match file {
-        Ok(f) => *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(f),
+        Ok(_) => *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf()),
         Err(e) => tracing::warn!("cannot write the log file {}: {e}", path.display()),
     }
 }
@@ -125,8 +128,14 @@ impl Drop for LogLine {
     fn drop(&mut self) {
         let _ = std::io::stderr().write_all(&self.0);
         let text = strip_ansi(&String::from_utf8_lossy(&self.0));
-        if let Some(file) = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let _ = file.write_all(text.as_bytes());
+        if let Some(path) = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path);
+            if let Ok(mut file) = file {
+                let _ = file.write_all(text.as_bytes());
+            }
         }
         let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
         for line in text.lines().filter(|l| !l.trim().is_empty()) {

@@ -938,6 +938,8 @@ impl App {
             }
             wgpu::SurfaceError::OutOfMemory => {
                 tracing::error!("GPU out of memory; exiting");
+                // Not a close: the supervisor restarts it.
+                self.exit_code = 1;
                 event_loop.exit();
             }
             // Typical for a minimized/occluded window; it would otherwise
@@ -1120,7 +1122,10 @@ impl ApplicationHandler for App {
                 let show = show.clone();
                 self.apply_show(event_loop, show);
                 if self.windows.is_empty() {
-                    event_loop.exit(); // a local show without outputs is an error already logged
+                    // A local show without outputs is an error, already
+                    // logged.
+                    self.exit_code = 1;
+                    event_loop.exit();
                 }
             }
             ShowSource::Cluster { runner_name, .. } => {

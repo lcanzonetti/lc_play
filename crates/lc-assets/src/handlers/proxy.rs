@@ -9,10 +9,10 @@
 //! the media folder (`.lcplay-proxies`, not listed as media), and serves it
 //! with `Range` support like any media file.
 //!
-//! * The first request for a file waits while its proxy is made. The encode
-//!   runs in its own task: a client that goes away (page reloaded, cue
-//!   deleted) does not abandon it half-written, and a second request waits
-//!   for the same encode instead of starting another.
+//! * The first request for a file starts its encode, in its own task, and
+//!   is answered at once (503, retry later; `?status` tells when it is
+//!   ready). No request waits on an encode, a client that goes away does not
+//!   abandon it half-written, and there is at most one encode per file.
 //! * Proxies have their own small concurrency limit, so a show full of new
 //!   videos does not hold up thumbnails and probes for minutes.
 //! * A proxy is named after the asset, its size and modification time: a
@@ -23,12 +23,12 @@
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::error::AppError;
@@ -45,10 +45,23 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Proxies made at the same time.
 pub const PROXY_JOBS: usize = 2;
 
-/// `GET /proxy/{id}` — the preview proxy of a video (made on first request).
+#[derive(Debug, Deserialize)]
+pub struct ProxyParams {
+    /// Answer with the proxy's state (`{"state": "ready" | "making" |
+    /// "failed"}`) instead of the proxy.
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `GET /proxy/{id}` — the preview proxy of a video. If it does not exist
+/// yet, its encode is started in the background and the answer is
+/// `503 Service Unavailable` with `Retry-After`: nothing waits on an encode,
+/// so the browser's few connections to this server (six per host) stay free
+/// for listings, thumbnails and uploads. `?status` reports progress.
 pub async fn proxy_media(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<ProxyParams>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
@@ -62,47 +75,80 @@ pub async fn proxy_media(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     let version = (item.size, modified);
-    if state.proxy_failed.lock().unwrap().get(&id) == Some(&version) {
-        return Err(AppError::NotFound); // tried already: no proxy for it
-    }
-    let dir = state.config.media_dir.join(PROXY_DIR);
     let stem = format!("{:016x}", fnv1a(id.as_bytes()));
-    let path = dir.join(format!("{stem}-{}-{modified}.mp4", item.size));
+    let path = state
+        .config
+        .media_dir
+        .join(PROXY_DIR)
+        .join(format!("{stem}-{}-{modified}.mp4", item.size));
 
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        let job = state
-            .proxy_jobs
-            .lock()
-            .unwrap()
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let (source, target, ffmpeg, slots) = (
-            item.abs_path.clone(),
-            path.clone(),
-            state.config.ffmpeg.clone(),
-            state.proxy_slots.clone(),
+    let ready = tokio::fs::try_exists(&path).await.unwrap_or(false);
+    let failed = !ready && state.proxy_failed.lock().unwrap().get(&id) == Some(&version);
+    if !ready && !failed {
+        start_job(
+            &state,
+            &id,
+            &item.name,
+            &item.abs_path,
+            &path,
+            &stem,
+            version,
         );
-        // In its own task: finishes (or fails) whatever happens to this
-        // request.
-        let made = tokio::spawn(async move {
-            let _making = job.lock().await;
-            if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-                return Ok(());
-            }
+    }
+    if params.status.is_some() {
+        let s = if ready {
+            "ready"
+        } else if failed {
+            "failed"
+        } else {
+            "making"
+        };
+        return Ok(axum::Json(serde_json::json!({ "state": s })).into_response());
+    }
+    if ready {
+        return serve_file(&path, "video/mp4".into(), &headers).await;
+    }
+    if failed {
+        return Err(AppError::NotFound);
+    }
+    Ok((
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "5")],
+        "preview proxy being made",
+    )
+        .into_response())
+}
+
+/// Start the encode of a proxy, unless one for this item is running. It
+/// runs to the end whatever happens to the request that started it.
+fn start_job(
+    state: &AppState,
+    id: &str,
+    name: &str,
+    source: &std::path::Path,
+    target: &std::path::Path,
+    stem: &str,
+    version: (u64, u64),
+) {
+    if !state.proxy_jobs.lock().unwrap().insert(id.to_string()) {
+        return; // already being made
+    }
+    let (state, id, name) = (state.clone(), id.to_string(), name.to_string());
+    let (source, target, stem) = (source.to_path_buf(), target.to_path_buf(), stem.to_string());
+    tokio::spawn(async move {
+        let result = async {
             tokio::fs::create_dir_all(target.parent().expect("in the proxy folder")).await?;
-            let _slot = slots
+            let _slot = state
+                .proxy_slots
                 .acquire()
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             remove_older_versions(&target, &stem).await;
-            make_proxy(&ffmpeg, &source, &target).await
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("proxy job: {e}")))?;
-        state.proxy_jobs.lock().unwrap().remove(&id);
-        match made {
-            Ok(()) => tracing::info!("preview proxy made for '{}'", item.name),
+            make_proxy(&state.config.ffmpeg, &source, &target).await
+        }
+        .await;
+        match result {
+            Ok(()) => tracing::info!("preview proxy made for '{name}'"),
             Err(e) => {
                 tracing::warn!("{e:?}");
                 state
@@ -110,11 +156,10 @@ pub async fn proxy_media(
                     .lock()
                     .unwrap()
                     .insert(id.clone(), version);
-                return Err(AppError::NotFound);
             }
         }
-    }
-    serve_file(&path, "video/mp4".into(), &headers).await
+        state.proxy_jobs.lock().unwrap().remove(&id);
+    });
 }
 
 /// Remove the proxies of earlier versions of the same asset.

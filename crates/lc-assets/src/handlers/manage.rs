@@ -109,7 +109,29 @@ fn safe_file_name(name: &str) -> Option<String> {
     let base = name.rsplit(['/', '\\']).next()?.trim();
     // …and refuse names that are special to the file system or to us
     // (dot-files are in-progress uploads).
-    if base.is_empty() || base.starts_with('.') || base.contains('\0') || base.len() > 200 {
+    if base.is_empty() || base.starts_with('.') || base.len() > 200 {
+        return None;
+    }
+    // What Windows cannot store as a plain file name: control characters,
+    // ':' (drive letters, alternate data streams) and the reserved device
+    // names, with or without an extension.
+    if base
+        .chars()
+        .any(|c| c.is_control() || matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return None;
+    }
+    let stem = base
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved || base.ends_with('.') || base.ends_with(' ') {
         return None;
     }
     Some(base.to_string())
@@ -256,6 +278,28 @@ pub async fn thumbnail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_windows_cannot_store_are_refused() {
+        for bad in [
+            "C:x.mp4",
+            "a.mp4:stream",
+            "CON.mp4",
+            "nul",
+            "com1.mov",
+            "lpt9",
+            "x\u{1}.mp4",
+            "a?.mp4",
+            "trailing.",
+        ] {
+            assert_eq!(safe_file_name(bad), None, "{bad}");
+        }
+        assert_eq!(
+            safe_file_name("console.mp4").as_deref(),
+            Some("console.mp4")
+        );
+        assert_eq!(safe_file_name("com10.mov").as_deref(), Some("com10.mov"));
+    }
 
     #[test]
     fn upload_names_cannot_leave_the_media_directory() {

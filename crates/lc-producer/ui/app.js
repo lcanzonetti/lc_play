@@ -1070,12 +1070,15 @@ function previewFor(cue, asset) {
     thumb.src = asset.url.replace('/stream/', '/thumb/') + `?v=${asset.size}`;
     p = { kind: asset.kind, thumb, failed: false };
     if (asset.kind === 'video') {
-      // The Asset Manager's preview proxy (a small H.264 copy, made once):
-      // plays in any web view whatever the original's codec (HAP, ProRes),
-      // and is far lighter to decode than a 4K original.
-      p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto', src: asset.url.replace('/stream/', '/proxy/') });
-      // No proxy (no H.264 encoder on the Asset Manager, a read-only media
-      // folder): try the original once — plain H.264 plays as it is.
+      // The Asset Manager's preview proxy (a small H.264 copy, made once)
+      // plays in any web view whatever the original's codec (HAP, ProRes)
+      // and is far lighter to decode than a 4K original. Its address is
+      // given to the <video> only once it exists (see proxySource): until
+      // then the thumbnail shows, and no connection waits on an encode.
+      p.node = Object.assign(document.createElement('video'), { muted: true, playsInline: true, preload: 'auto' });
+      p.proxy = asset.url.replace('/stream/', '/proxy/');
+      p.nextCheck = 0;
+      // No proxy after all: the original, which plays if it is H.264.
       p.node.addEventListener('error', () => {
         if (p.node.src.includes('/proxy/')) p.node.src = asset.url;
         else p.failed = true;
@@ -1089,6 +1092,22 @@ function previewFor(cue, asset) {
   }
   p.used = performance.now();
   return p;
+}
+
+/** Give a preview video its source once the Asset Manager has its proxy
+ *  (asking every few seconds; each question is answered at once). */
+function proxySource(p, asset) {
+  if (p.node.getAttribute('src') || p.checking || performance.now() < p.nextCheck) return;
+  p.checking = true;
+  fetch(`${p.proxy}?status=1`)
+    .then((r) => (r.ok ? r.json() : { state: 'failed' }))
+    .then(({ state }) => {
+      if (state === 'ready') p.node.src = p.proxy;
+      else if (state === 'failed') p.node.src = asset.url;
+      else p.nextCheck = performance.now() + 3000;
+    })
+    .catch(() => { p.nextCheck = performance.now() + 5000; })
+    .finally(() => { p.checking = false; });
 }
 
 /** Steer a preview video to `target` seconds; return something drawable. */
@@ -1134,6 +1153,7 @@ function cuePicture(cue, track, t, tl, onAir) {
   if (!asset) return null;
   if (asset.kind === 'video' && !liveVideo) return stillFor(asset);
   const p = previewFor(cue, asset);
+  if (asset.kind === 'video') proxySource(p, asset);
   if (asset.kind !== 'video') return (!p.failed && drawable(p.node)) || drawable(p.thumb);
   const tr = currentTransport(tl);
   const length = asset.duration_s || p.node.duration || 0;
@@ -1833,7 +1853,10 @@ function renderRunners(force = false) {
           : act('Standby', 'Close its outputs; it stays connected', () => runnerAction(name, 'standby', `Put ${name} in standby? Its outputs close until resumed.`)),
         act('Restart', machine?.supervised ? 'Restart the Runner program' : 'Not supervised: Restart will only stop it',
           () => runnerAction(name, 'restart', `Restart the Runner program on ${name}? Its outputs go dark for a few seconds.`)),
-        act('Quit', 'Close the Runner program; Start (here) opens it again', () => runnerAction(name, 'quit', `Close the Runner program on ${name}? It can be started again from here with Start.`)),
+        act('Quit', machine?.supervised ? 'Close the Runner program; Start (here) opens it again' : 'Close the Runner program (it runs without a supervisor: it can then only be started on its computer)',
+          () => runnerAction(name, 'quit', machine?.supervised
+            ? `Close the Runner program on ${name}? It can be started again from here with Start.`
+            : `Close the Runner program on ${name}? It runs without a supervisor, so it can then only be started on that computer.`)),
         act('Exit', 'Close the Runner program for good: it can then only be started on its computer', () => runnerAction(name, 'exit', `Close the Runner program on ${name} for good? It can then only be started again on that computer${machine?.allow_power ? ' or by rebooting it' : ''}.`)),
         act('Reboot', power ? 'Restart the computer' : noPower,
           () => runnerAction(name, 'reboot', `Restart the computer ${machine?.hostname || name}?`), { disabled: !power }),
@@ -1841,10 +1864,11 @@ function renderRunners(force = false) {
           () => runnerAction(name, 'power_off', `Shut down the computer ${machine?.hostname || name}? It can be woken again only if Wake-on-LAN is enabled on it.`), { disabled: !power }),
       );
     } else {
-      actions.append(act('Start', machine?.ip
+      const startable = machine?.ip && machine.supervised;
+      actions.append(act('Start', startable
         ? `Start the Runner program again on ${machine.hostname || machine.ip} (its supervisor waits for this after the Runner was closed; the computer must be on)`
-        : 'Its network address is not known yet',
-        () => { command({ type: 'start_runner', runner: name }); toast(`Asked ${name} to start.`, true); }, { disabled: !machine?.ip }));
+        : !machine?.ip ? 'Its network address is not known yet' : 'It ran without a supervisor (--no-supervise): start it on its computer',
+        () => { command({ type: 'start_runner', runner: name }); toast(`Asked ${name} to start.`, true); }, { disabled: !startable }));
       actions.append(act('Wake', machine?.mac ? `Send a Wake-on-LAN packet to ${machine.mac}` : 'Its network card address is not known yet',
         () => { command({ type: 'wake_runner', runner: name }); toast(`Wake-on-LAN sent to ${name}.`, true); }, { disabled: !machine?.mac }));
     }

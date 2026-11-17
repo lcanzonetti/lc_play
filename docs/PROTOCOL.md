@@ -362,7 +362,7 @@ Bundles are accepted; their time tags are ignored.
 | `GET /stream/{id}` | the file, with `Range` support |
 | `GET /thumb/{id}` | small PNG |
 | `GET /transcode/{id}` | on-the-fly transcode for browser preview |
-| `GET /proxy/{id}` | a 640-pixel H.264 preview copy of a video, made on first request (stored in `.lcplay-proxies` in the media folder, which is not listed), served with `Range` — what the Producer's stage preview plays |
+| `GET /proxy/{id}` | a 640-pixel H.264 preview copy of a video (stored in `.lcplay-proxies` in the media folder, which is not listed), served with `Range` — what the Producer's stage preview plays. While it is being made (the first request starts that, in the background): `503` with `Retry-After`; `404` if it cannot be made. `?status` answers `{ "state": "ready" \| "making" \| "failed" }` at once. |
 
 `kind` is `video`, `image` or `audio`. By default browsers may use the
 server only from pages served on port 7404 (the Producer); `POST`/`DELETE`

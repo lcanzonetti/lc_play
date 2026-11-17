@@ -107,7 +107,13 @@ fn main() -> anyhow::Result<()> {
     // Kept across restarts: see `folders.rs` for where, and why.
     let folders = lc_runner::folders::runner_folders(args.cache_dir.clone(), &name);
     let log_file = folders.state.join("runner.log");
-    let is_supervisor = !args.worker && !args.no_supervise;
+    // A show file or --demo without a Director is a stand-alone check: no
+    // supervisor (it would wait for a Start no Director can send).
+    let standalone = (args.show.is_some() || args.demo)
+        && args.director.is_none()
+        && !args.discover
+        && lc_runner::folders::runner_setting("director").is_none();
+    let is_supervisor = !args.worker && !args.no_supervise && !standalone;
     lc_runner::machine::persist_log(&log_file, !is_supervisor);
 
     if is_supervisor {
@@ -265,14 +271,23 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
         let port = std::fs::read_to_string(state_dir.join("launcher-port"))
             .ok()
             .and_then(|p| p.trim().parse::<u16>().ok());
-        if let (Some(port), Some(me)) = (port, &me) {
-            let msg = serde_json::to_vec(&lc_proto::StartRunner {
-                start_runner: me.clone(),
-            })?;
-            let socket = std::net::UdpSocket::bind(("127.0.0.1", 0))?;
-            socket.send_to(&msg, ("127.0.0.1", port))?;
+        // Before the Runner's first run there is no identity yet; the waiting
+        // supervisor then accepts any request.
+        let me = me.unwrap_or_else(|| lc_proto::NodeId(String::new()));
+        let sent = port.is_some_and(|port| {
+            let msg = serde_json::to_vec(&lc_proto::StartRunner { start_runner: me })
+                .expect("serialisable");
+            std::net::UdpSocket::bind(("127.0.0.1", 0))
+                .and_then(|s| s.send_to(&msg, ("127.0.0.1", port)))
+                .is_ok()
+        });
+        if sent {
+            println!(
+                "This Runner is already running (or waiting to be started): asked it to start."
+            );
+        } else {
+            println!("This Runner is already supervised by another lc-runner, which could not be reached.");
         }
-        println!("This Runner is already running (or waiting to be started): asked it to start.");
         return Ok(());
     }
 
@@ -285,6 +300,10 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating this program")?;
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let mut backoff = Duration::from_secs(1);
+    // Runs that failed within seconds of starting, in a row: a fault that a
+    // restart will not cure (a show file that does not parse, a missing
+    // GPU). After a few, stop restarting and wait for Start instead.
+    let mut quick_failures = 0;
     loop {
         let started = std::time::Instant::now();
         let mut child = Command::new(&exe)
@@ -313,6 +332,21 @@ fn supervise(state_dir: &std::path::Path) -> anyhow::Result<()> {
                 backoff = Duration::from_secs(1);
             }
             _ => {
+                if started.elapsed() < Duration::from_secs(5) {
+                    quick_failures += 1;
+                } else {
+                    quick_failures = 0;
+                }
+                if quick_failures >= 3 {
+                    tracing::error!(
+                        "supervisor: the runner failed at start {quick_failures} times in a row \
+                         ({status}); not restarting it again until Start (see the log above)"
+                    );
+                    quick_failures = 0;
+                    wait_for_start(&launcher, me.as_ref().or(read_node_id(state_dir).as_ref()));
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
                 // A runner that ran for a while and then died gets restarted
                 // quickly; one that dies at once, more and more slowly.
                 if started.elapsed() > Duration::from_secs(60) {

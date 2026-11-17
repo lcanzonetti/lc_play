@@ -761,6 +761,10 @@ impl Core {
             .filter(|k| !online(k))
             .filter_map(|k| {
                 let m = k.machine.as_ref()?;
+                // Without a supervisor nothing listens for the request.
+                if !m.supervised {
+                    return None;
+                }
                 let port = m.launcher_port.unwrap_or(lc_proto::LAUNCHER_PORT);
                 Some((k.node_id.clone(), m.ip.clone(), port))
             })
@@ -768,7 +772,9 @@ impl Core {
         drop(st);
         if targets.is_empty() {
             return Err(format!(
-                "start '{runner}': it is running already, or its address is not known yet"
+                "start '{runner}': it is running already, its address is not known yet, \
+                 or it runs without a supervisor (--no-supervise) and can only be started \
+                 on its computer"
             ));
         }
         let (mut sent, mut last_error) = (0, String::new());

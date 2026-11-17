@@ -27,7 +27,7 @@ pub struct AppState {
     pub thumbs: Arc<Mutex<HashMap<String, (u64, axum::body::Bytes)>>>,
     /// One lock per item whose preview proxy is being made, so that two
     /// requests for it start one ffmpeg, not two.
-    pub proxy_jobs: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    pub proxy_jobs: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Proxies made at the same time (their own limit: a show full of new
     /// videos must not hold up thumbnails and probes for minutes).
     pub proxy_slots: Arc<Semaphore>,

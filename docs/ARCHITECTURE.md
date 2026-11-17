@@ -268,8 +268,9 @@ Known gaps:
   drive the transport. (The Asset Manager does restrict browser access to
   the Producer's origin.) Closed show networks only.
 * **A panic in the Director is fatal in release builds** (`panic = "abort"`).
-  Arithmetic on values from the wire is overflow-safe, but there is no
-  supervisor: run it under one (systemd, a service manager).
+  Arithmetic on values from the wire is overflow-safe, but the Director,
+  unlike the Runner, has no supervisor of its own: run it under one
+  (systemd, a Windows service manager).
 
 ## 5. Runner internals
 
@@ -480,10 +481,17 @@ Director between Producers only.
 ### Runner management
 
 `lc-runner` is started as a supervisor that runs the real Runner as a child
-(`--worker`): exit code 0 ends both, the restart code (75) starts it again
-at once, anything else (a crash) starts it again after a growing pause. The
-child exits when the supervisor's end of its stdin closes, so killing the
-supervisor never leaves an orphan, on Windows too.
+(`--worker`): exit code 0 (window closed, Quit) leaves the supervisor
+waiting for a `start_runner` from the Director (UDP, its own port reported
+as `launcher_port`), the restart code (75) starts it again at once, the exit
+code (77, `Exit`) ends both, anything else (a crash) starts it again after a
+growing pause — and after three failures within seconds of starting, waits
+for Start instead of looping. One supervisor per Runner folder (lock file);
+a second launch asks the first to start the Runner. A show file or `--demo`
+without a Director runs unsupervised. The child exits when the supervisor's
+end of its stdin closes, so killing the supervisor never leaves an orphan,
+on Windows too. Both write the log file by path, so a rotation by one does
+not lose the other's lines.
 
 Operator actions travel as `runner_action` commands; the Director forwards
 them to the named Runner. A Runner reports its machine (host name, OS,

@@ -346,7 +346,8 @@ const SPARE_BUFFERS: usize = 8;
 
 /// Keep a texture buffer for the next decode (up to `SPARE_BUFFERS`).
 fn recycle(st: &mut Sched, buffer: Vec<u8>) {
-    if st.spare.len() < SPARE_BUFFERS {
+    // A stopped layer keeps nothing.
+    if !st.stop && st.spare.len() < SPARE_BUFFERS {
         st.spare.push(buffer);
     }
 }
@@ -473,6 +474,10 @@ impl HapContent {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+        // A worker that was mid-frame may have handed in its result since.
+        let mut st = self.shared.state.lock().unwrap();
+        st.ready.clear();
+        st.spare = Vec::new();
     }
 
     /// The frames to have ready, soonest first: the wanted one, then the
@@ -572,7 +577,7 @@ fn worker(
         st.busy.remove(&frame);
         match result {
             // Keep it only if it is still wanted (playback may have jumped).
-            Ok(()) if st.wanted.contains(&frame) => {
+            Ok(()) if !st.stop && st.wanted.contains(&frame) => {
                 st.ready.insert(frame, out);
             }
             Ok(()) => recycle(&mut st, out),
