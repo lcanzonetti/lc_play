@@ -171,6 +171,14 @@ pub struct Layer {
     /// only while that timeline is on stage.
     #[serde(default)]
     pub timeline: Option<String>,
+    /// Drawn on this output only (a display's test pattern), not on others
+    /// whose canvas area it overlaps.
+    #[serde(default)]
+    pub only_output: Option<String>,
+    /// Timed by the cluster clock (seconds), not by its timeline: test
+    /// patterns, which run whatever the transport does.
+    #[serde(default)]
+    pub cluster_clock: bool,
 }
 
 /// Content source for a layer. Tagged by `"type"` in JSON.
@@ -184,6 +192,9 @@ pub enum Source {
     /// The synchronisation test pattern, at `fps` frames per second.
     #[serde(rename = "sync_test")]
     SyncTest { fps: f64 },
+    /// Two lines sweeping across the layer, one step per frame at `fps`.
+    #[serde(rename = "sweep_test")]
+    SweepTest { fps: f64 },
     /// Pre-recorded video, decoded by an `ffmpeg` child process.
     Video { path: String },
     /// Live input such as a capture card or NDI stream (not implemented).

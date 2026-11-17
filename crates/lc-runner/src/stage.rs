@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use lc_proto::show::{AssetKind, CueSource, ShowDocument};
+use lc_proto::show::{AssetKind, CueSource, ShowDocument, TestPatternKind};
 
 use crate::assets::AssetCache;
 use crate::show::{
@@ -24,7 +24,7 @@ use crate::show::{
 };
 
 pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) -> Show {
-    let outputs = doc
+    let outputs: Vec<Output> = doc
         .stage
         .displays
         .iter()
@@ -143,9 +143,43 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
                         free_run: cue.free_run || track.free_run,
                     },
                     timeline: timeline.clone(),
+                    only_output: None,
+                    cluster_clock: false,
                 });
             }
         }
+    }
+
+    // A display's test pattern: a layer exactly over the display's area, in
+    // front of everything, drawn on that display only.
+    for d in &doc.stage.displays {
+        let (Some(t), true) = (
+            d.test_pattern,
+            outputs.iter().any(|o: &Output| o.id == d.id),
+        ) else {
+            continue;
+        };
+        let r = d.canvas_rect;
+        layers.push(Layer {
+            id: format!("test-pattern:{}", d.id),
+            source: match t.kind {
+                TestPatternKind::Lines => Source::SweepTest { fps: t.fps },
+                TestPatternKind::Counter => Source::SyncTest { fps: t.fps },
+            },
+            transform: Transform {
+                position: [r.x + r.w / 2.0, r.y + r.h / 2.0],
+                size: [r.w, r.h],
+                anchor: [0.5, 0.5],
+                scale: [1.0, 1.0],
+                rotation: 0.0,
+                opacity: 1.0,
+                z: f32::MAX,
+            },
+            timing: Timing::default(),
+            timeline: None,
+            only_output: Some(d.id.clone()),
+            cluster_clock: true,
+        });
     }
 
     Show {
@@ -218,6 +252,30 @@ mod tests {
             front.transform.z > show.layers[1].transform.z,
             "first track is in front"
         );
+    }
+
+    #[test]
+    fn a_display_test_pattern_is_a_top_layer_over_that_display_only() {
+        let mut d = doc();
+        d.stage.displays[1].test_pattern = Some(lc_proto::show::TestPattern {
+            kind: TestPatternKind::Lines,
+            fps: 50.0,
+        });
+        // Display b belongs to "right": on that Runner, the pattern is there…
+        let show = build(&d, "right", &cache());
+        let t = show
+            .layers
+            .iter()
+            .find(|l| l.only_output.as_deref() == Some("b"))
+            .unwrap();
+        assert!(matches!(t.source, Source::SweepTest { fps } if fps == 50.0));
+        assert_eq!(t.transform.position, [1920.0 + 960.0, 540.0]);
+        assert_eq!(t.transform.size, [1920.0, 1080.0]);
+        assert!(t.cluster_clock);
+        assert!(show.layers.iter().all(|l| l.transform.z <= t.transform.z));
+        // …on "left", which does not drive b, it is not.
+        let show = build(&d, "left", &cache());
+        assert!(show.layers.iter().all(|l| l.only_output.is_none()));
     }
 
     #[test]

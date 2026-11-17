@@ -58,6 +58,8 @@ struct SceneUniform {
     /// How the layer's texture(s) encode its pixels; see `Sampling`.
     mode: u32,
     uv_scale: [f32; 2],
+    /// Extra values for shader-drawn content (`Sampling::param`).
+    param: [f32; 4],
 }
 
 #[repr(C)]
@@ -72,7 +74,7 @@ struct BlendUniform {
 }
 
 // Uniform layouts must match the WGSL structs byte-for-byte.
-const _: () = assert!(std::mem::size_of::<SceneUniform>() == 80);
+const _: () = assert!(std::mem::size_of::<SceneUniform>() == 96);
 const _: () = assert!(std::mem::size_of::<BlendUniform>() == 32);
 
 /// Unit-quad vertex for the scene pass.
@@ -826,6 +828,13 @@ impl Gpu {
                 // `times[i]` is layer i's own timeline time, `None` while
                 // that timeline is off stage.
                 .filter(|&i| times[i].is_some_and(|t| show.layers[i].timing.visible_at(t)))
+                // A display's test pattern is for that display only.
+                .filter(|&i| {
+                    show.layers[i]
+                        .only_output
+                        .as_ref()
+                        .is_none_or(|id| *id == output.id)
+                })
         };
 
         // Per-layer uniforms for this output (staged; applied at submit).
@@ -838,6 +847,7 @@ impl Gpu {
                 opacity: t.opacity * show.layers[i].timing.fade_at(times[i].unwrap_or(0.0)),
                 mode: sampling.mode as u32,
                 uv_scale: sampling.uv_scale,
+                param: sampling.param,
             };
             self.queue
                 .write_buffer(&out.layer_uniforms[i], 0, bytemuck::bytes_of(&u));
@@ -1290,6 +1300,7 @@ struct OutputResources {
 mod tests {
     use super::*;
     use crate::show::Show;
+    use crate::testpattern::SweepContent;
 
     fn output(json_extra: &str) -> Output {
         let json = format!(
@@ -1582,6 +1593,40 @@ mod tests {
         let px = render_offscreen(&gpu, &show, 0, 64, 64)[32 * 64 + 32];
         assert!((px[0] - 0.5).abs() < 0.01, "red over black: {px:?}");
         assert!(px[1] < 0.01 && px[2] < 0.01, "{px:?}");
+    }
+
+    #[test]
+    fn the_sweep_test_pattern_draws_its_lines_where_the_frame_says() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        let json = |only: &str| {
+            format!(
+                r#"{{ "canvas": {{ "width": 64, "height": 64 }},
+                 "outputs": [ {{ "id": "o", "canvas_rect": {{ "x": 0, "y": 0, "w": 64, "h": 64 }} }} ],
+                 "layers": [ {{ "id": "t", "source": {{ "type": "sweep_test", "fps": 50 }},
+                               "transform": {{ "position": [32,32], "size": [64,64] }},
+                               "only_output": "{only}", "cluster_clock": true }} ] }}"#
+            )
+        };
+        let show = Show::from_json(&json("o")).unwrap();
+        let factory = gpu.factory();
+        let mut content = content::build(&show.layers[0], &factory).unwrap();
+        // Frame 50 at 50 fps: the vertical line half way across (100 steps
+        // in 2 s), the horizontal one a third of the way down (150 in 3 s).
+        content.update(1.0, &factory);
+        let px = render_contents(&gpu, &show, 0, 64, 64, &[content]);
+        let (x, y) = SweepContent::positions(50, 50.0);
+        let col = (x * 64.0) as usize;
+        let row = (y * 64.0) as usize;
+        assert!(px[5 * 64 + col][0] > 0.9, "vertical line at column {col}");
+        assert!(px[row * 64 + 5][0] > 0.9, "horizontal line at row {row}");
+        assert!(px[50 * 64 + 50][0] < 0.01, "transparent elsewhere");
+
+        // A pattern for another display is not drawn on this one.
+        let show = Show::from_json(&json("elsewhere")).unwrap();
+        let mut content = content::build(&show.layers[0], &factory).unwrap();
+        content.update(1.0, &factory);
+        let px = render_contents(&gpu, &show, 0, 64, 64, &[content]);
+        assert!(px[5 * 64 + col][0] < 0.01, "not on this output");
     }
 
     #[test]

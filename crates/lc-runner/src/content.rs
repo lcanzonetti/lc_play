@@ -41,6 +41,9 @@ pub enum Encoding {
     Yuv601 = 4,
     /// RGB in an sRGB texture whose alpha is to be ignored (HAP DXT1).
     Opaque = 5,
+    /// No texture: the shader draws the sweeping-lines test pattern (see
+    /// `testpattern.rs`), positioned by `Sampling::param`.
+    Sweep = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +52,8 @@ pub struct Sampling {
     /// Fraction of the texture that holds the picture (compressed textures
     /// are padded to whole 4×4 blocks).
     pub uv_scale: [f32; 2],
+    /// Extra values for shader-drawn content (the sweep test pattern).
+    pub param: [f32; 4],
 }
 
 impl Default for Sampling {
@@ -56,6 +61,7 @@ impl Default for Sampling {
         Sampling {
             mode: Encoding::Premultiplied,
             uv_scale: [1.0, 1.0],
+            param: [0.0; 4],
         }
     }
 }
@@ -211,6 +217,7 @@ pub fn cache_key(layer: &Layer) -> String {
         Source::Color { rgba } => format!("color:{rgba:?}"),
         // Keyed per layer, like video: each follows its own cue's timing.
         Source::SyncTest { fps } => format!("sync-test:{}:{fps}", layer.id),
+        Source::SweepTest { fps } => format!("sweep-test:{}:{fps}", layer.id),
         Source::Video { path } => format!("video:{}:{path}", layer.id),
         Source::Live { kind } => format!("live:{kind}"),
         Source::Missing { reason } => format!("missing:{reason}"),
@@ -237,6 +244,9 @@ pub fn build(layer: &Layer, factory: &TextureFactory) -> anyhow::Result<Box<dyn 
             *fps,
             &layer.timing,
             factory,
+        ))),
+        Source::SweepTest { fps } => Ok(Box::new(crate::testpattern::SweepContent::new(
+            *fps, factory,
         ))),
         Source::Missing { reason } => {
             tracing::debug!(layer = %layer.id, "{reason}; showing placeholder");

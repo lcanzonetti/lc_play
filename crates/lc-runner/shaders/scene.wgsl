@@ -13,11 +13,12 @@
 //   3  YUV 4:2:0, three R8 planes, BT.709 limited range (decoded video)
 //   4  YUV 4:2:0, three R8 planes, BT.601 limited range (SD video)
 //   5  RGB, alpha ignored, sRGB texture (HAP DXT1, which is RGB only)
+//   6  no texture: the sweeping-lines test pattern, drawn here
 //
 // Whatever the encoding, the result is premultiplied linear-light RGBA, which
 // is what the (sRGB) scene target blends in.
 
-// Must match `SceneUniform` in render.rs byte-for-byte (80 bytes).
+// Must match `SceneUniform` in render.rs byte-for-byte (96 bytes).
 struct SceneUniform {
     mvp: mat4x4<f32>,
     opacity: f32,
@@ -25,6 +26,9 @@ struct SceneUniform {
     // Fraction of the texture holding the picture: compressed textures are
     // padded to a multiple of 4 pixels.
     uv_scale: vec2<f32>,
+    // Mode 6: x = vertical line position, y = horizontal line position
+    // (0..1 across the layer), z = line width in output pixels.
+    param: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: SceneUniform;
@@ -62,8 +66,21 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     let su = textureSample(tex_u, samp, in.uv).r;
     let sv = textureSample(tex_v, samp, in.uv).r;
 
+    // Mode 6 needs screen-space derivatives, which must also be taken in
+    // uniform control flow: here, for every mode.
+    let px = fwidth(in.uv);
+
     var rgba: vec4<f32>;
     switch u.mode {
+        case 6u: {
+            // A vertical and a horizontal line, `param.z` output pixels
+            // wide, wherever the layer is shown (fitted to its display).
+            let half = 0.5 * u.param.z;
+            let dx = abs(in.uv.x - u.param.x) / max(px.x, 1e-6);
+            let dy = abs(in.uv.y - u.param.y) / max(px.y, 1e-6);
+            let on = f32(dx <= half || dy <= half);
+            rgba = vec4<f32>(on, on, on, on);
+        }
         case 5u: {
             // DXT1 punch-through texels read as transparent black; in HAP
             // they mean black.

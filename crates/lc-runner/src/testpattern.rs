@@ -213,3 +213,87 @@ mod tests {
         assert_eq!(pixel(&px, 4 * slot + slot / 2, 140), 0);
     }
 }
+
+/// Two lines sweeping across the layer: a vertical one left to right, a
+/// horizontal one top to bottom, one step per frame at `fps`, white on
+/// transparent so they can be watched over the content. A smooth sweep means
+/// every frame reached the screen once, in order; a judder or a jump, a
+/// repeated or dropped frame. Drawn by the scene shader (mode 6): sharp at
+/// any resolution, nothing to upload.
+pub struct SweepContent {
+    fps: f64,
+    frame: i64,
+    /// The shader samples a texture whatever the mode: a 1×1 one.
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Frames for one sweep across the display, per second of `fps`: the
+/// vertical line crosses in 2 s, the horizontal one in 3 s (different, so
+/// the two do not move as one).
+const SWEEP_X_SECONDS: f64 = 2.0;
+const SWEEP_Y_SECONDS: f64 = 3.0;
+/// Line width, output pixels.
+const SWEEP_LINE_PX: f32 = 3.0;
+
+impl SweepContent {
+    pub fn new(fps: f64, factory: &TextureFactory) -> Self {
+        let blank = factory.transparent();
+        SweepContent {
+            fps: fps.clamp(1.0, 1000.0),
+            frame: 0,
+            _texture: blank._texture,
+            bind_group: blank.bind_group,
+        }
+    }
+
+    /// Where the lines are on frame `frame`, 0..1 across the layer.
+    pub(crate) fn positions(frame: i64, fps: f64) -> (f32, f32) {
+        let steps = |seconds: f64| ((seconds * fps).round() as i64).max(2);
+        let at = |n: i64| (frame.rem_euclid(n) as f64 + 0.5) / n as f64;
+        (
+            at(steps(SWEEP_X_SECONDS)) as f32,
+            at(steps(SWEEP_Y_SECONDS)) as f32,
+        )
+    }
+}
+
+impl Content for SweepContent {
+    fn update(&mut self, t: f64, _gpu: &TextureFactory) {
+        // `t` is cluster time (seconds) for a display's test pattern: every
+        // display on the same step at the same instant.
+        self.frame = (t.max(0.0) * self.fps + 1e-6).floor() as i64;
+    }
+
+    fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.bind_group
+    }
+
+    fn sampling(&self) -> crate::content::Sampling {
+        let (x, y) = Self::positions(self.frame, self.fps);
+        crate::content::Sampling {
+            mode: crate::content::Encoding::Sweep,
+            uv_scale: [1.0, 1.0],
+            param: [x, y, SWEEP_LINE_PX, 0.0],
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    #[test]
+    fn the_lines_step_once_per_frame_and_wrap() {
+        let fps = 50.0;
+        let (x0, y0) = SweepContent::positions(0, fps);
+        let (x1, _) = SweepContent::positions(1, fps);
+        assert!(
+            (x1 - x0 - 1.0 / 100.0).abs() < 1e-6,
+            "100 steps across at 50 fps"
+        );
+        assert_eq!(SweepContent::positions(100, fps).0, x0, "wraps after 2 s");
+        assert_eq!(SweepContent::positions(150, fps).1, y0, "and 3 s");
+        assert!(x0 > 0.0 && x0 < 1.0);
+    }
+}

@@ -804,6 +804,11 @@ impl App {
             .layers
             .iter()
             .map(|layer| match layer.timeline.as_deref() {
+                // Test patterns run on the cluster clock, whatever the
+                // transport does.
+                _ if layer.cluster_clock => {
+                    Some(position.cluster_ns.max(0) as f64 / NANOS_PER_SEC as f64)
+                }
                 None => Some(now),
                 Some(id) => *task_times
                     .entry(id)

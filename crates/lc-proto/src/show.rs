@@ -158,6 +158,31 @@ pub struct Display {
     /// `None` = no warp.
     pub warp_corners: Option<[[f32; 2]; 4]>,
     pub blend: EdgeBlend,
+    /// A test pattern shown on this display only, over the content, fitted
+    /// to it. `None` = off.
+    pub test_pattern: Option<TestPattern>,
+}
+
+/// A display test pattern. Its frames follow the cluster clock — not the
+/// timeline — so it moves whether the show plays or not, and every display
+/// showing one is on the same step at the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TestPattern {
+    pub kind: TestPatternKind,
+    /// Steps per second: set it to the rate to test (usually the refresh
+    /// rate, or the content's frame rate).
+    pub fps: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestPatternKind {
+    /// A vertical and a horizontal line sweeping across the display, one
+    /// step per frame: judder, tearing and frame drops show at a glance.
+    Lines,
+    /// The frame counter of the `sync_test` cue: offsets between displays
+    /// read in frames.
+    Counter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -399,6 +424,11 @@ impl ShowDocument {
                 return Err(format!(
                     "{name}: canvas rect must not exceed {MAX_OUTPUT_PIXELS} pixels per side"
                 ));
+            }
+            if let Some(t) = d.test_pattern {
+                if !(t.fps.is_finite() && (1.0..=1000.0).contains(&t.fps)) {
+                    return Err(format!("{name}: test pattern fps must be 1..1000"));
+                }
             }
             if let Some(corners) = d.warp_corners {
                 let flat: Vec<f64> = corners.iter().flatten().map(|&v| v as f64).collect();

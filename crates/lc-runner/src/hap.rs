@@ -376,6 +376,7 @@ impl HapContent {
                 track.width as f32 / tw as f32,
                 track.height as f32 / th as f32,
             ],
+            param: [0.0; 4],
         };
         tracing::info!(
             "video '{path}': {}x{} at {:.3} fps, {} frames, HAP ({}) — decoded by the GPU",

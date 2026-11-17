@@ -1303,7 +1303,7 @@ function drawStage() {
     ctx.setLineDash(selected ? [] : [6, 4]);
     ctx.strokeRect(x + 0.5, y + 0.5, r.w * k, r.h * k);
     ctx.setLineDash([]);
-    const label = (d.name || 'display') + (d.runner ? ` @${d.runner}` : '');
+    const label = (d.name || 'display') + (d.runner ? ` @${d.runner}` : '') + (d.test_pattern ? ` · TEST ${d.test_pattern.fps} fps` : '');
     const tw = ctx.measureText(label).width + 10;
     ctx.fillStyle = selected ? '#fff' : '#4ea1ff';
     ctx.fillRect(x, y - 16, tw, 16);
@@ -1872,7 +1872,11 @@ function renderRunners(force = false) {
         el('span', { class: 'name', title: 'Edit in the Inspector', onclick: () => select({ type: 'display', id: d.id }) },
           `${d.name || 'display'} — ${d.canvas_rect.w}×${d.canvas_rect.h}${d.runner ? '' : ' (any runner)'}`),
         outputPicker(d, h?.monitors || []),
-        el('span', {}),
+        el('button', {
+          class: `small${d.test_pattern ? ' on' : ''}`,
+          title: d.test_pattern ? 'Test pattern on: click to turn it off' : 'Show moving test lines on this display (rate and kind in the Inspector)',
+          onclick: () => edit(() => { const live = findDisplay(d.id); if (live) live.test_pattern = live.test_pattern ? null : { kind: 'lines', fps: 60 }; }),
+        }, 'Test'),
         el('button', { class: 'small', title: 'Edit position, size, blend…', onclick: () => select({ type: 'display', id: d.id }) }, '✎')));
     }
     card.append(el('div', { class: 'btns' }, el('button', { onclick: () => addDisplay(name) }, '+ Display on this runner')));
@@ -2123,6 +2127,34 @@ function colorField(label, obj, key) {
 }
 
 const note = (text) => el('div', { class: 'note' }, text);
+
+/** A display's test pattern: drawn by its Runner over the content, fitted
+ *  to the display, at a chosen rate, on the cluster clock (it moves whether
+ *  the show plays or not, and every display is on the same step). */
+function testPatternFields(d) {
+  const tp = d.test_pattern;
+  const kind = el('select', { class: 'wide' },
+    el('option', { value: '' }, 'Off'),
+    el('option', { value: 'lines' }, 'Moving lines'),
+    el('option', { value: 'counter' }, 'Frame counter'));
+  kind.value = tp?.kind || '';
+  kind.onchange = () => {
+    kind.blur();
+    edit(() => {
+      const live = findDisplay(d.id);
+      if (!live) return;
+      live.test_pattern = kind.value ? { kind: kind.value, fps: live.test_pattern?.fps || 60 } : null;
+    });
+  };
+  const rows = [el('h4', {}, 'Test pattern'), el('div', { class: 'row' }, el('label', {}, 'Pattern'), kind)];
+  if (tp) {
+    rows.push(field('Rate (frames/s)', tp, 'fps', { step: 0.001, min: 1 }),
+      note(tp.kind === 'lines'
+        ? 'Two lines sweep across this display, one step per frame: smooth motion means every frame reached the screen once. Set the rate to the display refresh (or the content\'s frame rate) to judge judder.'
+        : 'The frame number, in digits and binary cells, with a white flash every second: film several displays together to read any offset in frames.'));
+  }
+  return rows;
+}
 const deleteButton = (text) => el('div', { class: 'btns' }, el('button', { class: 'danger', onclick: deleteSelection }, text));
 
 function renderInspector() {
@@ -2244,6 +2276,7 @@ function renderInspector() {
       pair('Left / Right', d.blend, 'left', 'right', frac),
       pair('Top / Bottom', d.blend, 'top', 'bottom', frac),
       field('Gamma', d.blend, 'gamma', { step: 0.1, min: 0.1 }),
+      ...testPatternFields(d),
       deleteButton('Delete display'));
     return;
   }

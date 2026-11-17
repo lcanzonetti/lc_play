@@ -413,6 +413,7 @@ impl VideoContent {
                             Encoding::Yuv709
                         },
                         uv_scale: [1.0, 1.0],
+                        param: [0.0; 4],
                     },
                 )
             }
