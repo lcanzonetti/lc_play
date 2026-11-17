@@ -202,6 +202,17 @@ at a frame boundary. The renderer now works per refresh:
 Escape hatches, for a driver that misbehaves: `LCPLAY_SWAPCHAIN=wgpu` (wgpu's
 own presentation, no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0`.
 
+**Frame timing log** (`frametime.rs`). Every render-loop iteration is split
+into *outside* (winit events), *housekeeping* (operator requests, show
+edits, asset swaps, reloads), *acquire* (waiting for the swap chains),
+*update* (layer contents, uploads included; the slowest layer is named),
+*render* (recording and submitting) and *present*. An iteration longer than
+two refreshes is logged as a `slow frame` line with that breakdown and what
+else happened in it (show applied, content loaded, preview read back, late
+decode…); at most four lines a second, and the periodic frame-rate line adds
+the slowest frame and the count over the threshold. `LCPLAY_FRAME_LOG=0`
+turns it off, `LCPLAY_FRAME_LOG=<ms>` sets the threshold.
+
 **[Not yet verified on frame-locked hardware.]** The pieces are unit-tested
 (grid arithmetic, refresh fitting, present tracking, the Director's grid
 selection) and run end to end on Linux, but the D3D12/NVAPI path has only

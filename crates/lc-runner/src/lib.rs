@@ -26,6 +26,7 @@ pub mod content;
 #[cfg(windows)]
 pub mod dxgi;
 pub mod folders;
+pub mod frametime;
 pub mod hap;
 pub mod machine;
 /// The QuickTime sample-table reader (in `lc-hap`, shared with the Asset

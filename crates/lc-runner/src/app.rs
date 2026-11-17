@@ -35,10 +35,11 @@ use lc_time::TransportChange;
 
 use crate::assets::AssetCache;
 use crate::content::{self, Content};
+use crate::frametime::{FrameTimer, Phase};
 use crate::playhead::Playhead;
 use crate::playhead::Position;
 use crate::render::{Capture, Gpu, OutputGpu};
-use crate::show::{Canvas, Output, Playback, Show};
+use crate::show::{Canvas, Output, Playback, Show, Source};
 use crate::stage;
 
 /// The cluster time at which a cue starting at `start_s` went on air under
@@ -132,6 +133,8 @@ pub struct App {
     /// Layer indices sorted back-to-front by z.
     draw_order: Vec<usize>,
     stats: FrameStats,
+    /// Where each frame's time goes; slow frames are logged.
+    timing: FrameTimer,
     /// Cluster only: (show id, asset-cache generation) of what is applied.
     applied: Option<(String, u64)>,
     started: bool,
@@ -147,6 +150,23 @@ pub struct App {
     /// How the process should end when the event loop stops: 0 to quit,
     /// `RESTART_EXIT_CODE` to be started again by the supervisor.
     pub exit_code: i32,
+}
+
+/// How the frame timing log names layer `index`: its id, and the file it
+/// shows, if any.
+fn layer_label(show: &Show, index: usize) -> String {
+    let Some(layer) = show.layers.get(index) else {
+        return format!("layer #{index}");
+    };
+    match &layer.source {
+        Source::Video { path } | Source::Image { path } => {
+            let file = std::path::Path::new(path)
+                .file_name()
+                .map_or_else(|| path.clone(), |f| f.to_string_lossy().into_owned());
+            format!("'{}' ({file})", layer.id)
+        }
+        _ => format!("'{}'", layer.id),
+    }
 }
 
 /// Logs the frame rate every few seconds so a show's performance is visible.
@@ -205,6 +225,7 @@ impl App {
                 frames: 0,
                 since: Instant::now(),
             },
+            timing: FrameTimer::from_env(),
             applied: None,
             started: false,
             reloads_done: 0,
@@ -251,6 +272,7 @@ impl App {
                     self.apply_show(event_loop, show);
                 }
                 RunnerAction::SendPreview => {
+                    self.timing.note("preview requested");
                     self.captures = self
                         .windows
                         .iter()
@@ -291,6 +313,7 @@ impl App {
         if !all_done && !too_old {
             return;
         }
+        self.timing.note("preview read back");
         let pictures: Vec<(String, u32, u32, Vec<u8>)> = self
             .captures
             .drain(..)
@@ -339,6 +362,7 @@ impl App {
         }
         self.reloads_done = requested;
         tracing::info!("reloading outputs");
+        self.timing.note("outputs reloaded");
         self.contents.clear();
         self.content_keys.clear();
         self.windows.clear();
@@ -426,6 +450,7 @@ impl App {
 
     /// Make `show` the one being rendered.
     fn apply_show(&mut self, event_loop: &ActiveEventLoop, show: Show) {
+        self.timing.note("show applied");
         // Forget the on-air instants of layers that are gone.
         self.onsets
             .retain(|id, _| show.layers.iter().any(|l| &l.id == id && l.timing.free_run));
@@ -434,6 +459,7 @@ impl App {
         // In standby the outputs stay closed, whatever the show says.
         let wanted: &[Output] = if self.standby { &[] } else { &show.outputs };
         if wanted != self.window_outputs.as_slice() {
+            self.timing.note("windows rebuilt");
             if let Err(e) = self.sync_windows(event_loop, wanted, show.layers.len()) {
                 tracing::error!("cannot set up the outputs: {e:#}");
                 self.windows.clear();
@@ -659,6 +685,7 @@ impl App {
                 }
                 None => {
                     tracing::debug!(layer = %layer.id, "loading content");
+                    self.timing.note("content loaded");
                     content::build(layer, &factory).unwrap_or_else(|e| {
                         tracing::error!(layer = %layer.id, "{e:#}; showing placeholder");
                         content::placeholder(&factory)
@@ -687,13 +714,14 @@ impl App {
         self.local_transport(TransportChange::SeekBy(seconds * NANOS_PER_SEC));
     }
 
-    /// Render one frame on every output, card by card.
-    fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
+    /// Render one frame on every output, card by card. Returns whether
+    /// anything was rendered.
+    fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
         if self.windows.is_empty() {
             // No outputs (the show lost its displays): nothing may keep
             // decoding in the background.
             self.contents.iter_mut().flatten().for_each(|c| c.idle());
-            return;
+            return false;
         }
         let mut sampled = None;
         for g in 0..self.gpus.len() {
@@ -705,8 +733,12 @@ impl App {
             if let Some(fps) = self.stats.tick() {
                 // Reported to the Director with the next health message.
                 self.playhead.report_fps(fps as f32);
+                let slow = self
+                    .timing
+                    .summary()
+                    .map_or_else(String::new, |s| format!("; {s}"));
                 tracing::info!(
-                    "{fps:.1} fps (show time {:.1}s, frame {})",
+                    "{fps:.1} fps (show time {:.1}s, frame {}){slow}",
                     position.show_seconds(),
                     position.frame
                 );
@@ -716,6 +748,17 @@ impl App {
             self.health_at = Instant::now();
             self.publish_output_health();
         }
+        sampled.is_some()
+    }
+
+    /// The shortest refresh period among the outputs, once measured.
+    fn refresh_period(&self) -> Option<Duration> {
+        self.windows
+            .iter()
+            .filter_map(|rw| rw.gpu.timing.clock.period())
+            .filter(|ns| ns.is_finite() && *ns > 0.0)
+            .min_by(f64::total_cmp)
+            .map(|ns| Duration::from_secs_f64(ns / 1e9))
     }
 
     /// Render the outputs of card `g`:
@@ -739,12 +782,14 @@ impl App {
         let playhead = self.playhead.clone();
         let local_now = || playhead.clock.local_now_ns();
         let mut frames = Vec::with_capacity(outs.len());
+        let acquiring = Instant::now();
         for &w in &outs {
             match self.gpus[g].acquire(&mut self.windows[w].gpu, local_now) {
                 Ok(frame) => frames.push((w, frame)),
                 Err(e) => self.surface_error(g, w, e, event_loop),
             }
         }
+        self.timing.since(Phase::Acquire, acquiring);
         if frames.is_empty() {
             return None;
         }
@@ -770,7 +815,12 @@ impl App {
         let (position, grid_offset) = playhead.position_for_display(display_local, was_on_grid);
 
         let times = self.layer_times(&position);
+        let updating = Instant::now();
         let late = self.update_contents(g, &outs, &position, &times);
+        self.timing.since(Phase::Update, updating);
+        if !late.is_empty() {
+            self.timing.note("late decode");
+        }
 
         let views: Vec<_> = frames
             .iter()
@@ -779,6 +829,7 @@ impl App {
                 (&rw.gpu, &self.show.outputs[rw.output_idx], &f.view)
             })
             .collect();
+        let rendering = Instant::now();
         self.gpus[g].render(
             &views,
             &self.show,
@@ -786,6 +837,8 @@ impl App {
             &self.contents[g],
             &self.draw_order,
         );
+        self.timing.since(Phase::Render, rendering);
+        let presenting = Instant::now();
         for (w, _) in &frames {
             self.windows[*w].window.pre_present_notify();
         }
@@ -797,6 +850,7 @@ impl App {
                 rw.gpu.timing.late_decodes += 1;
             }
         }
+        self.timing.since(Phase::Present, presenting);
         Some(position)
     }
 
@@ -848,7 +902,13 @@ impl App {
             .iter()
             .zip(&mut self.contents[g])
             .zip(times);
-        for ((layer, c), time) in layers {
+        // Each layer's update is timed from its start to the next one's (the
+        // loop body has several early `continue`s).
+        let mut started: Option<(usize, Instant)> = None;
+        for (i, ((layer, c), time)) in layers.enumerate() {
+            if let Some((j, at)) = started.replace((i, Instant::now())) {
+                self.timing.layer(j, at.elapsed());
+            }
             let Some(t) = *time else {
                 c.idle(); // its timeline is off stage
                           // Played again later, it goes on air afresh.
@@ -916,6 +976,9 @@ impl App {
                 // (an ffmpeg process and several frames of memory) around.
                 c.idle();
             }
+        }
+        if let Some((j, at)) = started {
+            self.timing.layer(j, at.elapsed());
         }
         late.sort_unstable();
         late.dedup();
@@ -1173,11 +1236,15 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.timing.begin();
+        let housekeeping = Instant::now();
         self.handle_requests(event_loop);
         self.reload_if_requested(event_loop);
         self.follow_cluster_show(event_loop);
+        self.timing.since(Phase::Housekeeping, housekeeping);
 
         if self.windows.is_empty() {
+            self.timing.skip();
             // Nothing may keep decoding with no output to show it on.
             self.contents.iter_mut().flatten().for_each(|c| c.idle());
             // Downloads still progress (and are reported) without outputs.
@@ -1196,7 +1263,15 @@ impl ApplicationHandler for App {
         // Frames are driven from here rather than per-window RedrawRequested so
         // all outputs render together. FIFO present blocks on vsync, which
         // paces the loop, so Poll does not spin the CPU.
-        self.render_frame(event_loop);
+        if self.render_frame(event_loop) {
+            let period = self.refresh_period();
+            let show = &self.show;
+            if let Some(line) = self.timing.end(period, |i| layer_label(show, i)) {
+                tracing::warn!("{line}");
+            }
+        } else {
+            self.timing.skip();
+        }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     }
 }

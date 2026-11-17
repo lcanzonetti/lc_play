@@ -363,6 +363,15 @@ below normal, so a busy CPU delays a video layer rather than every output.
 If `late` climbs on a machine where other software competes for the CPU,
 `LCPLAY_THREAD_PRIORITY=0` leaves priorities as Windows sets them.
 
+Stutters are logged: a frame that takes longer than two refreshes writes a
+`slow frame` line to the Runner's log (the Producer's **Log** button) with
+where its time went — `acquire` (waiting for the display/GPU), `update`
+(layers, with the slowest one named), `housekeeping` (show edits, asset
+swaps), `render`, `present`, `outside` (the window system) — and what else
+happened in that frame. The frame-rate line every 5 s adds the slowest frame
+and how many were over. `LCPLAY_FRAME_LOG=<ms>` sets another threshold,
+`LCPLAY_FRAME_LOG=0` turns the log off.
+
 ## Workspace
 
 | Crate | Role |
