@@ -297,7 +297,9 @@ crates/
   lc-director   Core (state + command logic) · server (WS/HTTP) · store (persistence)
   lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
                 renderer (app, render, content, video, show)
-  lc-assets     media HTTP server (library, Range streaming, upload, thumbnails)
+  lc-assets     media HTTP server (library, Range streaming, upload, thumbnails,
+                optimisation jobs)
+  lc-hap        HAP frames (decode, encode, re-chunk) and QuickTime read/write
   lc-producer   the operator's application: serves the interface (ui/) and shows
                 it in a native window (system web view)
   lc-ctl        command-line controller, reference protocol client
@@ -407,16 +409,44 @@ so dragging a cue in the Producer moves it on the output without a flicker.
 
 ### Assets
 
-The show names each asset by its URL on the Asset Manager. A Runner downloads
-it once into its cache (`<id>-<size>.<ext>`) and plays from local disk; until
-the file has arrived the cue shows a placeholder. Asset ids are derived from
-the file name, **not** from the content, and the show records each asset's
-size. When a file is replaced under the same name, an open Producer notices
-the changed size, updates the show, and Runners fetch the new file; with no
-Producer open the show keeps the old size — Runners that have the old file
-keep playing it and new Runners refuse the download (reported once, retried
-with back-off). A replacement of exactly the same size is not detected at
-all. Content hashing is the planned fix.
+The show names each asset by its URL on the Asset Manager, with its size and
+its path there. A Runner downloads it once into its cache, under that path
+(`Optimized/Show A/intro.mov`, cleaned for Windows), and plays from local
+disk; until the file has arrived the cue shows a placeholder. An index in the
+cache (`.lcplay-index.json`: asset id → URL, size, file) says which version
+each file is, so a new version at the same name is fetched again; the
+renderer's content key includes the file's size and modification time, so
+what was loaded from the old version is reloaded. If Windows will not
+replace a file that is still open, the new version goes beside it under a
+`~tag` name.
+
+Asset ids are derived from the file name, **not** from the content. When a
+file is replaced under the same name, or its optimised copy is (re)made, an
+open Producer notices the changed URL or size, updates the show, and Runners
+fetch the new file; with no Producer open the show keeps the old values —
+Runners that have the old file keep playing it and new Runners refuse the
+download (reported once, retried with back-off). A replacement of the
+original of exactly the same size is not detected. Content hashing is the
+planned fix. (Optimised copies carry their version in the URL, `?v=`, so
+re-optimising is always detected.)
+
+### Optimisation (Asset Manager)
+
+`lc-assets/src/optimize.rs`. ffprobe classifies each video (codec name,
+codec tag, pixel format) into a row of the codec map
+(`.lcplay/optimize.json`); the row gives the output, chunks and Snappy. One
+background job at a time: HAP → re-chunk goes through `lc_hap::rechunk`
+(parse each frame's decode instructions, unpack, split the texture again on
+block boundaries, Snappy per chunk where it helps, write a new QuickTime
+file with the same timing); everything else through ffmpeg's HAP encoder
+(`-c:v hap -format … -chunks N -compressor snappy|none`), padded to a
+multiple of 4. Output is written hidden and renamed when complete. The
+manifest (`.lcplay/optimized.json`) records per source path the version it
+was made from (size, mtime), the rule, the output and failures, so nothing
+is redone or retried in a loop; a re-optimise marks the record stale and the
+old output stays in use until the new one replaces it. The library listing
+reports, per item, the status and `play_url`/`play_size`/`play_path` — what
+the Producer writes into the show.
 
 ### Video
 

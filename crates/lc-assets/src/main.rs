@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod handlers;
 mod library;
+mod optimize;
 mod state;
 
 use axum::response::Html;
@@ -48,6 +49,7 @@ async fn main() {
     let cors = config.cors.clone();
     let bind = config.bind;
     let state = AppState::new(config, library);
+    optimize::spawn(state.clone());
 
     let mut app = Router::new()
         .route("/", get(|| async { Html(PLAYER_HTML) }))
@@ -58,6 +60,16 @@ async fn main() {
         .route("/transcode/{id}", get(handlers::transcode::transcode_media))
         .route("/proxy/{id}", get(handlers::proxy::proxy_media))
         .route("/thumb/{id}", get(handlers::manage::thumbnail))
+        .route("/optimized/{id}", get(optimize::serve))
+        .route(
+            "/api/optimize",
+            get(optimize::get_settings).put(optimize::put_settings),
+        )
+        .route("/api/optimize/apply", axum::routing::post(optimize::apply))
+        .route(
+            "/api/items/{id}/optimize",
+            axum::routing::post(optimize::redo_item),
+        )
         .route(
             "/api/items/{id}",
             axum::routing::delete(handlers::manage::delete_item),

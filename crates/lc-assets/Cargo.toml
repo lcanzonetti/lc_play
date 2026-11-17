@@ -12,7 +12,9 @@ name = "lc-assets"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 axum.workspace = true
+lc-hap.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

@@ -213,15 +213,33 @@ impl TextureFactory<'_> {
 /// keyed per layer, since each layer needs its own decoder position.
 pub fn cache_key(layer: &Layer) -> String {
     match &layer.source {
-        Source::Image { path } => format!("image:{path}"),
+        Source::Image { path } => format!("image:{path}:{}", file_version(path)),
         Source::Color { rgba } => format!("color:{rgba:?}"),
         // Keyed per layer, like video: each follows its own cue's timing.
         Source::SyncTest { fps } => format!("sync-test:{}:{fps}", layer.id),
         Source::SweepTest { fps } => format!("sweep-test:{}:{fps}", layer.id),
-        Source::Video { path } => format!("video:{}:{path}", layer.id),
+        Source::Video { path } => format!("video:{}:{path}:{}", layer.id, file_version(path)),
         Source::Live { kind } => format!("live:{kind}"),
         Source::Missing { reason } => format!("missing:{reason}"),
     }
+}
+
+/// Size and modification time of a media file. Part of the cache key: a
+/// Runner keeps assets under readable names, so a new version of a file
+/// (replaced, re-optimised) lands at the same path, and what is loaded from
+/// the old one must be loaded again.
+fn file_version(path: &str) -> String {
+    std::fs::metadata(path).map_or_else(
+        |_| "-".into(),
+        |m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{}-{mtime}", m.len())
+        },
+    )
 }
 
 /// Build the content for a layer. Never blocks on files: anything slow is

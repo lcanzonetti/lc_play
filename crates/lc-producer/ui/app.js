@@ -892,12 +892,7 @@ function fitRect(mediaW, mediaH, enlarge) {
 function addAssetCue(item, tl, ti, t) {
   const kind = item.kind; // 'video' | 'image'
   // Record the asset in the show, with the URL Runners will fetch it from.
-  const entry = {
-    id: item.id, name: item.name, kind,
-    url: `${S.assetsUrl}/stream/${item.id}`,
-    size: item.size, width: item.width || 0, height: item.height || 0,
-    duration_s: item.duration_s || 0,
-  };
+  const entry = { id: item.id, name: item.name, kind, ...assetFacts(item) };
   const cue = {
     name: item.name, source: { type: 'asset', asset: item.id },
     duration_s: kind === 'video' && item.duration_s > 0 ? round2(item.duration_s) : 10,
@@ -937,23 +932,134 @@ async function loadLibrary() {
   }
 }
 
+/** What the show records about a library item: the file Runners play — the
+ *  optimised version once the Asset Manager has made it, the original until
+ *  then — and the media's dimensions and duration. */
+function assetFacts(item) {
+  return {
+    url: S.assetsUrl + (item.play_url || `/stream/${item.id}`),
+    size: item.play_size ?? item.size,
+    path: item.play_path || item.path,
+    width: item.width || 0, height: item.height || 0,
+    duration_s: item.duration_s || 0,
+  };
+}
+
 /** A file replaced on the Asset Manager keeps its id (ids come from the
- *  name) but not its size, dimensions or duration. The show records those —
- *  the size is part of every Runner's cache key — so bring the show's copy up
- *  to date; Runners then fetch the new file. */
+ *  name) but not its size, dimensions or duration; an optimised version, when
+ *  it is ready, has another URL, size and path. The show records those — URL
+ *  and size are every Runner's cache key — so bring the show's copy up to
+ *  date; Runners then fetch the new file. */
 function reconcileAssets() {
   if (!S.doc || !S.library) return;
-  const facts = (x) => [x.size, x.width || 0, x.height || 0, x.duration_s || 0].join();
+  const keys = ['url', 'size', 'path', 'width', 'height', 'duration_s'];
+  const facts = (x) => keys.map((k) => x[k] ?? '').join('|');
   const stale = S.doc.assets
     .map((a) => [a, S.library.find((i) => i.id === a.id)])
-    .filter(([a, item]) => item && facts(item) !== facts(a));
+    .filter(([a, item]) => item && facts(assetFacts(item)) !== facts(a));
   if (!stale.length) return;
   edit(() => {
-    for (const [a, item] of stale) {
-      Object.assign(a, { size: item.size, width: item.width || 0, height: item.height || 0, duration_s: item.duration_s || 0 });
-    }
+    for (const [a, item] of stale) Object.assign(a, assetFacts(item));
   });
-  toast(`${stale.map(([a]) => a.name).join(', ')}: file changed on the Asset Manager — show updated.`, true);
+  toast(`${stale.map(([a]) => a.name).join(', ')}: new version on the Asset Manager — show updated.`, true);
+}
+
+/** One line on where the optimiser is with an item, for the asset list. */
+function optimizeBadge(item) {
+  const o = item.optimized;
+  if (!o || o.state === 'original') return null;
+  const label = { hap: 'HAP', hap_alpha: 'HAP Alpha', hap_q: 'HAP Q', rechunk: 're-chunked', keep: 'original' };
+  const how = o.rule ? `${label[o.rule.output] || o.rule.output}, ${o.rule.chunks} chunks${o.rule.snappy ? '' : ', no Snappy'}` : '';
+  const text = {
+    pending: 'waiting to optimise',
+    optimizing: `optimising ${Math.round(100 * (o.progress || 0))} %`,
+    done: o.output ? `optimised: ${how}` : (o.rule?.output === 'keep' ? 'played as it is' : `already ${how}`),
+    failed: 'optimisation failed',
+  }[o.state] || o.state;
+  return el('span', { class: `opt opt-${o.state}`, title: o.error || '' }, text);
+}
+
+async function reoptimize(item) {
+  try {
+    const res = await fetch(`${S.assetsUrl}/api/items/${item.id}/optimize`, { method: 'POST' });
+    if (!res.ok) toast(`Could not re-optimise ${item.name}: ${await res.text()}`);
+    else toast(`${item.name} will be optimised again`, true);
+  } catch {
+    toast(`Could not re-optimise ${item.name}: Asset Manager not reachable`);
+  }
+  loadLibrary();
+}
+
+// ───────────────────── optimisation settings (codec map) ─────────────────────
+
+const SOURCES = [
+  ['h264', 'H.264'], ['hevc', 'HEVC / H.265'], ['prores', 'ProRes'], ['prores_alpha', 'ProRes 4444 with alpha'],
+  ['hap', 'HAP'], ['hap_alpha', 'HAP Alpha'], ['hap_q', 'HAP Q'], ['hap_r', 'HAP R (BC7)'], ['hap_q_alpha', 'HAP Q Alpha'],
+  ['notchlc', 'NotchLC'], ['dxv', 'DXV'], ['other', 'Anything else'],
+];
+const HAP_SOURCES = ['hap', 'hap_alpha', 'hap_q', 'hap_r'];
+
+/** The Asset Manager's codec map, as a table: for each source codec, what it
+ *  becomes, in how many chunks, Snappy or not. */
+async function openOptimizeSettings() {
+  let settings;
+  try {
+    const res = await fetch(`${S.assetsUrl}/api/optimize`);
+    if (!res.ok) throw new Error(await res.text());
+    settings = await res.json();
+  } catch (e) {
+    return toast(`Cannot read the optimisation settings: ${e.message || 'Asset Manager not reachable'}`);
+  }
+  const body = $('#opt-rows');
+  body.replaceChildren();
+  for (const [src, label] of SOURCES) {
+    const rule = settings.rules[src];
+    const outputs = [['keep', 'Keep as it is']];
+    // Lossless re-chunking needs a single-texture HAP file.
+    if (HAP_SOURCES.includes(src)) outputs.push(['rechunk', 'Re-chunk (lossless)']);
+    // HAP Q Alpha cannot be written by ffmpeg, nor safely converted.
+    if (src !== 'hap_q_alpha') outputs.push(['hap', 'HAP'], ['hap_alpha', 'HAP Alpha'], ['hap_q', 'HAP Q']);
+    const output = el('select', {}, ...outputs.map(([v, t]) => el('option', { value: v }, t)));
+    output.value = rule.output;
+    const chunks = el('input', { type: 'number', min: '1', max: '64', step: '1', value: String(rule.chunks) });
+    const snappy = el('input', { type: 'checkbox' });
+    snappy.checked = rule.snappy;
+    const sync = () => { chunks.disabled = snappy.disabled = output.value === 'keep'; };
+    output.onchange = sync;
+    sync();
+    const row = el('tr', {}, el('td', {}, label), el('td', {}, output), el('td', {}, chunks), el('td', {}, snappy));
+    row.read = () => ({ output: output.value, chunks: Math.max(1, Math.min(64, parseInt(chunks.value, 10) || 1)), snappy: snappy.checked });
+    row.dataset.src = src;
+    body.append(row);
+  }
+  $('#opt-enabled').checked = settings.enabled;
+  $('#opt-dialog').hidden = false;
+
+  const save = async (apply) => {
+    const rules = {};
+    for (const row of body.children) rules[row.dataset.src] = row.read();
+    try {
+      const res = await fetch(`${S.assetsUrl}/api/optimize`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: $('#opt-enabled').checked, rules }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      if (apply) {
+        const r = await fetch(`${S.assetsUrl}/api/optimize/apply`, { method: 'POST' });
+        const { queued } = await r.json();
+        toast(`Settings saved; ${queued} file${queued === 1 ? '' : 's'} will be optimised again.`, true);
+      } else {
+        toast('Settings saved: they apply to files optimised from now on.', true);
+      }
+      $('#opt-dialog').hidden = true;
+      loadLibrary();
+    } catch (e) {
+      toast(`Could not save the optimisation settings: ${e.message || 'Asset Manager not reachable'}`);
+    }
+  };
+  $('#opt-save').onclick = () => save(false);
+  $('#opt-apply').onclick = () => save(true);
+  $('#opt-cancel').onclick = () => ($('#opt-dialog').hidden = true);
 }
 
 function renderAssets(problem) {
@@ -971,8 +1077,10 @@ function renderAssets(problem) {
     },
       // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
       el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
-      el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta)),
-      el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕'),
+      el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta, optimizeBadge(item))),
+      el('div', { class: 'btns' },
+        item.kind === 'video' ? el('button', { title: 'Optimise again, with the current settings', onclick: (e) => { e.stopPropagation(); reoptimize(item); } }, '↻') : null,
+        el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕')),
     ));
   }
 }
@@ -2410,6 +2518,7 @@ $('#file-open').onchange = async (e) => {
   } catch (err) { toast(`Cannot open ${file.name}: ${err.message}`); }
 };
 $('#btn-upload').onclick = () => $('#file-upload').click();
+$('#btn-optimize').onclick = () => openOptimizeSettings();
 $('#file-upload').onchange = (e) => { uploadFiles([...e.target.files]); e.target.value = ''; };
 
 // Files dropped on the asset panel are uploaded.

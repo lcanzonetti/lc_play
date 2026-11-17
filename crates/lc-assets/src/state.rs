@@ -33,11 +33,14 @@ pub struct AppState {
     pub proxy_slots: Arc<Semaphore>,
     /// Items no proxy could be made for, with the (size, mtime) tried.
     pub proxy_failed: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    /// Background conversion to the playback codec (the codec map).
+    pub optimizer: Arc<crate::optimize::Optimizer>,
 }
 
 impl AppState {
     pub fn new(config: Config, library: Arc<Library>) -> Self {
         let slots = Arc::new(Semaphore::new(config.max_transcodes));
+        let optimizer = crate::optimize::Optimizer::new(&config.media_dir, &config.ffmpeg);
         AppState {
             config: Arc::new(config),
             library,
@@ -47,6 +50,7 @@ impl AppState {
             proxy_jobs: Arc::default(),
             proxy_slots: Arc::new(Semaphore::new(crate::handlers::proxy::PROXY_JOBS)),
             proxy_failed: Arc::default(),
+            optimizer,
         }
     }
 }

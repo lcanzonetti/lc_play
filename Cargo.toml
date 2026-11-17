@@ -20,6 +20,7 @@ members = [
     "crates/lc-discovery",
     "crates/lc-net",
     "crates/lc-director",
+    "crates/lc-hap",
     "crates/lc-runner",
     "crates/lc-assets",
     "crates/lc-ctl",
@@ -42,6 +43,7 @@ lc-time = { path = "crates/lc-time" }
 lc-discovery = { path = "crates/lc-discovery" }
 lc-net = { path = "crates/lc-net" }
 lc-director = { path = "crates/lc-director" }
+lc-hap = { path = "crates/lc-hap" }
 
 anyhow = "1"
 axum = "0.8"

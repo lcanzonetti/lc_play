@@ -34,6 +34,9 @@ pub struct Probe {
     pub height: u32,
     /// Seconds; zero for stills.
     pub duration_s: f64,
+    /// For videos: the codec, as the optimiser's codec map names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::optimize::Source>,
 }
 
 /// An item as the API reports it: the indexed facts plus probe metadata.
@@ -42,12 +45,26 @@ pub async fn describe(state: &AppState, item: MediaItem) -> ItemDto {
         MediaKind::Audio => None,
         MediaKind::Video | MediaKind::Image => probe(state, &item).await,
     };
+    let mtime = crate::optimize::mtime_of(&item.abs_path).await;
+    let status = state
+        .optimizer
+        .status(&item, mtime, probe.and_then(|p| p.source));
     let mut dto = ItemDto::from(item);
     dto.probe = probe;
+    // What a Runner should download: the optimised file once it exists,
+    // the original until then (or when it is used as it is).
+    if let (Some(out), Some(size)) = (&status.output, status.output_size) {
+        // The version in the URL: a re-optimised file is a new download
+        // for Runners even if its size happens to be the same.
+        dto.play_url = format!("/optimized/{}?v={}", dto.id, status.version.unwrap_or(0));
+        dto.play_size = size;
+        dto.play_path = out.clone();
+    }
+    dto.optimized = Some(status);
     dto
 }
 
-async fn probe(state: &AppState, item: &MediaItem) -> Option<Probe> {
+pub(crate) async fn probe(state: &AppState, item: &MediaItem) -> Option<Probe> {
     if let Some((size, probe)) = state.probes.lock().unwrap().get(&item.id) {
         if *size == item.size {
             return *probe;
@@ -70,7 +87,10 @@ async fn run_ffprobe(state: &AppState, item: &MediaItem) -> Option<Probe> {
     let _slot = state.transcode_slots.acquire().await.ok()?;
     let out = Command::new(&state.config.ffprobe)
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=width,height:format=duration"])
+        .args([
+            "-show_entries",
+            "stream=width,height,codec_name,codec_tag_string,pix_fmt:format=duration",
+        ])
         .args(["-of", "json"])
         .arg(&item.abs_path)
         .stdin(Stdio::null())
@@ -92,6 +112,13 @@ async fn run_ffprobe(state: &AppState, item: &MediaItem) -> Option<Probe> {
                 .filter(|d| d.is_finite() && *d > 0.0)
                 .unwrap_or(0.0),
         },
+        source: (item.kind == MediaKind::Video).then(|| {
+            crate::optimize::Source::classify(
+                stream["codec_name"].as_str().unwrap_or(""),
+                stream["codec_tag_string"].as_str().unwrap_or(""),
+                stream["pix_fmt"].as_str().unwrap_or(""),
+            )
+        }),
     };
     Some(probe)
 }
@@ -199,6 +226,7 @@ pub async fn delete_item(
     let item = state.library.get(&id).ok_or(AppError::NotFound)?;
     tokio::fs::remove_file(&item.abs_path).await?;
     crate::handlers::proxy::remove_proxies(&state.config.media_dir, &id).await;
+    state.optimizer.forget(&item.path);
     rescan(&state).await;
     tracing::info!(name = %item.name, "asset deleted");
     Ok(Json(serde_json::json!({ "deleted": item.name })))

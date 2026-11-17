@@ -278,8 +278,9 @@ broadcasts them back. Other tools may ignore it.
   },
   "assets": [
     { "id": "636c6970", "name": "clip.mp4", "kind": "video",
-      "url": "http://10.0.0.1:7403/stream/636c6970",
-      "size": 594087, "width": 1920, "height": 1080, "duration_s": 12.0 }
+      "url": "http://10.0.0.1:7403/optimized/636c6970?v=1794930967",
+      "size": 594087, "path": "Optimized/clip.mov",
+      "width": 1920, "height": 1080, "duration_s": 12.0 }
   ],
   "control_cues": [
     { "id": "k1", "at_s": 30, "action": "pause", "target": "", "to_s": 0 },
@@ -356,7 +357,12 @@ Bundles are accepted; their time tags are ignored.
 
 | Method & path | |
 |---|---|
-| `GET /api/library` | `{ count, items: [{ id, name, kind, size, mime, width, height, duration_s, stream_url, thumb_url }] }` |
+| `GET /api/library` | `{ count, items: [{ id, name, path, kind, size, mime, width, height, duration_s, source, stream_url, thumb_url, play_url, play_size, play_path, optimized }] }` — `play_*`: the file to play (the optimised copy when ready, else the original); `optimized` (videos): `{ state: "original" \| "pending" \| "optimizing" \| "done" \| "failed", source, progress?, rule?, error?, output?, output_size?, version? }` |
+| `GET /api/optimize` | the codec map: `{ enabled, rules: { <source>: { output, chunks, snappy } } }`, sources `h264 hevc prores prores_alpha hap hap_alpha hap_q hap_r hap_q_alpha notchlc dxv other`, outputs `keep rechunk hap hap_alpha hap_q`, chunks 1–64 |
+| `PUT /api/optimize` | replace it (values out of range are corrected; returns what was stored) |
+| `POST /api/optimize/apply` | optimise again files made with other rules, retry failures: `{ queued }` |
+| `POST /api/items/{id}/optimize` | optimise one video again |
+| `GET /optimized/{id}` | the optimised copy, with `Range` (`404` if there is none) |
 | `POST /api/upload?name=<file name>` | body = the raw file; returns the item |
 | `DELETE /api/items/{id}` | removes the file |
 | `GET /stream/{id}` | the file, with `Range` support |
@@ -365,7 +371,7 @@ Bundles are accepted; their time tags are ignored.
 | `GET /proxy/{id}` | a 640-pixel H.264 preview copy of a video (stored in `.lcplay-proxies` in the media folder, which is not listed), served with `Range` — what the Producer's stage preview plays. While it is being made (the first request starts that, in the background): `503` with `Retry-After`; `404` if it cannot be made. `?status` answers `{ "state": "ready" \| "making" \| "failed" }` at once. |
 
 `kind` is `video`, `image` or `audio`. By default browsers may use the
-server only from pages served on port 7404 (the Producer); `POST`/`DELETE`
+server only from pages served on port 7404 (the Producer); `POST`/`PUT`/`DELETE`
 carrying any other `Origin` get `403`. Set `LCMS_CORS` to change that.
 
 ## 8. Security

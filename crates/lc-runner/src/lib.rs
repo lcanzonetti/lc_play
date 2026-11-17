@@ -28,7 +28,9 @@ pub mod dxgi;
 pub mod folders;
 pub mod hap;
 pub mod machine;
-pub mod mov;
+/// The QuickTime sample-table reader (in `lc-hap`, shared with the Asset
+/// Manager).
+pub use lc_hap::mov;
 #[cfg(windows)]
 pub mod nvapi;
 pub mod playhead;

@@ -29,6 +29,7 @@ tracing-subscriber.workspace = true
 
 # Cluster side (agent): control channel, clock sync, discovery.
 lc-proto.workspace = true
+lc-hap.workspace = true
 lc-time.workspace = true
 lc-discovery.workspace = true
 lc-net.workspace = true

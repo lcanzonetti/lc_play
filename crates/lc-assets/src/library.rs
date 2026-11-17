@@ -121,8 +121,19 @@ impl Library {
         for entry in WalkDir::new(&self.root)
             .follow_links(true)
             .into_iter()
-            // The Asset Manager's own folder (preview proxies) is not media.
-            .filter_entry(|e| e.depth() == 0 || e.file_name() != crate::handlers::proxy::PROXY_DIR)
+            // The Asset Manager's own folders (preview proxies, settings,
+            // optimised copies) are not media of their own: an optimised
+            // file is a property of its original.
+            .filter_entry(|e| {
+                e.depth() != 1
+                    || ![
+                        crate::handlers::proxy::PROXY_DIR,
+                        crate::optimize::OPTIMIZED_DIR,
+                        crate::optimize::OWN_DIR,
+                    ]
+                    .iter()
+                    .any(|d| e.file_name() == *d)
+            })
             .filter_map(|e| e.ok())
         {
             if !entry.file_type().is_file() {

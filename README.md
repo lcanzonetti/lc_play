@@ -31,6 +31,7 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 | Frame sync on frame-locked hardware: frames rendered for the refresh they appear on, a cluster-wide refresh grid, NVIDIA present barrier, one GPU device per graphics card, per-output sync health, sync test pattern | implemented, **not yet run on real hardware** (see below) |
 | Runner management: restart, quit, standby, reboot / power off the computer (opt-in), Wake-on-LAN, remote log, live output pictures, remote desktop | implemented |
 | Asset Manager: upload, list, thumbnails, metadata, HTTP Range delivery | implemented |
+| Asset Manager: background optimisation to HAP by a per-codec map (output, chunks, Snappy), lossless HAP re-chunking | implemented, tested |
 | Producer: stand-alone window with floating panels — stage (zoom, pan, snapping) with live content preview, timelines, tasks, runners, assets, inspector, undo, save/open | implemented (basic) |
 | One-command launcher for a single machine | implemented |
 
@@ -241,21 +242,62 @@ HAP is decoded by the GPU, but each frame is first decompressed (Snappy)
 and copied by the CPU: measured here, about 2.5–3 ms of one core per frame
 of 4K HAP Q — 15–20 % of a core per layer at 60 fps, more for footage that
 compresses less well, and double at 8K. A laptop that also runs the Producer
-feels that; a show machine with more cores much less. To lower it: encode
-with chunks (`-chunks 8`: decompressed on several cores), use plain HAP
-(half the data of HAP Q) where its quality is enough, or encode without
-Snappy (`-compressor none`): no decompression at all, at the price of
-larger files (8 MB per 4K HAP Q frame, ≈ 500 MB/s at 60 fps — fast NVMe
-only).
+feels that; a show machine with more cores much less. To lower it: use
+chunks (decompressed on several cores at once), use plain HAP (half the
+data of HAP Q) where its quality is enough, or store without Snappy: no
+decompression at all, at the price of larger files (8 MB per 4K HAP Q
+frame, ≈ 500 MB/s at 60 fps — fast NVMe only). The Asset Manager does
+this for you — see below.
+
+### Asset optimisation
+
+The Asset Manager converts videos to the playback codec in the
+background, by a codec map set in the Producer (**Assets → Optimise…**):
+for each kind of source — H.264, HEVC, ProRes, ProRes 4444 with alpha,
+HAP, HAP Alpha, HAP Q, HAP R, HAP Q Alpha, NotchLC, DXV, anything else —
+what it becomes (keep, re-chunk, HAP, HAP Alpha, HAP Q), the number of
+chunks (1–64) and whether chunks are Snappy-compressed. Defaults: 8 chunks
+with Snappy; HAP Q for ordinary video, HAP Alpha for ProRes with alpha,
+HAP files re-chunked, HAP Q Alpha kept as it is.
+
+- **Originals are kept.** Converted copies go in `Optimized\` in the media
+  folder, with the same sub-folders and names (`.mov`). The settings and a
+  record of what was made are in `.lcplay\`.
+- **Re-chunking HAP is lossless**: the compressed texture is kept bit for
+  bit, only its split into chunks and the Snappy setting change — fast,
+  and no quality is lost. A HAP file already stored as asked is used as it
+  is. (HAP Q Alpha holds two textures; it can only be kept.)
+- New and changed files are converted as they appear, one at a time; the
+  Assets window shows progress, and the result or the error on each file.
+  Changing the map applies to files converted from then on; **Save and
+  apply to existing files** converts again those made with other settings
+  (and retries failures), and **↻** on an asset converts that one again.
+- The show follows: once a file's optimised copy is ready the Producer
+  points the show at it, and Runners download it. Until then they play
+  the original — a cue added before the conversion finished is downloaded
+  twice.
+- Other formats go through ffmpeg's HAP encoder, which needs ffmpeg built
+  with Snappy (the usual Windows builds are). Sizes are padded to a
+  multiple of 4 pixels.
 
 ### Where a Runner keeps its files
 
 Each Runner has one folder, kept across restarts: downloaded media in
-`assets\` (named `<asset id>-<size>.<ext>`), plus its last show, its
+`assets\`, under the same names and sub-folders as on the Asset Manager
+(e.g. `assets\Optimized\Show A\intro.mov`), plus its last show, its
 identity and its log. By default it is **`lc-runner\` in the folder the LC
 Play programs are in** — e.g. `C:\LC Play\lc-runner\assets\` — so media
 is copied once and survives restarts and reboots. (On Linux and macOS the
 folder is `lc-runner-data/`: the program itself is called `lc-runner`.)
+
+`assets\.lcplay-index.json` records which version of each file is there
+(the URL and size it came from), so a file replaced or re-optimised on the
+Asset Manager is fetched again. A file copied into `assets\` by hand, under
+its Asset Manager name and with the right size, is used without
+downloading — big shows can be pre-loaded from a disk. Names Windows cannot
+store are cleaned (`?` → `_`, `CON` → `_CON`); two assets that end up with
+the same name get a `~tag` suffix. Files from older versions
+(`<id>-<size>.<ext>`) are no longer used and can be deleted.
 
 To put it elsewhere (a separate media drive, for instance), in order of
 priority:
@@ -322,7 +364,8 @@ If `late` climbs on a machine where other software competes for the CPU,
 | `lc-net` | control-channel client (WebSocket) |
 | `lc-director` | Director service |
 | `lc-runner` | Runner service: cluster agent + wgpu renderer |
-| `lc-assets` | Asset Manager service |
+| `lc-assets` | Asset Manager service (incl. optimisation) |
+| `lc-hap` | HAP frames and QuickTime files: reading, writing, lossless re-chunking |
 | `lc-ctl` | command-line controller |
 | `lc-producer` | Producer: serves the operator's web interface |
 | `lc-play` | launcher: all services on one machine |

@@ -39,9 +39,10 @@ use anyhow::{bail, Context as _};
 use crate::content::{
     placeholder_static, Content, Encoding, Sampling, StaticContent, TextureFactory,
 };
-use crate::mov::{read_video_track, VideoTrack};
 use crate::show::Timing;
 use crate::video::{media_frame, VideoContent, VideoInfo};
+use lc_hap::frame::decode_frame;
+use lc_hap::mov::{read_video_track, VideoTrack};
 
 /// Frames decoded ahead of the one on screen.
 const AHEAD: i64 = 4;
@@ -116,206 +117,6 @@ impl HapFormat {
 fn texture_len(format: HapFormat, width: u32, height: u32) -> usize {
     width.div_ceil(4) as usize * height.div_ceil(4) as usize * format.block_bytes()
 }
-
-/// One section header: (payload length, type byte, header length).
-fn section(data: &[u8]) -> anyhow::Result<(usize, u8, usize)> {
-    if data.len() < 4 {
-        bail!("truncated section header");
-    }
-    let small = u32::from_le_bytes([data[0], data[1], data[2], 0]) as usize;
-    let kind = data[3];
-    let (len, header) = if small == 0 {
-        let big = data.get(4..8).context("truncated long section header")?;
-        (u32::from_le_bytes(big.try_into().unwrap()) as usize, 8)
-    } else {
-        (small, 4)
-    };
-    if header + len > data.len() {
-        bail!("section of {len} bytes overruns the frame");
-    }
-    Ok((len, kind, header))
-}
-
-/// Decode one HAP frame into texture blocks (`out`, already the right
-/// length). Chunked frames are unpacked on up to `threads` threads.
-pub fn decode_frame(
-    frame: &[u8],
-    format: HapFormat,
-    out: &mut [u8],
-    threads: usize,
-) -> anyhow::Result<()> {
-    let (len, kind, header) = section(frame)?;
-    let payload = &frame[header..header + len];
-    if kind & 0x0F != format.section_type() {
-        bail!(
-            "frame has texture type {:#x}, expected {:#x}",
-            kind & 0x0F,
-            format.section_type()
-        );
-    }
-    match kind >> 4 {
-        // Uncompressed.
-        0xA => {
-            if payload.len() != out.len() {
-                bail!(
-                    "frame holds {} bytes of texture, expected {}",
-                    payload.len(),
-                    out.len()
-                );
-            }
-            out.copy_from_slice(payload);
-        }
-        // One Snappy block.
-        0xB => unsnap(payload, out)?,
-        // "Complex": decode instructions, then chunks.
-        0xC => decode_chunked(payload, out, threads)?,
-        other => bail!("unknown HAP compressor {other:#x}"),
-    }
-    Ok(())
-}
-
-fn unsnap(input: &[u8], out: &mut [u8]) -> anyhow::Result<()> {
-    let n = snap::raw::decompress_len(input)?;
-    if n != out.len() {
-        bail!("chunk unpacks to {n} bytes, expected {}", out.len());
-    }
-    snap::raw::Decoder::new().decompress(input, out)?;
-    Ok(())
-}
-
-/// A chunked frame: the texture is split into chunks compressed separately,
-/// so they can be unpacked in parallel.
-fn decode_chunked(payload: &[u8], out: &mut [u8], threads: usize) -> anyhow::Result<()> {
-    let (instr_len, kind, header) = section(payload)?;
-    if kind != 0x01 {
-        bail!("chunked frame without decode instructions");
-    }
-    let instructions = &payload[header..header + instr_len];
-    let data = &payload[header + instr_len..];
-
-    let (mut compressors, mut sizes, mut offsets) = (None, None, None);
-    let mut rest = instructions;
-    while !rest.is_empty() {
-        let (len, kind, header) = section(rest)?;
-        let body = &rest[header..header + len];
-        match kind {
-            0x02 => compressors = Some(body),
-            0x03 => sizes = Some(le32_table(body)),
-            0x04 => offsets = Some(le32_table(body)),
-            _ => {} // e.g. frame dimensions: not needed
-        }
-        rest = &rest[header + len..];
-    }
-    let compressors = compressors.context("no chunk compressor table")?;
-    let sizes = sizes.context("no chunk size table")?;
-    if sizes.len() != compressors.len() {
-        bail!("chunk tables disagree");
-    }
-    // Where each chunk is in `data`: given, or one after another.
-    let starts: Vec<usize> = match offsets {
-        Some(o) if o.len() == sizes.len() => o.iter().map(|&v| v as usize).collect(),
-        _ => sizes
-            .iter()
-            .scan(0usize, |at, &size| {
-                let start = *at;
-                *at += size as usize;
-                Some(start)
-            })
-            .collect(),
-    };
-    let inputs: Vec<(&[u8], u8)> = starts
-        .iter()
-        .zip(&sizes)
-        .zip(compressors)
-        .map(|((&start, &size), &c)| {
-            data.get(start..start + size as usize)
-                .map(|bytes| (bytes, c))
-                .context("chunk outside the frame")
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    // Each chunk's unpacked length decides where in the texture it goes.
-    let lengths: Vec<usize> = inputs
-        .iter()
-        .map(|&(bytes, c)| match c {
-            0x0A => Ok(bytes.len()),
-            0x0B => Ok(snap::raw::decompress_len(bytes)?),
-            other => bail!("unknown chunk compressor {other:#x}"),
-        })
-        .collect::<anyhow::Result<_>>()?;
-    if lengths.iter().sum::<usize>() != out.len() {
-        bail!(
-            "chunks unpack to {} bytes, expected {}",
-            lengths.iter().sum::<usize>(),
-            out.len()
-        );
-    }
-
-    // Disjoint slices of `out`, one per chunk.
-    let mut targets = Vec::with_capacity(lengths.len());
-    let mut remaining = out;
-    for &n in &lengths {
-        let (head, tail) = remaining.split_at_mut(n);
-        targets.push(head);
-        remaining = tail;
-    }
-    let jobs: Vec<_> = inputs.into_iter().zip(targets).collect();
-    let unpack = |(input, c): (&[u8], u8), target: &mut [u8]| -> anyhow::Result<()> {
-        match c {
-            0x0A => {
-                target.copy_from_slice(input);
-                Ok(())
-            }
-            _ => unsnap(input, target),
-        }
-    };
-    let threads = threads.clamp(1, jobs.len().max(1));
-    if threads == 1 {
-        for (input, target) in jobs {
-            unpack(input, target)?;
-        }
-        return Ok(());
-    }
-    // Split the chunks into `threads` groups and unpack the groups in
-    // parallel.
-    let per = jobs.len().div_ceil(threads);
-    let mut groups: Vec<Vec<_>> = Vec::new();
-    let mut it = jobs.into_iter();
-    loop {
-        let group: Vec<_> = it.by_ref().take(per).collect();
-        if group.is_empty() {
-            break;
-        }
-        groups.push(group);
-    }
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = groups
-            .into_iter()
-            .map(|group| {
-                scope.spawn(move || {
-                    crate::priority::background_thread();
-                    for (input, target) in group {
-                        unpack(input, target)?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join()
-                .map_err(|_| anyhow::anyhow!("unpack thread panicked"))??;
-        }
-        Ok(())
-    })
-}
-
-fn le32_table(body: &[u8]) -> Vec<u32> {
-    body.chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
-}
-
-// ───────────────────────────── playback ─────────────────────────────
 
 /// What the decoding workers share with the renderer.
 struct Shared {
@@ -438,6 +239,8 @@ impl HapContent {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         // Two frame-level workers keep the pipeline full; each also unpacks
         // the chunks of its frame in parallel.
+        // Chunk threads (in lc-hap) give way to the render thread too.
+        lc_hap::frame::set_thread_init(crate::priority::background_thread);
         let workers = 2.min(cores);
         let chunk_threads = (cores / workers).clamp(1, 8);
         for _ in 0..workers {
@@ -570,7 +373,7 @@ fn worker(
             packet.resize(size as usize, 0);
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut packet)?;
-            decode_frame(&packet, format, &mut out, chunk_threads)
+            decode_frame(&packet, format.section_type(), &mut out, chunk_threads)
         })();
 
         let mut st = shared.state.lock().unwrap();
@@ -900,7 +703,7 @@ mod tests {
                     let mut packet = vec![0u8; size as usize];
                     file.seek(SeekFrom::Start(offset)).unwrap();
                     file.read_exact(&mut packet).unwrap();
-                    decode_frame(&packet, expect, &mut out, 4)
+                    decode_frame(&packet, expect.section_type(), &mut out, 4)
                         .unwrap_or_else(|e| panic!("{path}: {e:#}"));
                 }
             }
@@ -927,7 +730,7 @@ mod tests {
             let mut packet = vec![0u8; size as usize];
             file.seek(SeekFrom::Start(offset)).unwrap();
             file.read_exact(&mut packet).unwrap();
-            decode_frame(&packet, format, &mut out, cores).unwrap();
+            decode_frame(&packet, format.section_type(), &mut out, cores).unwrap();
         }
         let per = start.elapsed().as_secs_f64() * 1000.0 / track.frames.len() as f64;
         println!(
@@ -971,7 +774,7 @@ mod tests {
             b"\xff\xff\xff\xbb",
             b"\x00\x00\x00\xcb\x05\x00\x00\x00",
         ] {
-            assert!(decode_frame(bad, HapFormat::Dxt1, &mut out, 2).is_err());
+            assert!(decode_frame(bad, HapFormat::Dxt1.section_type(), &mut out, 2).is_err());
         }
     }
 }

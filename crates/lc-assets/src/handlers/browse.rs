@@ -29,6 +29,15 @@ pub struct ItemDto {
     pub transcode_url: String,
     /// Small JPEG preview.
     pub thumb_url: String,
+    /// What to play: the optimised version when there is one, else the
+    /// original (`stream_url`, `size`, `path`).
+    pub play_url: String,
+    pub play_size: u64,
+    /// Relative to the media folder.
+    pub play_path: String,
+    /// Videos: where the optimiser is with this file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimized: Option<crate::optimize::Status>,
     /// Pixel size and duration, when `ffprobe` could read the file.
     #[serde(flatten)]
     pub probe: Option<crate::handlers::manage::Probe>,
@@ -41,6 +50,10 @@ impl From<MediaItem> for ItemDto {
             transcode_url: format!("/transcode/{}", m.id),
             thumb_url: format!("/thumb/{}", m.id),
             probe: None,
+            play_url: format!("/stream/{}", m.id),
+            play_size: m.size,
+            play_path: m.path.clone(),
+            optimized: None,
             id: m.id,
             name: m.name,
             path: m.path,

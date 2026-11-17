@@ -1,0 +1,11 @@
+[package]
+name = "lc-hap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "HAP video in QuickTime files: reading the sample table, decoding frames to texture blocks, writing files, and re-chunking HAP losslessly"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+snap = "1.1.2"

@@ -249,11 +249,16 @@ pub struct Asset {
     /// File name, for people (and for the file extension).
     pub name: String,
     pub kind: AssetKind,
-    /// HTTP URL of the original file on the Asset Manager.
+    /// HTTP URL of the file to play on the Asset Manager: its optimised
+    /// version once there is one, the original until then.
     pub url: String,
-    /// Size in bytes. Part of a Runner's cache key, so a file replaced under
-    /// the same name is fetched again.
+    /// Size in bytes of that file. With the URL, part of a Runner's cache
+    /// key, so a replaced or re-optimised file is fetched again.
     pub size: u64,
+    /// Where the file is on the Asset Manager, relative to its media folder
+    /// (e.g. `Optimized/Show A/intro.mov`): Runners store their copy under
+    /// the same name. Empty in shows written before; the name is used then.
+    pub path: String,
     pub width: u32,
     pub height: u32,
     /// Zero for stills.

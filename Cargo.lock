@@ -1935,8 +1935,10 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 name = "lc-assets"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "axum",
  "futures",
+ "lc-hap",
  "mime_guess",
  "pin-project-lite",
  "serde",
@@ -1991,6 +1993,14 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "lc-hap"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "snap",
 ]
 
 [[package]]
@@ -2055,6 +2065,7 @@ dependencies = [
  "image",
  "lc-director",
  "lc-discovery",
+ "lc-hap",
  "lc-net",
  "lc-proto",
  "lc-time",

@@ -73,6 +73,7 @@
   <section class="win" id="win-assets" data-title="Assets">
     <header class="win-head"><span class="win-title">Assets</span>
       <button id="btn-upload">Upload…</button>
+      <button id="btn-optimize" title="What each codec is converted to, in how many chunks, with or without Snappy">Optimise…</button>
       <input type="file" id="file-upload" multiple hidden>
       <button class="win-close" title="Hide">✕</button></header>
     <div class="win-body col">
@@ -145,6 +146,13 @@
 </div>
 
 <div id="toast" hidden></div>
+<div id="opt-dialog" hidden><div class="box">
+  <h3>Asset optimisation</h3>
+  <p class="dim">Videos are converted on the Asset Manager to the codec chosen here, by their codec. Originals are kept; converted copies go in its <code>Optimized</code> folder, with the same names. More chunks let a Runner unpack a frame on more CPU cores at once; without Snappy there is nothing to unpack, but files are about twice as large.</p>
+  <label><input type="checkbox" id="opt-enabled"> Optimise new and changed files automatically</label>
+  <table class="opt-table"><thead><tr><th>Source</th><th>Convert to</th><th>Chunks</th><th>Snappy</th></tr></thead><tbody id="opt-rows"></tbody></table>
+  <div class="btns"><button id="opt-cancel">Cancel</button><button id="opt-save" title="Applies to files optimised from now on">Save</button><button id="opt-apply" class="primary" title="Also optimise again the files made with other settings, and retry failures">Save and apply to existing files</button></div>
+</div></div>
 <div id="modal" hidden><div class="box"><p id="modal-text"></p><div class="btns"><button id="modal-no">Cancel</button><button id="modal-yes" class="primary">OK</button></div></div></div>
 <script src="app.js"></script>
 </body>

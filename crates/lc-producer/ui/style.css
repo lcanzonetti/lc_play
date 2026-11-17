@@ -108,6 +108,21 @@ input[type=checkbox] { vertical-align: -2px; }
 .asset .meta { font-size: 11px; color: var(--dim); }
 .asset button { padding: 0 5px; visibility: hidden; }
 .asset:hover button { visibility: visible; }
+.asset .btns { display: flex; gap: 2px; }
+.opt { display: block; font-size: 11px; }
+.opt-pending { color: var(--dim); }
+.opt-optimizing { color: #e0b040; }
+.opt-done { color: #5fbf6f; }
+.opt-failed { color: #e05050; cursor: help; }
+#opt-dialog { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 9400; display: flex; align-items: center; justify-content: center; }
+#opt-dialog[hidden] { display: none; }
+#opt-dialog .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; max-width: 640px; max-height: 90vh; overflow: auto; }
+#opt-dialog h3 { margin: 0 0 8px; }
+#opt-dialog .dim { color: var(--dim); font-size: 12px; }
+#opt-dialog .btns { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
+.opt-table { border-collapse: collapse; margin-top: 10px; width: 100%; }
+.opt-table th, .opt-table td { padding: 3px 6px; text-align: left; }
+.opt-table input[type=number] { width: 56px; }
 .empty { padding: 14px 8px; color: var(--dim); text-align: center; }
 
 /* ---- inspector / forms ------------------------------------------------ */
