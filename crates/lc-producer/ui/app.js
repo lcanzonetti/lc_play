@@ -573,7 +573,18 @@ function connect(url, protocol) {
     sendPresence();
   };
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    if (S.connected) {
+      // Was connected: say why it was lost. A freeze of this window just
+      // before is the usual cause (the Director drops a client that sends
+      // nothing, not even its pings, for 6 s), not the Director or the
+      // network.
+      const stall = S.lastStall && performance.now() - S.lastStall.at < 15000 ? S.lastStall : null;
+      console.warn(`Director connection lost (code ${ev.code})`, stall ? `after a ${Math.round(stall.ms)} ms freeze` : '');
+      toast(stall
+        ? `Director connection lost after this window was unresponsive for ${(stall.ms / 1000).toFixed(1)} s — reconnecting.`
+        : `Director connection lost (code ${ev.code}) — reconnecting.`);
+    }
     S.connected = false;
     S.status = null;
     renderCluster(); renderRunners();
@@ -2583,6 +2594,24 @@ function tick(now) {
   requestAnimationFrame(tick);
 }
 
+/** Notice when this window's script was blocked (a timer that fires late
+ *  by more than a second): kept in `S.lastStall` and logged, so that a lost
+ *  Director connection can be told apart from a frozen interface. A hidden
+ *  window's timers are slowed down on purpose by the browser: not counted. */
+function watchFreezes() {
+  const PERIOD = 250;
+  let last = performance.now(), wasVisible = !document.hidden;
+  setInterval(() => {
+    const now = performance.now(), late = now - last - PERIOD, visible = !document.hidden;
+    if (late > 1000 && visible && wasVisible) {
+      S.lastStall = { at: now, ms: late + PERIOD };
+      console.warn(`interface unresponsive for ${Math.round(late + PERIOD)} ms`);
+    }
+    last = now;
+    wasVisible = visible;
+  }, PERIOD);
+}
+
 // ───────────────────────────── start-up ─────────────────────────────
 
 (async function start() {
@@ -2596,6 +2625,7 @@ function tick(now) {
   connect(`ws://${cfg.director || `${host}:${cfg.director_port}`}/ws`, cfg.protocol);
 
   setInterval(() => send({ type: 'ping' }), 2000);  // the Director drops silent clients
+  watchFreezes();
   loadLibrary();
   setInterval(loadLibrary, 5000);                   // picks up files copied in by hand
   renderCluster();

@@ -372,6 +372,13 @@ happened in that frame. The frame-rate line every 5 s adds the slowest frame
 and how many were over. `LCPLAY_FRAME_LOG=<ms>` sets another threshold,
 `LCPLAY_FRAME_LOG=0` turns the log off.
 
+When a client loses the Director, the Director's log says why
+(`Producer 'name' disconnected: idle timeout` = it sent nothing, not even its
+pings, for 6 s). The Producer notices when its own window froze for more than
+a second, and says so when the connection drops right after: *Director
+connection lost after this window was unresponsive for 7.3 s* points at the
+computer running the Producer, not at the Director or the network.
+
 ## Workspace
 
 | Crate | Role |

@@ -301,7 +301,14 @@ async fn connection(mut socket: WebSocket, app: AppState, addr: SocketAddr) -> R
     .await;
 
     core.unregister(conn);
-    tracing::info!("{:?} '{}' disconnected", hello.role, hello.name);
+    // Why, at the level the disconnection itself is logged: "idle timeout"
+    // means the client sent nothing (not even its pings) for IDLE_TIMEOUT —
+    // typically a frozen or suspended interface, not the network.
+    let why = match &result {
+        Ok(()) => "closed",
+        Err(reason) => reason.as_str(),
+    };
+    tracing::info!("{:?} '{}' disconnected: {why}", hello.role, hello.name);
     result
 }
 

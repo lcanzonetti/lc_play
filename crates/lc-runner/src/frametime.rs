@@ -30,8 +30,9 @@
 //!   during *update*; the copy to the GPU itself is part of the submission
 //!   in *render*.)
 //!
-//! The log is rate-limited (a few lines a second); the periodic frame-rate
-//! line also gives the slowest frame and how many were over the threshold.
+//! The log is rate-limited (four lines a second, but a frame of 100 ms or
+//! more is always logged); the periodic frame-rate line also gives the
+//! slowest frame and how many were over the threshold.
 //!
 //! `LCPLAY_FRAME_LOG`: unset = on, threshold two refreshes; `0` or `off` =
 //! no log; a number = threshold in milliseconds.
@@ -62,8 +63,12 @@ const PHASES: [(Phase, &str); 5] = [
     (Phase::Present, "present"),
 ];
 
-/// Detailed lines logged per second at most; more are only counted.
+/// Detailed lines logged per second at most; more are only counted…
 const MAX_LINES_PER_SECOND: u32 = 4;
+/// …except frames at least this long: the hiccups the log is for, never
+/// hidden behind a run of slightly slow ones (and at most ten a second by
+/// their very length).
+const ALWAYS_LOGGED: Duration = Duration::from_millis(100);
 
 /// Used for the threshold until an output knows its refresh period.
 const FALLBACK_PERIOD: Duration = Duration::from_micros(16_667);
@@ -249,7 +254,7 @@ impl FrameTimer {
             *window = now;
             self.lines_in_window = 0;
         }
-        if self.lines_in_window >= MAX_LINES_PER_SECOND {
+        if self.lines_in_window >= MAX_LINES_PER_SECOND && interval < ALWAYS_LOGGED {
             self.unlogged += 1;
             return None;
         }
@@ -422,6 +427,9 @@ mod tests {
         let summary = t.summary().unwrap();
         assert!(summary.contains("10 over 20.0 ms"), "{summary}");
         assert!(summary.contains("(6 not logged)"), "{summary}");
+        // Over the limit, a real hiccup is still logged.
+        let big = frame(&mut t, &mut at, MS, &[(Phase::Update, 250 * MS)]);
+        assert!(big.is_some_and(|l| l.starts_with("slow frame: 251.0 ms")));
     }
 
     #[test]

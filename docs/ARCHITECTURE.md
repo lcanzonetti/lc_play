@@ -209,7 +209,8 @@ edits, asset swaps, reloads), *acquire* (waiting for the swap chains),
 *render* (recording and submitting) and *present*. An iteration longer than
 two refreshes is logged as a `slow frame` line with that breakdown and what
 else happened in it (show applied, content loaded, preview read back, late
-decode…); at most four lines a second, and the periodic frame-rate line adds
+decode…); at most four lines a second (a frame of 100 ms or more is always
+logged), and the periodic frame-rate line adds
 the slowest frame and the count over the threshold. `LCPLAY_FRAME_LOG=0`
 turns it off, `LCPLAY_FRAME_LOG=<ms>` sets the threshold.
 
