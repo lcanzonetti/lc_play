@@ -686,3 +686,153 @@ async fn the_refresh_grid_comes_from_the_best_measured_runner() {
     assert_eq!(status.grid_source, Some(NodeId("b".into())));
     director.shutdown().await;
 }
+
+/// The next show sent to `conn`.
+async fn next_show(conn: &mut Connection) -> serde_json::Value {
+    loop {
+        if let ServerMessage::Show { document, .. } =
+            conn.recv_timeout(Duration::from_secs(3)).await.unwrap()
+        {
+            return document;
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_producers_editing_at_once_both_keep_their_changes() {
+    let director = director_with_show(serde_json::json!({
+        "tracks": [ { "id": "t1", "cues": [ { "id": "c1", "x": 0 } ] } ],
+        "stage": { "width": 1920, "height": 1080,
+                   "displays": [ { "id": "d1", "canvas_rect": { "x": 0, "y": 0, "w": 1920, "h": 1080 } } ] }
+    }))
+    .await;
+    let url = lc_net::control_url(director.control_addr());
+    let producer = |id: &str| Hello {
+        role: Role::Producer,
+        node_id: NodeId(id.into()),
+        name: id.into(),
+        ..hello(PROTOCOL_VERSION)
+    };
+    let (mut alice, _) = Connection::connect(&url, || producer("alice"))
+        .await
+        .unwrap();
+    let (mut bob, _) = Connection::connect(&url, || producer("bob")).await.unwrap();
+    let runner = Hello {
+        role: Role::Runner,
+        runner: Some(RunnerHello::default()),
+        ..hello(PROTOCOL_VERSION)
+    };
+    let (mut runner, _) = Connection::connect(&url, || runner.clone()).await.unwrap();
+
+    // Both edit, written against the same show, sent back to back.
+    let edit = |ops: serde_json::Value, by: &str| ClientMessage::Command {
+        command: Command::EditShow {
+            ops: serde_json::from_value(ops).unwrap(),
+            tag: Some(serde_json::json!({ "by": by, "n": 1 })),
+        },
+        timeline: None,
+    };
+    alice
+        .send(&edit(
+            serde_json::json!([{ "op": "set",
+                "path": ["stage", "displays", { "id": "d1" }, "warp_corners"],
+                "value": [[0.0, 0.0], [1.0, 0.0], [0.9, 1.0], [0.1, 1.0]] }]),
+            "alice",
+        ))
+        .await
+        .unwrap();
+    bob.send(&edit(
+        serde_json::json!([{ "op": "set",
+            "path": ["tracks", { "id": "t1" }, "cues", { "id": "c1" }, "x"], "value": 500 }]),
+        "bob",
+    ))
+    .await
+    .unwrap();
+
+    // Whatever the order, the shows the Runner gets end with one that holds
+    // both (the first it gets may be the one sent when it connected).
+    let mut last = next_show(&mut runner).await;
+    for _ in 0..3 {
+        if last["tracks"][0]["cues"][0]["x"] == 500
+            && last["stage"]["displays"][0]["warp_corners"].is_array()
+        {
+            break;
+        }
+        last = next_show(&mut runner).await;
+    }
+    assert_eq!(last["tracks"][0]["cues"][0]["x"], 500);
+    assert_eq!(last["stage"]["displays"][0]["warp_corners"][2][0], 0.9);
+    // Each show carries the tag of the edit that made it.
+    assert!(["alice", "bob"].contains(&last["_edit"]["by"].as_str().unwrap()));
+
+    // Presence goes to the other Producers, not to Runners; leaving says so.
+    alice
+        .send(&ClientMessage::Presence(lc_proto::Presence {
+            name: "Alice".into(),
+            color: "#e44".into(),
+            selection: Some(serde_json::json!({ "type": "display", "id": "d1" })),
+            dragging: false,
+        }))
+        .await
+        .unwrap();
+    loop {
+        if let ServerMessage::Presence { node_id, presence } =
+            bob.recv_timeout(Duration::from_secs(3)).await.unwrap()
+        {
+            assert_eq!(node_id, NodeId("alice".into()));
+            assert_eq!(presence.unwrap().name, "Alice");
+            break;
+        }
+    }
+    drop(alice);
+    loop {
+        if let ServerMessage::Presence { node_id, presence } =
+            bob.recv_timeout(Duration::from_secs(3)).await.unwrap()
+        {
+            assert_eq!(node_id, NodeId("alice".into()));
+            assert!(presence.is_none(), "Alice has left");
+            break;
+        }
+    }
+    // The Runner never saw a presence message.
+    while let Ok(msg) = runner.recv_timeout(Duration::from_millis(200)).await {
+        assert!(!matches!(msg, ServerMessage::Presence { .. }));
+    }
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_edit_without_a_show_or_that_breaks_it_is_refused() {
+    let director = start().await;
+    let edit = |ops: serde_json::Value| Command::EditShow {
+        ops: serde_json::from_value(ops).unwrap(),
+        tag: None,
+    };
+    let set_name = serde_json::json!([{ "op": "set", "path": ["name"], "value": "x" }]);
+    assert!(
+        director.core().command(edit(set_name)).is_err(),
+        "no show yet"
+    );
+    director
+        .core()
+        .command(Command::LoadShow {
+            document: serde_json::json!({ "tracks": [ { "cues": [ { "x": 1 } ] } ] }),
+        })
+        .unwrap();
+    // Ids were assigned on load, so the cue can be addressed.
+    let doc = director.core().show().unwrap().document;
+    let (track, cue) = (
+        doc["tracks"][0]["id"].as_str().unwrap().to_string(),
+        doc["tracks"][0]["cues"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    // A negative duration is not a valid show: the edit is refused whole.
+    let bad = serde_json::json!([{ "op": "set",
+        "path": ["tracks", { "id": track }, "cues", { "id": cue }, "duration_s"], "value": -5 }]);
+    let err = director.core().command(edit(bad)).unwrap_err();
+    assert!(err.starts_with("edit_show"), "{err}");
+    assert_eq!(director.core().show().unwrap().document, doc, "unchanged");
+    director.shutdown().await;
+}

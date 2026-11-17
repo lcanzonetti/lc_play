@@ -30,6 +30,9 @@ pub enum ClientMessage {
     },
     /// Periodic Runner status (1 Hz).
     Health(Health),
+    /// Who this Producer's user is and what they are working on, relayed to
+    /// the other Producers.
+    Presence(Presence),
     /// Application-level keepalive; answered with `Pong`. Lets a client detect
     /// a dead link faster than TCP would.
     Ping,
@@ -108,6 +111,15 @@ pub enum Command {
     /// distributes it to every Runner.
     LoadShow {
         document: serde_json::Value,
+    },
+    /// Change part of the show (see [`crate::edit`]): what Producers send,
+    /// so that several can edit at once. `tag` is copied into the resulting
+    /// document as `_edit`, so the sender recognises its own edit when the
+    /// show comes back.
+    EditShow {
+        ops: Vec<crate::edit::EditOp>,
+        #[serde(default)]
+        tag: Option<serde_json::Value>,
     },
     /// Ask for an immediate [`ServerMessage::Cluster`].
     Status,
@@ -225,6 +237,21 @@ pub struct Health {
     pub downloads: Vec<AssetDownload>,
 }
 
+/// A Producer's user, as the other Producers show them.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Presence {
+    /// The user's name, as they typed it.
+    pub name: String,
+    /// CSS colour their selection is outlined in.
+    pub color: String,
+    /// What they have selected: `{ "type": "cue", "id": "…" }` and the like.
+    #[serde(default)]
+    pub selection: Option<serde_json::Value>,
+    /// Whether they are dragging it right now.
+    #[serde(default)]
+    pub dragging: bool,
+}
+
 /// One asset on its way into a Runner's cache.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AssetDownload {
@@ -328,6 +355,12 @@ pub enum ServerMessage {
     /// [`crate::vblank`]). Sent when it changes and on connection.
     Grid {
         grid: crate::VblankGrid,
+    },
+    /// Another Producer's user and what they are working on; `presence:
+    /// null` when they have left. Not sent to Runners.
+    Presence {
+        node_id: NodeId,
+        presence: Option<Presence>,
     },
     /// The Director could not act on a message. Never fatal for the link.
     Error {

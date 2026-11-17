@@ -1,0 +1,474 @@
+//! Edits to the show document, for several Producers working at once.
+//!
+//! A Producer does not send the whole show after each change (which would
+//! erase whatever another Producer changed meanwhile). It sends the change
+//! as a list of [`EditOp`]s. The Director applies them, in the order they
+//! arrive, to the show it holds, and distributes the result to everyone.
+//!
+//! Objects in lists — tracks, cues, displays, tasks, control cues, assets —
+//! are addressed by their `id`, never by position, so two people inserting,
+//! deleting or reordering at the same time cannot make each other's edits
+//! land on the wrong object. Conflicts resolve simply:
+//!
+//! * two people set the same field: the edit that reaches the Director last
+//!   wins;
+//! * someone edits (or moves, or deletes) an object another person has just
+//!   deleted: that part of the edit is skipped ([`Applied::skipped`]).
+//!
+//! The Producer applies the same operations to its own copy (in JavaScript,
+//! `app.js`), so both implementations follow the rules below exactly.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Most operations one edit may carry, and the deepest path: generous for a
+/// show, but bounded (they come from the network).
+pub const MAX_OPS: usize = 20_000;
+pub const MAX_DEPTH: usize = 16;
+
+/// One step of a path into the document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Step {
+    /// A field of an object.
+    Key(String),
+    /// The element of a list whose `id` is this.
+    Id { id: String },
+}
+
+/// One change to the document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EditOp {
+    /// Set the value at `path` (a field, or a whole list element). Missing
+    /// fields on the way are created.
+    Set { path: Vec<Step>, value: Value },
+    /// Remove a field.
+    Unset { path: Vec<Step> },
+    /// Insert `value` (an object with an `id`) into the list at `path`, after
+    /// the element with id `after` (`None`: at the start; an `after` that no
+    /// longer exists: at the end).
+    Insert {
+        path: Vec<Step>,
+        #[serde(default)]
+        after: Option<String>,
+        value: Value,
+    },
+    /// Remove the list element at `path` (whose last step is an id).
+    Remove { path: Vec<Step> },
+    /// Move the list element at `path` after the element with id `after`.
+    Move {
+        path: Vec<Step>,
+        #[serde(default)]
+        after: Option<String>,
+    },
+}
+
+/// What happened when applying an edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub applied: usize,
+    /// Operations whose target no longer exists (deleted by someone else).
+    pub skipped: usize,
+}
+
+/// Apply `ops` to `doc`, in order. Operations whose target has gone are
+/// skipped; a malformed edit (too many operations, too deep, an insert
+/// without id) is refused as a whole, leaving `doc` unchanged.
+pub fn apply(doc: &mut Value, ops: &[EditOp]) -> Result<Applied, String> {
+    if ops.len() > MAX_OPS {
+        return Err(format!("edit: more than {MAX_OPS} operations"));
+    }
+    for op in ops {
+        let path = match op {
+            EditOp::Set { path, .. }
+            | EditOp::Unset { path }
+            | EditOp::Insert { path, .. }
+            | EditOp::Remove { path }
+            | EditOp::Move { path, .. } => path,
+        };
+        if path.len() > MAX_DEPTH {
+            return Err(format!("edit: a path deeper than {MAX_DEPTH}"));
+        }
+        if let EditOp::Insert { value, .. } = op {
+            if id_of(value).is_none() {
+                return Err("edit: an inserted list element needs an id".into());
+            }
+        }
+    }
+    let mut result = Applied::default();
+    for op in ops {
+        if apply_one(doc, op) {
+            result.applied += 1;
+        } else {
+            result.skipped += 1;
+        }
+    }
+    Ok(result)
+}
+
+fn apply_one(doc: &mut Value, op: &EditOp) -> bool {
+    match op {
+        EditOp::Set { path, value } => {
+            let Some((last, parent)) = split(path) else {
+                // An empty path replaces the whole document.
+                *doc = value.clone();
+                return true;
+            };
+            let Some(parent) = walk(doc, parent, Some(last)) else {
+                return false;
+            };
+            match (last, parent) {
+                (Step::Key(k), Value::Object(map)) => {
+                    map.insert(k.clone(), value.clone());
+                    true
+                }
+                (Step::Id { id }, Value::Array(list)) => match position(list, id) {
+                    Some(i) => {
+                        list[i] = value.clone();
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            }
+        }
+        EditOp::Unset { path } => {
+            let Some((Step::Key(k), parent)) = split(path) else {
+                return false;
+            };
+            match walk(doc, parent, None) {
+                Some(Value::Object(map)) => {
+                    map.remove(k);
+                    true
+                }
+                _ => false,
+            }
+        }
+        EditOp::Insert { path, after, value } => {
+            // A list that does not exist yet (an older document) is created.
+            if walk(doc, path, None).is_none() {
+                let Some((Step::Key(k), parent)) = split(path) else {
+                    return false;
+                };
+                let Some(Value::Object(map)) = walk(doc, parent, path.last()) else {
+                    return false;
+                };
+                map.insert(k.clone(), Value::Array(Vec::new()));
+            }
+            let Some(Value::Array(list)) = walk(doc, path, None) else {
+                return false;
+            };
+            let id = id_of(value).unwrap_or_default().to_string();
+            if position(list, &id).is_some() {
+                return false; // already there (inserted twice)
+            }
+            let at = insertion_point(list, after.as_deref());
+            list.insert(at, value.clone());
+            true
+        }
+        EditOp::Remove { path } => {
+            let Some((Step::Id { id }, parent)) = split(path) else {
+                return false;
+            };
+            match walk(doc, parent, None) {
+                Some(Value::Array(list)) => match position(list, id) {
+                    Some(i) => {
+                        list.remove(i);
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            }
+        }
+        EditOp::Move { path, after } => {
+            let Some((Step::Id { id }, parent)) = split(path) else {
+                return false;
+            };
+            let Some(Value::Array(list)) = walk(doc, parent, None) else {
+                return false;
+            };
+            let Some(i) = position(list, id) else {
+                return false;
+            };
+            let element = list.remove(i);
+            let at = insertion_point(list, after.as_deref());
+            list.insert(at, element);
+            true
+        }
+    }
+}
+
+/// `(last step, the steps before it)`.
+fn split(path: &[Step]) -> Option<(&Step, &[Step])> {
+    let (last, parent) = path.split_last()?;
+    Some((last, parent))
+}
+
+/// Follow `path` from `doc`. With `create` (the step that will follow), a
+/// missing object field is created as the container that step needs.
+fn walk<'a>(doc: &'a mut Value, path: &[Step], create: Option<&Step>) -> Option<&'a mut Value> {
+    let mut here = doc;
+    for (n, step) in path.iter().enumerate() {
+        here = match step {
+            Step::Key(k) => {
+                let map = here.as_object_mut()?;
+                if create.is_some() && !map.contains_key(k) {
+                    let next = path.get(n + 1).or(create)?;
+                    let empty = match next {
+                        Step::Key(_) => Value::Object(Map::new()),
+                        Step::Id { .. } => Value::Array(Vec::new()),
+                    };
+                    map.insert(k.clone(), empty);
+                }
+                map.get_mut(k)?
+            }
+            Step::Id { id } => {
+                let list = here.as_array_mut()?;
+                let i = position(list, id)?;
+                &mut list[i]
+            }
+        };
+    }
+    Some(here)
+}
+
+fn id_of(value: &Value) -> Option<&str> {
+    value.get("id")?.as_str().filter(|s| !s.is_empty())
+}
+
+fn position(list: &[Value], id: &str) -> Option<usize> {
+    list.iter().position(|v| id_of(v) == Some(id))
+}
+
+fn insertion_point(list: &[Value], after: Option<&str>) -> usize {
+    match after {
+        None => 0,
+        Some(a) => position(list, a).map_or(list.len(), |i| i + 1),
+    }
+}
+
+/// The lists whose elements are addressed by id.
+pub const KEYED_LISTS: [&str; 6] = [
+    "tracks",
+    "cues",
+    "displays",
+    "tasks",
+    "control_cues",
+    "assets",
+];
+
+/// Give every element of the keyed lists an id, where one is missing (a
+/// hand-written show): edits can only address elements that have one.
+/// Returns how many were assigned.
+pub fn ensure_ids(doc: &mut Value) -> usize {
+    let mut taken = std::collections::HashSet::new();
+    collect_ids(doc, &mut taken);
+    let mut assigned = 0;
+    assign_ids(doc, &mut taken, &mut assigned, false);
+    assigned
+}
+
+fn collect_ids(v: &Value, taken: &mut std::collections::HashSet<String>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(id) = map.get("id").and_then(Value::as_str) {
+                taken.insert(id.to_string());
+            }
+            map.values().for_each(|v| collect_ids(v, taken));
+        }
+        Value::Array(list) => list.iter().for_each(|v| collect_ids(v, taken)),
+        _ => {}
+    }
+}
+
+fn assign_ids(
+    v: &mut Value,
+    taken: &mut std::collections::HashSet<String>,
+    assigned: &mut usize,
+    keyed: bool,
+) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                assign_ids(child, taken, assigned, KEYED_LISTS.contains(&k.as_str()));
+            }
+        }
+        Value::Array(list) => {
+            for element in list.iter_mut() {
+                if keyed {
+                    if let Some(map) = element.as_object_mut() {
+                        let missing = map
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_none_or(|s| s.is_empty());
+                        if missing {
+                            let mut n = taken.len();
+                            let id = loop {
+                                let id = format!("auto-{n}");
+                                if !taken.contains(&id) {
+                                    break id;
+                                }
+                                n += 1;
+                            };
+                            taken.insert(id.clone());
+                            map.insert("id".into(), Value::String(id));
+                            *assigned += 1;
+                        }
+                    }
+                }
+                assign_ids(element, taken, assigned, false);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ops(v: Value) -> Vec<EditOp> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn doc() -> Value {
+        json!({
+            "name": "show",
+            "tracks": [
+                { "id": "t1", "cues": [ { "id": "a", "x": 0 }, { "id": "b", "x": 10 } ] },
+                { "id": "t2", "cues": [] }
+            ],
+            "stage": { "displays": [ { "id": "d1", "warp_corners": null } ] }
+        })
+    }
+
+    #[test]
+    fn two_people_editing_different_things_both_keep_their_change() {
+        let mut d = doc();
+        // Alice moves a warp corner, Bob moves a cue: in either order the
+        // result holds both.
+        let alice = ops(json!([{ "op": "set",
+            "path": ["stage", "displays", { "id": "d1" }, "warp_corners"],
+            "value": [[0,0],[1,0],[1,1],[0,1]] }]));
+        let bob = ops(json!([{ "op": "set",
+            "path": ["tracks", { "id": "t1" }, "cues", { "id": "b" }, "x"], "value": 99 }]));
+        apply(&mut d, &alice).unwrap();
+        apply(&mut d, &bob).unwrap();
+        assert_eq!(d["tracks"][0]["cues"][1]["x"], 99);
+        assert_eq!(d["stage"]["displays"][0]["warp_corners"][2], json!([1, 1]));
+    }
+
+    #[test]
+    fn lists_are_addressed_by_id_not_position() {
+        let mut d = doc();
+        // Someone inserts a cue at the start; an edit to "b" written before
+        // that still reaches "b".
+        apply(
+            &mut d,
+            &ops(json!([{ "op": "insert",
+            "path": ["tracks", { "id": "t1" }, "cues"], "after": null,
+            "value": { "id": "new", "x": 5 } }])),
+        )
+        .unwrap();
+        apply(
+            &mut d,
+            &ops(json!([{ "op": "set",
+            "path": ["tracks", { "id": "t1" }, "cues", { "id": "b" }, "x"], "value": 7 }])),
+        )
+        .unwrap();
+        let cues = &d["tracks"][0]["cues"];
+        assert_eq!(cues[0]["id"], "new");
+        assert_eq!(cues[2]["x"], 7);
+    }
+
+    #[test]
+    fn editing_something_deleted_meanwhile_is_skipped() {
+        let mut d = doc();
+        apply(&mut d, &ops(json!([{ "op": "remove", "path": ["tracks", { "id": "t1" }, "cues", { "id": "a" }] }]))).unwrap();
+        let r = apply(&mut d, &ops(json!([
+            { "op": "set", "path": ["tracks", { "id": "t1" }, "cues", { "id": "a" }, "x"], "value": 1 },
+            { "op": "set", "path": ["name"], "value": "renamed" }
+        ]))).unwrap();
+        assert_eq!(
+            r,
+            Applied {
+                applied: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(d["name"], "renamed");
+    }
+
+    #[test]
+    fn move_and_insert_after() {
+        let mut d = doc();
+        apply(
+            &mut d,
+            &ops(json!([{ "op": "move", "path": ["tracks", { "id": "t1" }], "after": "t2" }])),
+        )
+        .unwrap();
+        assert_eq!(d["tracks"][0]["id"], "t2");
+        // An `after` that no longer exists appends.
+        apply(
+            &mut d,
+            &ops(
+                json!([{ "op": "insert", "path": ["tracks"], "after": "gone",
+            "value": { "id": "t3", "cues": [] } }]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(d["tracks"][2]["id"], "t3");
+        // Inserting the same id twice does nothing the second time.
+        let r = apply(
+            &mut d,
+            &ops(json!([{ "op": "insert", "path": ["tracks"], "after": null,
+            "value": { "id": "t3" } }])),
+        )
+        .unwrap();
+        assert_eq!(r.skipped, 1);
+    }
+
+    #[test]
+    fn missing_containers_are_created() {
+        let mut d = json!({});
+        apply(
+            &mut d,
+            &ops(json!([
+                { "op": "set", "path": ["stage", "background"], "value": [0, 0, 0, 1] },
+                { "op": "insert", "path": ["tasks"], "value": { "id": "sting" } }
+            ])),
+        )
+        .unwrap();
+        assert_eq!(d["stage"]["background"][3], 1);
+        assert_eq!(d["tasks"][0]["id"], "sting");
+    }
+
+    #[test]
+    fn malformed_edits_are_refused_whole() {
+        let mut d = doc();
+        let before = d.clone();
+        let bad = ops(json!([
+            { "op": "set", "path": ["name"], "value": "x" },
+            { "op": "insert", "path": ["tracks"], "value": { "no_id": true } }
+        ]));
+        assert!(apply(&mut d, &bad).is_err());
+        assert_eq!(d, before);
+        let deep: Vec<Step> = (0..20).map(|_| Step::Key("a".into())).collect();
+        assert!(apply(&mut d, &[EditOp::Unset { path: deep }]).is_err());
+    }
+
+    #[test]
+    fn hand_written_shows_get_ids() {
+        let mut d = json!({ "tracks": [ { "cues": [ { "x": 1 }, { "id": "auto-1" } ] } ] });
+        assert_eq!(ensure_ids(&mut d), 2);
+        let track = d["tracks"][0]["id"].as_str().unwrap();
+        let cue = d["tracks"][0]["cues"][0]["id"].as_str().unwrap();
+        assert!(track.starts_with("auto-") && cue.starts_with("auto-"));
+        assert_ne!(cue, "auto-1", "existing ids are not reused");
+        assert_ne!(track, cue);
+        assert_eq!(ensure_ids(&mut d), 0);
+    }
+}

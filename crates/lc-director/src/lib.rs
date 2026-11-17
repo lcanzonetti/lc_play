@@ -558,7 +558,25 @@ impl Core {
     }
 
     pub fn unregister(&self, conn: u64) {
-        self.state().nodes.remove(&conn);
+        let gone = self.state().nodes.remove(&conn);
+        // The other Producers stop showing that user.
+        if let Some(node) = gone.filter(|n| n.role == Role::Producer) {
+            self.publish(ServerMessage::Presence {
+                node_id: node.node_id,
+                presence: None,
+            });
+        }
+    }
+
+    /// Relay a Producer's presence to the other Producers.
+    pub fn presence(&self, conn: u64, presence: lc_proto::Presence) {
+        let node = self.state().nodes.get(&conn).cloned();
+        if let Some(node) = node.filter(|n| n.role == Role::Producer) {
+            self.publish(ServerMessage::Presence {
+                node_id: node.node_id,
+                presence: Some(presence),
+            });
+        }
     }
 
     /// Record a Runner's health report, and judge it: is its clock where
@@ -776,6 +794,7 @@ impl Core {
             }
             Command::SetLoop { loop_ns } => TransportChange::SetLoop(loop_ns),
             Command::LoadShow { document } => return self.load_show(document),
+            Command::EditShow { ops, tag } => return self.edit_show(&ops, tag),
             Command::RunnerAction { runner, action } => return self.runner_action(&runner, action),
             Command::WakeRunner { runner } => return self.wake_runner(&runner),
             // Answered by the connection that asked; nothing to change here.
@@ -976,10 +995,49 @@ impl Core {
         }
     }
 
+    /// Apply a Producer's edit to the show (see `lc_proto::edit`). Done under
+    /// the state lock from reading the show to storing the result, so that
+    /// two edits arriving together are applied one after the other, each to
+    /// the result of the previous one — neither is lost.
+    fn edit_show(
+        &self,
+        ops: &[lc_proto::edit::EditOp],
+        tag: Option<serde_json::Value>,
+    ) -> Result<(), String> {
+        let mut st = self.state();
+        let Some(show) = &st.show else {
+            return Err("edit_show: there is no show to edit".into());
+        };
+        let mut document = show.document.clone();
+        let applied = lc_proto::edit::apply(&mut document, ops)?;
+        if applied.skipped > 0 {
+            tracing::debug!(
+                skipped = applied.skipped,
+                "edit_show: parts of an edit referred to something deleted meanwhile"
+            );
+        }
+        if let (Some(map), Some(tag)) = (document.as_object_mut(), tag) {
+            map.insert("_edit".into(), tag);
+        }
+        self.load_show_locked(&mut st, document)
+            .map_err(|e| e.replacen("load_show", "edit_show", 1))
+    }
+
     fn load_show(&self, document: serde_json::Value) -> Result<(), String> {
+        let mut st = self.state();
+        self.load_show_locked(&mut st, document)
+    }
+
+    fn load_show_locked(
+        &self,
+        st: &mut std::sync::MutexGuard<'_, State>,
+        mut document: serde_json::Value,
+    ) -> Result<(), String> {
         if !document.is_object() {
             return Err("load_show: the show document must be a JSON object".into());
         }
+        // Edits address list elements by id: make sure every one has one.
+        lc_proto::edit::ensure_ids(&mut document);
         // Refuse what no Runner could render, here, with a message for the
         // operator — instead of distributing it and failing on every node.
         // (Unknown fields are allowed and preserved: the document is stored
@@ -987,7 +1045,6 @@ impl Core {
         let parsed: ShowDocument =
             serde_json::from_value(document.clone()).map_err(|e| format!("load_show: {e}"))?;
         parsed.validate().map_err(|e| format!("load_show: {e}"))?;
-        let mut st = self.state();
         // A task that is no longer in the show goes off stage — but its
         // transport is *kept*, stopped. Dropping it would restart its epochs
         // at 1 if the task ever came back (an undo, an older show file), and
@@ -1002,7 +1059,7 @@ impl Core {
         let at = self.clock.now_ns() + self.lead_ns;
         for id in removed {
             self.apply(
-                &mut st,
+                st,
                 Some(&id),
                 TransportChange::Stop { deactivate: true },
                 at,
@@ -1019,7 +1076,6 @@ impl Core {
             id: id.clone(),
             document: document.clone(),
         });
-        drop(st);
         self.publish(ServerMessage::Show {
             revision,
             id,

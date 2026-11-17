@@ -28,6 +28,7 @@
 //!   Director failure.
 
 pub mod beacon;
+pub mod edit;
 pub mod message;
 pub mod show;
 pub mod transport;
@@ -36,8 +37,8 @@ pub mod vblank;
 pub use beacon::{Beacon, DISCOVERY_GROUP, DISCOVERY_PORT};
 pub use message::{
     AssetDownload, ClientMessage, ClusterStatus, Command, Health, Hello, KnownRunner, MachineInfo,
-    MonitorInfo, NodeStatus, OutputPreview, RunnerAction, RunnerHello, ServerMessage, SyncQuality,
-    Welcome,
+    MonitorInfo, NodeStatus, OutputPreview, Presence, RunnerAction, RunnerHello, ServerMessage,
+    SyncQuality, Welcome,
 };
 pub use show::ShowDocument;
 pub use transport::{FrameRate, TransportState};

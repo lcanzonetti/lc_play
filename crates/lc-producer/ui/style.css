@@ -212,3 +212,9 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 .dl .fill { height: 100%; background: var(--accent, #3d8bfd); transition: width 0.4s linear; }
 .dl.failed .fill { background: #e8a33d; }
 .dl.failed .dim { color: #e8a33d; }
+
+/* Users working on the show together (top bar) and the inspector's note. */
+#users { gap: 4px; }
+#users .user { border: 1px solid var(--c); color: var(--c); border-radius: 10px; padding: 1px 8px; font-size: 12px; white-space: nowrap; }
+#users .user.me { background: var(--c); color: #06121f; cursor: pointer; }
+.together { border-left: 3px solid var(--c); padding: 4px 8px; margin-bottom: 8px; font-size: 12px; background: rgba(255, 255, 255, 0.04); }

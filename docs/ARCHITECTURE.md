@@ -459,6 +459,24 @@ fullscreen, monitor) and GPU state (warp, blend, rotation) in place; windows
 are only opened and closed when displays are added or removed. On Windows
 the renderer uses Direct3D 12 (`LCPLAY_BACKEND` overrides).
 
+### Several Producers on one show
+
+The Director holds the one show everybody edits (it already did, for the
+Runners). Producers send **edits** (`edit_show`: operations addressed by
+object id, `lc-proto/src/edit.rs`) instead of whole documents. The Director
+applies them under its state lock, one after another, validates the result
+and distributes the show as before. Each Producer shows the Director's show
+with its own not-yet-confirmed edits re-applied on top ("server
+reconciliation"), so its own changes appear at once and nobody else's are
+overwritten. Conflicts: last writer wins per field; edits to something
+deleted meanwhile are dropped. No operational transform or CRDT is needed
+because there is a single, always-present sequencer, and editing without a
+Director is not possible anyway. A show that arrives mid-drag is applied
+when the drag ends, so the dragged object does not jump. Undo steps are
+stored as operations (forward and back), so undo reverts only that user's
+changes. Presence (name, colour, selection, dragging) is relayed by the
+Director between Producers only.
+
 ### Runner management
 
 `lc-runner` is started as a supervisor that runs the real Runner as a child

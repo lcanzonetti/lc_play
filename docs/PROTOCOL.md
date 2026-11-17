@@ -74,8 +74,41 @@ Commands:
 | `seek` | `show_ns ≥ 0` | jump; play state unchanged |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
-| `load_show` | `document` (JSON object) | new show revision, distributed to Runners |
+| `load_show` | `document` (JSON object) | new show revision, distributed to Runners; replaces the show for everyone |
+| `edit_show` | `ops` (list of edit operations), `tag` (copied into the result as `_edit`) | applies the operations to the current show, then as `load_show`; see below |
 | `status` | — | Director replies with `cluster` |
+
+`edit_show` is how Producers edit, so that several can work on one show at
+once (lc-proto `edit.rs`). An operation is one of
+
+```json
+{ "op": "set",    "path": ["stage", "displays", { "id": "d1" }, "warp_corners"], "value": [[0,0],[1,0],[1,1],[0,1]] }
+{ "op": "unset",  "path": ["tracks", { "id": "t1" }, "name"] }
+{ "op": "insert", "path": ["tracks", { "id": "t1" }, "cues"], "after": "c3", "value": { "id": "c9", … } }
+{ "op": "remove", "path": ["tracks", { "id": "t1" }, "cues", { "id": "c3" }] }
+{ "op": "move",   "path": ["tracks", { "id": "t2" }], "after": null }
+```
+
+A path step is a field name, or `{ "id": … }` for the element of a list
+(`tracks`, `cues`, `displays`, `tasks`, `control_cues`, `assets`) with that
+id. `after: null` inserts or moves to the start; an `after` that no longer
+exists, to the end. The Director applies edits in the order they arrive;
+operations whose target someone else has deleted meanwhile are skipped, and
+for the same field the later edit wins. If the result is not a valid show the
+whole edit is refused (`error` starting with `edit_show`). Every element of
+those lists gets an id on load if it has none (`auto-<n>`).
+
+The resulting `show` carries the edit's `tag` as `_edit` (`{ "by": <client
+id>, "n": <edit number> }`): a Producer drops its own edits up to `n` from
+those it still has pending, and shows the Director's show with the rest
+applied on top.
+
+Producers also send `{ "type": "presence", "name": "Alice", "color":
+"#ff6b6b", "selection": { "type": "cue", "id": "c1" }, "dragging": false }`
+(on selection changes and every 3 s). The Director relays it to the other
+Producers and controllers — never to Runners — as `{ "type": "presence",
+"node_id": "…", "presence": { … } }`, and with `"presence": null` when that
+Producer disconnects.
 
 Runner actions: `reload_outputs` (close and rebuild the outputs), `restart`
 and `quit` (the Runner program), `standby` / `resume` (close / reopen the

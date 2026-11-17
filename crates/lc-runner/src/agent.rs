@@ -400,7 +400,8 @@ impl Link {
                         | ServerMessage::Cluster(_)
                         | ServerMessage::Welcome(_)
                         | ServerMessage::RunnerLogs { .. }
-                        | ServerMessage::RunnerPreview { .. } => {}
+                        | ServerMessage::RunnerPreview { .. }
+                        | ServerMessage::Presence { .. } => {}
                     }
                 }
 

@@ -1,0 +1,85 @@
+// Two users editing one show at once, in two real browsers.
+//
+// Needs Node with Playwright (`npm i -g playwright`, or any project that has
+// it) and a Director plus a Producer running on this machine:
+//
+//   target/debug/lc-director --state-dir /tmp/lcplay-mu &
+//   target/debug/lc-producer --browser &
+//   node crates/lc-producer/ui-tests/multiuser.js [screenshot.png]
+//
+// Checks: diff/apply round trip (randomised), simultaneous edits converge
+// and both survive, presence and the inspector's note, per-user undo, and a
+// user who leaves disappearing. Exit code 1 on any failure.
+const { chromium } = require('playwright');
+const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 1; } else console.log('ok  ', m); };
+(async () => {
+  const b = await chromium.launch();
+  const errs = [];
+  const open = async (name) => {
+    const ctx = await b.newContext({ viewport: { width: 1400, height: 900 } });
+    await ctx.addInitScript((n) => localStorage.setItem('lcplay.user', JSON.stringify({ name: n, color: n === 'Alice' ? '#ff6b6b' : '#4dabf7' })), name);
+    const p = await ctx.newPage(); p.on('pageerror', (e) => errs.push(name + ': ' + e.message));
+    await p.goto('http://127.0.0.1:7404'); return p;
+  };
+  const A = await open('Alice'); await A.waitForTimeout(2500);
+  const B = await open('Bob'); await B.waitForTimeout(2500);
+
+  // Property test of diff/apply in the page.
+  const prop = await A.evaluate(() => {
+    let rnd = 1; const r = (n) => { rnd = (rnd * 1103515245 + 12345) % 2147483648; return rnd % n; };
+    const base = () => ({ name: 's', tracks: [0,1,2,3].map((i) => ({ id: 't' + i, name: 'T' + i, cues: [0,1,2].map((j) => ({ id: `c${i}${j}`, x: j, rgba: [1, 0, 0, 1] })) })), stage: { displays: [{ id: 'd1', canvas_rect: { x: 0, y: 0, w: 10, h: 10 } }] } });
+    for (let it = 0; it < 500; it++) {
+      const a = base(), bb = clone(a);
+      for (let m = 0; m < 1 + r(5); m++) {
+        const t = bb.tracks;
+        switch (r(7)) {
+          case 0: t.splice(r(t.length + 1), 0, { id: 'n' + it + m, cues: [] }); break;
+          case 1: if (t.length) t.splice(r(t.length), 1); break;
+          case 2: if (t.length > 1) { const [e] = t.splice(r(t.length), 1); t.splice(r(t.length + 1), 0, e); } break;
+          case 3: if (t.length && t[0].cues.length) t[0].cues[r(t[0].cues.length)].x = r(100); break;
+          case 4: bb.name = 'n' + r(9); break;
+          case 5: delete bb.stage.displays[0].canvas_rect.h; break;
+          case 6: if (t.length) t[r(t.length)].cues.reverse(); break;
+        }
+      }
+      const got = applyOps(clone(a), diffDoc(a, bb));
+      if (JSON.stringify(got) !== JSON.stringify(bb)) return `mismatch at ${it}: ${JSON.stringify(diffDoc(a, bb))}`;
+    }
+    return 'ok';
+  });
+  assert(prop === 'ok', 'diff then apply reproduces the target (500 random edits): ' + prop);
+
+  // Simultaneous edits from both pages.
+  await Promise.all([
+    A.evaluate(() => edit(() => { S.doc.stage.displays[0].canvas_rect.x = 123; })),
+    B.evaluate(() => edit(() => { tlObj(MAIN).tracks.push({ id: 'bobtrack', name: 'Bob track', cues: [] }); S.doc.name = 'Bob named it'; })),
+  ]);
+  await A.waitForTimeout(1500);
+  const docs = await Promise.all([A, B].map((p) => p.evaluate(() => JSON.stringify(S.doc))));
+  const da = JSON.parse(docs[0]);
+  assert(docs[0] === docs[1], 'both pages converge on the same show');
+  assert(da.stage.displays[0].canvas_rect.x === 123 && da.name === 'Bob named it' && da.tracks.some((t) => t.id === 'bobtrack'), "Alice's and Bob's changes are both in it");
+
+  // Presence.
+  await A.evaluate(() => select({ type: 'display', id: S.doc.stage.displays[0].id }));
+  await B.waitForTimeout(800);
+  const seen = await B.evaluate(() => [...S.others.values()].map((o) => [o.name, o.selection?.type]));
+  assert(seen.some(([n, t]) => n === 'Alice' && t === 'display'), 'Bob sees Alice and what she selected: ' + JSON.stringify(seen));
+  await B.evaluate(() => select({ type: 'display', id: S.doc.stage.displays[0].id }));
+  await B.waitForTimeout(300);
+  const note = await B.locator('#inspector .together').innerText().catch(() => '');
+  assert(note.includes('Alice'), 'the inspector says Alice is on it too: ' + note);
+
+  // Alice undoes: only her change goes.
+  await A.evaluate(() => stepHistory(S.undo, S.redo));
+  await A.waitForTimeout(1200);
+  const after = JSON.parse(await B.evaluate(() => JSON.stringify(S.doc)));
+  assert(after.stage.displays[0].canvas_rect.x !== 123 && after.tracks.some((t) => t.id === 'bobtrack'), "Alice's undo reverts her edit and keeps Bob's");
+  if (process.argv[2]) await B.screenshot({ path: process.argv[2] });
+
+  // Alice leaves: Bob stops showing her.
+  await A.context().close(); await B.waitForTimeout(1500);
+  assert(await B.evaluate(() => S.others.size) === 0, 'a user who leaves disappears');
+  assert(!errs.length, 'no page errors ' + JSON.stringify(errs));
+  await b.close();
+})();

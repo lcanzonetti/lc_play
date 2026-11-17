@@ -122,6 +122,20 @@ and resets them. The layout is remembered.
 | Inspector | Properties of whatever is selected; with nothing selected, the show and stage. |
 | Assets | Media on the Asset Manager. |
 
+**Several people at once.** Anyone who can reach the Producer's address
+(`http://<producer machine>:7404`, started with `--browser` or alongside the
+window) can open it in a browser and work on the same show at the same time
+— one on displays and warp, another on the timeline. Each change is sent as a
+small edit to the Director, which applies everyone's edits in turn; objects
+are tracked by identity, so simultaneous changes to different things all
+survive, and for the same field the last change wins. Each user's name and
+colour are in the top bar (click your own to rename yourself); what the
+others have selected is outlined in their colour on the stage and the
+timeline, dashed while they drag it, and the inspector says when someone
+else has the same thing selected. **Undo** reverts only your own changes.
+**New** and **Open…** replace the show for everyone (with a warning). There
+is no password: keep the show network closed.
+
 The default display is a 960×540 window showing a 1920×1080 stage — a
 preview. For a real output, pick **Fullscreen · #n** for the display in the
 Runners window. New displays are placed to the right of the existing ones,

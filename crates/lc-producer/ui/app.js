@@ -92,9 +92,15 @@ const S = {
   clientId: 'producer-' + uid(), // identifies this page's edits when they come back
   editN: 0,             // number of the last document this page sent
   doc: null,            // the show document being edited
-  lastSent: '',         // JSON of the document as last sent/received (change detection)
+  lastSent: '',         // JSON of the document as last sent/received: what the next edit is computed against
   dirty: false,         // there are edits the Director has not received
-  holdForeign: false,   // ignore other senders' shows until ours is confirmed
+  holdForeign: false,   // a whole show we sent is on its way: ignore older ones until it is back
+  server: null,         // the show as the Director last sent it (the shared truth)
+  pending: [],          // our edits sent but not yet seen back: [{ n, ops }]
+  replaceNext: false,   // the next send replaces the show for everyone (New, Open)
+  deferredShow: false,  // a show arrived during a drag: apply it when the drag ends
+  user: loadUser(),     // { name, color }: who this is, for the other users
+  others: new Map(),    // node id → presence of the other Producers' users
   sel: null,            // { type: 'cue'|'display'|'control'|'track'|'task', id }
   tl: MAIN,             // the timeline open in the Timeline window
   transports: {},       // timeline id → transport states known, oldest first (≤ 2)
@@ -323,6 +329,180 @@ function windowDragMove(e) {
 }
 window.addEventListener('resize', applyLayout);
 
+// ───────────────────────────── users ─────────────────────────────
+// Several people can edit the same show at once, each in their own
+// Producer page (on this computer or any other that can reach the Producer's
+// address). Each has a name and a colour; what they have selected is
+// outlined in their colour on the others' screens.
+
+// (A function declaration, not a constant: `S` calls it before this line.)
+function userKey() { return 'lcplay.user'; }
+function loadUser() {
+  let u = null;
+  try { u = JSON.parse(localStorage.getItem(userKey())); } catch { /* none yet */ }
+  const palette = ['#ff6b6b', '#ffa94d', '#ffd43b', '#69db7c', '#38d9a9', '#4dabf7', '#9775fa', '#f783ac'];
+  if (!u?.name) u = { name: `User ${Math.floor(Math.random() * 90 + 10)}`, color: palette[Math.floor(Math.random() * palette.length)] };
+  return u;
+}
+function saveUser() {
+  try { localStorage.setItem(userKey(), JSON.stringify(S.user)); } catch { /* not remembered */ }
+}
+
+/** Tell the other Producers who we are and what we are working on. */
+function sendPresence() {
+  send({ type: 'presence', name: S.user.name, color: S.user.color, selection: S.sel, dragging: !!(drag?.undone || tlDrag?.undone) });
+}
+
+/** Other users who have `sel` (or the object `type`/`id`) selected. */
+function othersOn(type, id) {
+  return [...S.others.values()].filter((o) => o.selection?.type === type && o.selection?.id === id);
+}
+
+function renderUsers() {
+  const box = $('#users');
+  if (!box) return;
+  const me = el('span', { class: 'user me', style: `--c:${S.user.color}`, title: 'You — click to change your name' }, S.user.name);
+  me.onclick = () => {
+    const name = prompt('Your name, as the other users see it:', S.user.name);
+    if (name?.trim()) { S.user.name = name.trim().slice(0, 40); saveUser(); renderUsers(); sendPresence(); }
+  };
+  box.replaceChildren(me, ...[...S.others.values()].map((o) =>
+    el('span', { class: 'user', style: `--c:${o.color}`, title: o.selection ? `${o.name}: ${o.dragging ? 'moving' : 'has selected'} a ${o.selection.type}` : o.name }, o.name)));
+}
+
+/** Outline what the others have selected in the timeline (the stage draws
+ *  its own outlines every frame). */
+function markOthers() {
+  document.querySelectorAll('#tracks .cue').forEach((n) => {
+    const o = othersOn('cue', n.dataset.id)[0];
+    n.style.boxShadow = o ? `0 0 0 2px ${o.color}` : '';
+    n.title = o ? `${n.title.split(' — ')[0]} — ${o.name}${o.dragging ? ' is moving it' : ' has it selected'}` : n.title.split(' — ')[0];
+  });
+}
+
+// ───────────────────────────── shared editing ─────────────────────────────
+// Edits travel as small operations, not whole shows (lc-proto/src/edit.rs
+// has the same rules, and the Director applies them): objects in lists are
+// addressed by id, so two people's simultaneous edits both survive. The
+// Director's copy is the truth; this page shows it with its own edits that
+// are still on their way applied on top.
+
+/** Lists whose elements are addressed by id (as in edit.rs). */
+const KEYED = new Set(['tracks', 'cues', 'displays', 'tasks', 'control_cues', 'assets']);
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+const keyedList = (list) => list.every((e) => isObj(e) && typeof e.id === 'string' && e.id);
+
+/** The operations that turn document `a` into document `b`. */
+function diffDoc(a, b, path = [], out = []) {
+  if (a === b) return out;
+  if (isObj(a) && isObj(b)) {
+    for (const k of Object.keys(b)) {
+      if (b[k] === undefined) continue;
+      if (a[k] === undefined) out.push({ op: 'set', path: [...path, k], value: clone(b[k]) });
+      else diffDoc(a[k], b[k], [...path, k], out);
+    }
+    for (const k of Object.keys(a)) if (a[k] !== undefined && b[k] === undefined) out.push({ op: 'unset', path: [...path, k] });
+    return out;
+  }
+  const last = path[path.length - 1];
+  if (Array.isArray(a) && Array.isArray(b) && KEYED.has(last) && keyedList(a) && keyedList(b)) {
+    const inB = new Set(b.map((e) => e.id)), byId = new Map(a.map((e) => [e.id, e]));
+    for (const e of a) if (!inB.has(e.id)) out.push({ op: 'remove', path: [...path, { id: e.id }] });
+    // Replay b's order on a copy of what survives, inserting and moving as
+    // needed: the fewest operations for the usual edits (one added, one
+    // dragged up or down).
+    const sim = a.filter((e) => inB.has(e.id)).map((e) => e.id);
+    let prev = null;
+    for (const e of b) {
+      const at = sim.indexOf(e.id);
+      const want = prev === null ? 0 : sim.indexOf(prev) + 1;
+      if (at < 0) {
+        out.push({ op: 'insert', path, after: prev, value: clone(e) });
+        sim.splice(want, 0, e.id);
+      } else if (at !== want) {
+        out.push({ op: 'move', path: [...path, { id: e.id }], after: prev });
+        sim.splice(at, 1);
+        sim.splice(prev === null ? 0 : sim.indexOf(prev) + 1, 0, e.id);
+      }
+      prev = e.id;
+    }
+    for (const e of b) if (byId.has(e.id)) diffDoc(byId.get(e.id), e, [...path, { id: e.id }], out);
+    return out;
+  }
+  if (JSON.stringify(a) !== JSON.stringify(b)) out.push({ op: 'set', path, value: clone(b) });
+  return out;
+}
+
+/** Apply operations to `doc` in place, skipping those whose target is gone
+ *  (the same rules as the Director's). Returns the document. */
+function applyOps(doc, ops) {
+  const find = (list, id) => (Array.isArray(list) ? list.findIndex((e) => isObj(e) && e.id === id) : -1);
+  const walk = (path, create) => {
+    let here = doc;
+    for (let n = 0; n < path.length; n++) {
+      const step = path[n];
+      if (typeof step === 'string') {
+        if (!isObj(here)) return undefined;
+        if (create && here[step] === undefined) {
+          const next = n + 1 < path.length ? path[n + 1] : create;
+          here[step] = typeof next === 'string' ? {} : [];
+        }
+        here = here[step];
+      } else {
+        const i = find(here, step.id);
+        if (i < 0) return undefined;
+        here = here[i];
+      }
+      if (here === undefined) return undefined;
+    }
+    return here;
+  };
+  const placeAfter = (list, after) => (after == null ? 0 : (find(list, after) < 0 ? list.length : find(list, after) + 1));
+  for (const op of ops) {
+    const path = op.path || [], last = path[path.length - 1], parent = path.slice(0, -1);
+    if (op.op === 'set') {
+      if (!path.length) { doc = clone(op.value); continue; }
+      const p = walk(parent, last);
+      if (typeof last === 'string' && isObj(p)) p[last] = clone(op.value);
+      else if (last && typeof last === 'object') { const i = find(p, last.id); if (i >= 0) p[i] = clone(op.value); }
+    } else if (op.op === 'unset') {
+      const p = walk(parent);
+      if (isObj(p)) delete p[last];
+    } else if (op.op === 'insert') {
+      let list = walk(path);
+      if (list === undefined && typeof last === 'string') { const p = walk(parent, last); if (isObj(p)) list = p[last] = []; }
+      if (!Array.isArray(list) || find(list, op.value?.id) >= 0) continue;
+      list.splice(placeAfter(list, op.after), 0, clone(op.value));
+    } else if (op.op === 'remove' || op.op === 'move') {
+      const list = walk(parent), i = last && typeof last === 'object' ? find(list, last.id) : -1;
+      if (i < 0) continue;
+      const [e] = list.splice(i, 1);
+      if (op.op === 'move') list.splice(placeAfter(list, op.after), 0, e);
+    }
+  }
+  return doc;
+}
+
+/** Show the Director's copy with our pending edits on top. Called when a
+ *  show arrives, and after a drag that held one back. */
+function rebase() {
+  if (!S.server) return;
+  // Local changes not yet turned into an edit go first, so they are kept.
+  if (S.doc && JSON.stringify(S.doc) !== S.lastSent) sendDoc(true);
+  let doc = clone(S.server);
+  for (const p of S.pending) doc = applyOps(doc, p.ops);
+  const next = normalize(doc);
+  const changed = JSON.stringify(next) !== JSON.stringify(S.doc);
+  S.doc = next;
+  S.lastSent = JSON.stringify(S.doc);
+  S.deferredShow = false;
+  if (!changed) return;
+  refreshAll();
+  markOthers();
+  reconcileAssets();
+}
+
 // ───────────────────────────── network ─────────────────────────────
 
 function connect(url, protocol) {
@@ -330,7 +510,8 @@ function connect(url, protocol) {
   S.ws = ws;
   ws.onopen = () => {
     S.connected = true;
-    ws.send(JSON.stringify({ type: 'hello', protocol, node_id: S.clientId, role: 'producer', name: 'Producer' }));
+    ws.send(JSON.stringify({ type: 'hello', protocol, node_id: S.clientId, role: 'producer', name: S.user.name }));
+    sendPresence();
   };
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -364,9 +545,11 @@ function onMessage(msg) {
         // never received, or it came back with no show at all (restarted
         // without saved state), ours is the one to keep: send it, and do not
         // let the Director's older copy overwrite it in the meantime.
-        if (S.dirty || msg.show_revision == null) {
-          S.holdForeign = true;
+        if (msg.show_revision == null) {
+          S.replaceNext = true; // it has nothing: ours becomes the show
           sendDoc(true);
+        } else if (S.dirty) {
+          sendDoc(true); // our edits, as operations, on top of its show
         }
       } else if (msg.show_revision == null) {
         // First contact with a Director that has no show: start it off with
@@ -380,29 +563,38 @@ function onMessage(msg) {
       pushTransport(msg.state, msg.timeline || MAIN);
       break;
     case 'show': {
-      // Every document this page sends carries a tag ({by, n}); the Director
-      // stores and re-broadcasts documents verbatim, so the tag tells our own
-      // edits coming back from somebody else's. (Comparing the JSON text
-      // would not: the Director does not preserve key order.)
+      // Every show the Director sends is the shared truth, whoever changed
+      // it. Our own edits come back tagged ({by, n}): those that have
+      // arrived are no longer pending. The rest are re-applied on top.
       const tag = msg.document._edit;
-      if (tag?.by === S.clientId) {
-        if (tag.n >= S.editN) S.holdForeign = false; // our latest has arrived
-        break; // we already have this, or something newer
-      }
-      if (S.holdForeign || S.dirty) break; // ours is on its way, and wins
-      // Somebody else's show (another Producer, lc-ctl, or the one stored on
-      // the Director when this page was opened): adopt it. Anything being
-      // dragged refers to the old document.
-      drag = tlDrag = null;
       delete msg.document._edit;
-      S.doc = normalize(msg.document);
-      S.lastSent = JSON.stringify(S.doc);
-      refreshAll();
-      reconcileAssets();
+      if (S.holdForeign && tag?.by !== S.clientId) break; // a whole show of ours is on its way
+      if (tag?.by === S.clientId) {
+        S.pending = S.pending.filter((p) => p.n > tag.n);
+        if (tag.n >= S.editN) S.holdForeign = false;
+      }
+      S.server = msg.document;
+      // Mid-drag the dragged object must not jump: apply after the drag.
+      if (drag?.undone || tlDrag?.undone) { S.deferredShow = true; break; }
+      if (!S.doc) { S.doc = normalize(clone(S.server)); S.lastSent = JSON.stringify(S.doc); refreshAll(); reconcileAssets(); break; }
+      rebase();
       break;
     }
+    case 'presence':
+      if (msg.node_id === S.clientId) break; // our own, relayed back
+      if (msg.presence) S.others.set(msg.node_id, msg.presence);
+      else S.others.delete(msg.node_id);
+      renderUsers(); markOthers();
+      if (S.sel) {
+        const key = JSON.stringify(othersOn(S.sel.type, S.sel.id).map((o) => [o.name, o.dragging]));
+        if (key !== S.selOthersKey) renderInspector();
+      }
+      break;
     case 'cluster':
       S.status = msg;
+      for (const id of S.others.keys()) {
+        if (!(msg.nodes || []).some((n) => n.node_id === id)) { S.others.delete(id); renderUsers(); markOthers(); }
+      }
       // Our estimate of the cluster clock: accurate to the network delay of
       // this message, which is ample for moving a playhead on screen.
       S.clockOffsetNs = msg.cluster_ns - performance.now() * 1e6;
@@ -421,6 +613,12 @@ function onMessage(msg) {
     case 'error':
       // If it was our document that was refused, no echo will come.
       S.holdForeign = false;
+      if (msg.message.startsWith('edit_show')) {
+        // Refused (it would have made the show invalid): back to the shared
+        // show, without our unconfirmed edits.
+        S.pending = [];
+        if (S.server) { S.doc = null; S.doc = normalize(clone(S.server)); S.lastSent = JSON.stringify(S.doc); refreshAll(); }
+      }
       toast(msg.message);
       break;
   }
@@ -471,11 +669,21 @@ const seek = (seconds, tl = MAIN) => command({ type: 'seek', show_ns: Math.round
 
 /** Make a change to the show: undo point, apply, redraw, send. */
 function edit(change, { inspector = true } = {}) {
-  S.undo.push(JSON.stringify(S.doc));
+  const before = clone(S.doc);
+  change();
+  record(before);
+  afterChange(inspector);
+}
+
+/** Add an undo step for the change from `before` to the current show. The
+ *  step holds operations, not a copy of the show: undoing reverts only what
+ *  *this user* changed, never what others did in the meantime. */
+function record(before) {
+  const fwd = diffDoc(before, S.doc);
+  if (!fwd.length) return;
+  S.undo.push({ back: diffDoc(S.doc, before), fwd });
   if (S.undo.length > 200) S.undo.shift();
   S.redo = [];
-  change();
-  afterChange(inspector);
 }
 
 function afterChange(inspector = true) {
@@ -506,15 +714,30 @@ function sendDoc(force = false) {
     S.dirty = true;
     return;
   }
+  const tag = { by: S.clientId, n: ++S.editN };
+  if (S.replaceNext || !S.server || !S.lastSent) {
+    // A whole new show (New, Open, or the Director has none): replaces the
+    // show for everyone.
+    S.replaceNext = false;
+    S.pending = [];
+    S.holdForeign = true;
+    command({ type: 'load_show', document: { ...S.doc, _edit: tag } });
+  } else {
+    // Only what changed since the last send, as operations.
+    const ops = diffDoc(JSON.parse(S.lastSent), S.doc);
+    if (!ops.length) { S.dirty = false; return; }
+    S.pending.push({ n: tag.n, ops });
+    command({ type: 'edit_show', ops, tag });
+  }
   S.lastSent = json;
   S.dirty = false;
-  command({ type: 'load_show', document: { ...S.doc, _edit: { by: S.clientId, n: ++S.editN } } });
 }
 
 function stepHistory(from, to) {
   if (!from.length) return;
-  to.push(JSON.stringify(S.doc));
-  S.doc = JSON.parse(from.pop());
+  const step = from.pop();
+  S.doc = normalize(applyOps(S.doc, from === S.undo ? step.back : step.fwd));
+  to.push(step);
   refreshAll();
   scheduleSend();
 }
@@ -529,6 +752,8 @@ function refreshAll() {
 function select(sel) {
   S.sel = sel;
   renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
+  markOthers();
+  sendPresence();
 }
 
 async function deleteSelection() {
@@ -956,7 +1181,8 @@ function drawStage() {
         // The selected cue is always shown (ghosted when not on air), so it
         // can be positioned without scrubbing to it first.
         if (!onAir) S.onsets.delete(cue.id); // on air again later: afresh
-        if (!onAir && cue !== sel) continue;
+        const others = othersOn('cue', cue.id);
+        if (!onAir && cue !== sel && !others.length) continue;
         const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
                    * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
         ctx.save();
@@ -976,6 +1202,20 @@ function drawStage() {
           ctx.lineWidth = 2 / k;
           ctx.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
         }
+        // Another user's selection: their colour, their name; dashed while
+        // they are dragging it.
+        others.forEach((o, i) => {
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = o.color;
+          ctx.lineWidth = 2 / k;
+          ctx.setLineDash(o.dragging ? [6 / k, 4 / k] : []);
+          const pad = (3 + 3 * i) / k;
+          ctx.strokeRect(-cue.w / 2 - pad, -cue.h / 2 - pad, cue.w + 2 * pad, cue.h + 2 * pad);
+          ctx.setLineDash([]);
+          ctx.font = `${12 / k}px system-ui, sans-serif`;
+          ctx.fillStyle = o.color;
+          ctx.fillText(o.name, -cue.w / 2, -cue.h / 2 - pad - 4 / k - i * 14 / k);
+        });
         ctx.restore();
       }
     }
@@ -1002,6 +1242,16 @@ function drawStage() {
     ctx.fillStyle = '#06121f';
     ctx.fillText(label, x + 5, y - 4);
     displayTabs.push({ id: d.id, x, y: y - 16, w: tw, h: 16 });
+    othersOn('display', d.id).forEach((o, i) => {
+      const pad = 3 + 3 * i;
+      ctx.strokeStyle = o.color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash(o.dragging ? [6, 4] : []);
+      ctx.strokeRect(x - pad, y - pad, r.w * k + 2 * pad, r.h * k + 2 * pad);
+      ctx.setLineDash([]);
+      ctx.fillStyle = o.color;
+      ctx.fillText(o.name, x + tw + 6 + i * 60, y - 4);
+    });
   }
 
   // Resize handles of the selected cue (only unrotated: resizing a rotated
@@ -1139,7 +1389,7 @@ function stageDragMove(e) {
   }
   // The undo point is taken on the first real movement, so a plain click
   // does not leave an empty step in the history.
-  if (!drag.undone) { S.undo.push(JSON.stringify(S.doc)); S.redo = []; drag.undone = true; }
+  if (!drag.undone) { drag.before = clone(S.doc); drag.undone = true; sendPresence(); }
   const dx = (e.clientX - drag.mx) / view.k, dy = (e.clientY - drag.my) / view.k;
   const o = drag.orig, c = drag.target;
   const snapping = $('#stage-snap').checked && !e.altKey, tol = 8 / view.k;
@@ -1197,6 +1447,7 @@ function renderTabs() {
 
 function renderTimeline() {
   if (!S.doc) return;
+  queueMicrotask(markOthers); // once the cues below exist
   renderTabs();
   const obj = tlObj(S.tl), pps = S.pxPerSec, width = obj.duration_s * pps;
   $('#tl-body').style.width = HEAD_W + width + 40 + 'px';
@@ -1276,7 +1527,7 @@ $('#cuelane').addEventListener('mousedown', (e) => {
 
 function timelineDragMove(e) {
   const dt = (e.clientX - tlDrag.mx) / S.pxPerSec, o = tlDrag.orig;
-  const takeUndo = () => { if (!tlDrag.undone) { S.undo.push(JSON.stringify(S.doc)); S.redo = []; tlDrag.undone = true; } };
+  const takeUndo = () => { if (!tlDrag.undone) { tlDrag.before = clone(S.doc); tlDrag.undone = true; sendPresence(); } };
 
   if (tlDrag.kind === 'control') {
     const hit = findControl(tlDrag.id);
@@ -1340,9 +1591,12 @@ window.addEventListener('mouseup', (e) => {
   }
   if (winDrag) saveLayout();
   if (scrubbing) { lastScrub = 0; scrub(e); }
-  if ((drag?.undone) || (tlDrag?.undone)) sendDoc(); // final position, immediately
+  const finished = drag?.undone ? drag : tlDrag?.undone ? tlDrag : null;
+  if (finished) { record(finished.before); sendDoc(); } // final position, immediately
   winDrag = drag = tlDrag = null;
   scrubbing = false;
+  if (finished) sendPresence();
+  if (S.deferredShow) rebase();
 });
 
 $('#tl-play').onclick = () => command({ type: currentTransport(S.tl)?.playing ? 'pause' : 'play' }, S.tl);
@@ -1809,6 +2063,14 @@ function renderInspector() {
   box.dataset.sel = JSON.stringify(S.sel);
   box.replaceChildren();
   if (!S.doc) return;
+  // Someone else on the same object: say so (a warning, not a lock — the
+  // last change to a field wins).
+  const together = S.sel ? othersOn(S.sel.type, S.sel.id) : [];
+  S.selOthersKey = JSON.stringify(together.map((o) => [o.name, o.dragging]));
+  if (together.length) {
+    box.append(el('div', { class: 'together', style: `--c:${together[0].color}` },
+      `${together.map((o) => o.name).join(', ')} ${together.some((o) => o.dragging) ? 'is moving' : together.length > 1 ? 'also have' : 'also has'} this selected.`));
+  }
   const sec = { step: 0.1, min: 0 };
   const type = S.sel?.type;
 
@@ -1972,6 +2234,9 @@ $('#chk-loop').onchange = (e) => command({ type: 'set_loop', loop_ns: e.target.c
 $('#sel-rate').onchange = (e) => command({ type: 'set_rate', rate_permille: Number(e.target.value) });
 $('#btn-undo').onclick = () => stepHistory(S.undo, S.redo);
 $('#btn-redo').onclick = () => stepHistory(S.redo, S.undo);
+// Presence is also repeated, so a user who joins later sees everyone.
+setInterval(sendPresence, 3000);
+renderUsers();
 $('#stage-video').checked = liveVideo;
 $('#stage-video').onchange = (e) => setLiveVideo(e.target.checked);
 $('#btn-synctest').onclick = () => {
@@ -1980,7 +2245,10 @@ $('#btn-synctest').onclick = () => {
 };
 $('#btn-color').onclick = () => addCue({ name: 'Colour', source: { type: 'color', rgba: [0.1, 0.4, 0.8, 1] }, duration_s: 10, ...fitRect(640, 360, false) }, S.tl, 0, showSeconds(S.tl));
 $('#btn-new').onclick = async () => {
-  if (await ask('Start a new, empty show? The current one is replaced on the Director.')) edit(() => { S.doc = defaultDoc(); S.sel = null; S.tl = MAIN; });
+  if (await ask('Start a new, empty show? It replaces the current one on the Director — for every user working on it.')) {
+    S.replaceNext = true;
+    edit(() => { S.doc = defaultDoc(); S.sel = null; S.tl = MAIN; });
+  }
 };
 $('#btn-save').onclick = () => {
   const a = el('a', { href: URL.createObjectURL(new Blob([JSON.stringify(S.doc, null, 2)], { type: 'application/json' })), download: `${S.doc.name || 'show'}.lcplay.json` });
@@ -1995,6 +2263,8 @@ $('#file-open').onchange = async (e) => {
   try {
     const doc = normalize(JSON.parse(await file.text()));
     delete doc._edit;
+    if (S.others.size && !(await ask(`Open ${file.name}? It replaces the show for every user working on it.`))) return;
+    S.replaceNext = true;
     edit(() => { S.doc = doc; S.sel = null; S.tl = MAIN; });
   } catch (err) { toast(`Cannot open ${file.name}: ${err.message}`); }
 };
