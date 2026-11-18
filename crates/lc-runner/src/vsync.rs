@@ -140,11 +140,16 @@ impl RefreshClock {
         self.foreign
     }
 
+    /// Judge the driver's rate again. Without enough fresh evidence (just
+    /// after a restart) the verdict stands: a stall or a new counter does not
+    /// make a foreign driver this display's; without the mode's period there
+    /// is nothing to judge against.
     fn update_foreign(&mut self) {
-        self.foreign = match (self.driver_period(), self.nominal) {
-            (Some(d), Some(nom)) => d < nom * (1.0 - NOMINAL_TOLERANCE),
-            _ => false,
-        };
+        match (self.driver_period(), self.nominal) {
+            (_, None) => self.foreign = false,
+            (Some(d), Some(nom)) => self.foreign = d < nom * (1.0 - NOMINAL_TOLERANCE),
+            (None, Some(_)) => {}
+        }
     }
 
     /// The period to number new observations with: the fit's, else (before
@@ -245,12 +250,12 @@ impl RefreshClock {
     }
 
     /// Forget the samples, the provisional period and the driver's rate (not
-    /// the numbering: the next sample is numbered on from the last).
+    /// the numbering: the next sample is numbered on from the last; nor
+    /// whether the driver is foreign, which only fresh rates can change).
     fn restart(&mut self) {
         self.samples.clear();
         self.shortest = None;
         self.rates.clear();
-        self.foreign = false;
     }
 
     /// Number the samples again from their times with period `p`, keeping
@@ -269,8 +274,9 @@ impl RefreshClock {
     /// latest report, so it must be called after the matching
     /// [`observe_refresh`](Self::observe_refresh); and a count the driver lost
     /// between that refresh and the report would put it one refresh early.
-    /// In practice they are the same refresh (all 3147 reports of the laptop
-    /// capture in `testdata`).
+    /// In practice they are the same refresh: in every one of the 3147
+    /// reports (data rows) of `testdata/vsync-laptop-slow.csv`, which the
+    /// replay test checks.
     pub fn from_driver(&self, count: i64) -> i64 {
         count + self.driver_offset
     }
@@ -468,6 +474,14 @@ impl PresentTracker {
         let mut v: Vec<i64> = self.lags.iter().copied().collect();
         v.sort_unstable();
         v[v.len() / 2].clamp(0, 4)
+    }
+
+    /// Forget what was learnt about where presents land (the lags, and the
+    /// presents still waiting for a report), keeping the counts of presents
+    /// and misses, which are published as running totals.
+    pub fn forget_lags(&mut self) {
+        self.pending.clear();
+        self.lags.clear();
     }
 
     /// A frame was presented as `present_id`. `base` is the refresh it was
@@ -922,6 +936,51 @@ mod tests {
         );
     }
 
+    /// A driver counting another display's refreshes stays foreign through a
+    /// stall (the window hidden for two seconds): the restart forgets the
+    /// rates, not the verdict, until fresh rates say otherwise.
+    #[test]
+    fn a_stall_does_not_clear_the_foreign_verdict() {
+        const PANEL: f64 = 1e9 / 165.0;
+        let mut c = RefreshClock::default();
+        c.set_nominal(Some(P));
+        let mut count = 0i64;
+        let mut t = 0f64;
+        let mut report = |c: &mut RefreshClock, counts: i64| {
+            count += counts;
+            t += PANEL * counts as f64;
+            c.observe_refresh(count, t as i64);
+        };
+        for k in 0..100 {
+            report(&mut c, 7 + k % 2);
+        }
+        assert!(c.is_foreign());
+        report(&mut c, 330); // two seconds without a report
+        for k in 0..20 {
+            report(&mut c, 7 + k % 2);
+            assert!(c.is_foreign(), "report {k} after the stall");
+        }
+        assert!(off(c.period().unwrap() / P * NOMINAL) <= NOMINAL_TOLERANCE);
+    }
+
+    #[test]
+    fn forgetting_lags_keeps_the_published_totals() {
+        let mut t = PresentTracker::default();
+        for id in 0..20u32 {
+            let c = t.correction();
+            t.presented(id, id as i64, c);
+            t.landed(id, id as i64 + 2);
+        }
+        t.presented(20, 20, 2);
+        t.landed(20, 25);
+        let (presents, missed) = (t.presents, t.missed);
+        assert!(missed > 0 && t.correction() == 2);
+        t.forget_lags();
+        assert_eq!((t.presents, t.missed), (presents, missed));
+        assert_eq!(t.correction(), 0, "nothing learnt any more");
+        assert!(t.pending.is_empty());
+    }
+
     #[test]
     fn a_young_fit_is_not_mature() {
         let mut c = RefreshClock::default();
@@ -943,7 +1002,10 @@ mod tests {
     #[test]
     fn replay_of_a_laptop_capture_holds_sixty_hertz() {
         let rows = fixture(include_str!("../testdata/vsync-laptop-slow.csv"));
-        assert!(rows.len() > 3000);
+        assert_eq!(rows.len(), 3147);
+        // The refresh each report says the last present reached is the
+        // report's own refresh, in every row (what `from_driver` relies on).
+        assert!(rows.iter().all(|r| r[3] == r[0]));
         // Where the second swap-chain counter starts.
         let reset = rows.windows(2).position(|w| w[1][0] < w[0][0]).unwrap() + 1;
 

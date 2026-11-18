@@ -753,10 +753,13 @@ impl App {
         if self.health_at.elapsed() >= Duration::from_millis(500) {
             self.health_at = Instant::now();
             // A window can be moved to another monitor, or the mode changed:
-            // keep each clock's yardstick current.
+            // keep each clock's yardstick current. The window system can
+            // briefly not know the monitor (while a window moves): then the
+            // last known mode stands.
             for rw in &mut self.windows {
-                let nominal = crate::render::nominal_period(&rw.window);
-                rw.gpu.timing.clock.set_nominal(nominal);
+                if let Some(nominal) = crate::render::nominal_period(&rw.window) {
+                    rw.gpu.timing.clock.set_nominal(Some(nominal));
+                }
             }
             self.publish_output_health();
         }

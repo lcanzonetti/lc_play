@@ -687,9 +687,13 @@ impl Gpu {
         out.width = width;
         out.height = height;
         // A new size means a new mode: the refresh train is measured afresh,
-        // against the mode the window is on now.
+        // against the mode the window is on now (the last known one if the
+        // window system does not say), and whether the driver's reports are
+        // this display's is judged afresh too, silently.
+        let nominal = nominal_period(&out.window).or(out.timing.clock.nominal());
         out.timing.clock = RefreshClock::default();
-        out.timing.clock.set_nominal(nominal_period(&out.window));
+        out.timing.clock.set_nominal(nominal);
+        out.timing.foreign = false;
         let res = &mut out.res;
         let (tex, view, bg) = self.make_scene_target(width, height, res.rotated);
         res._scene_tex = tex;
@@ -748,8 +752,9 @@ impl Gpu {
                         if foreign != out.timing.foreign {
                             out.timing.foreign = foreign;
                             report_foreign(&out.timing.clock, foreign);
-                            // Lags learnt from the other clock mean nothing.
-                            out.timing.tracker = PresentTracker::default();
+                            // Lags learnt from the other clock mean nothing
+                            // (the published totals stay).
+                            out.timing.tracker.forget_lags();
                         }
                         if !foreign {
                             // The refresh the present reached, in the clock's
