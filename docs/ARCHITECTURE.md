@@ -185,9 +185,10 @@ at a frame boundary. The renderer now works per refresh:
    Observations more than a quarter period off the line are dropped first,
    unless more than a quarter of them are (then the numbering is at fault);
    that removes the off-grid report the driver gives when a swap chain's
-   counter starts, which had made the first fit 1 % fast. The fit spans 600
-   observations (ten seconds at 60 Hz): the driver's timestamps jitter by
-   about ±0.2 ms, which over two seconds let the period wander by ±50 ppm.
+   counter starts, which had made the first fit 1 % fast. The fit spans ten
+   seconds of observations, whatever the refresh rate (at most 6000): the
+   driver's timestamps jitter by about ±0.2 ms, which over the two seconds
+   the fit used to span let the period wander by ±50 ppm.
 
    When the driver's counter ticks faster than the mode (its lower-quartile
    time per count more than 3 % short of the mode's period), its reports
@@ -266,9 +267,9 @@ frame-latency waitable, and the `RefreshClock` period and `PresentTracker`
 correction after the report, and the clock's own number for the reported
 refresh (`clock_refresh`: where it runs ahead of the driver's `sync_refresh`,
 the driver lost counts). It exists because a drifting period estimate
-cannot be diagnosed from the estimate: over a two-second fitting window, reports
-arriving progressively late and a refresh counter that skips refreshes give
-the same straight line. Over a whole run the raw counter steps against time
+cannot be diagnosed from the estimate: over the fitting window (two seconds
+when the log was added), reports arriving progressively late and a refresh
+counter that skips refreshes give the same straight line. Over a whole run the raw counter steps against time
 tell them apart — which is how the counter fault above was found.
 
 **[Not yet verified on frame-locked hardware.]** The pieces are unit-tested

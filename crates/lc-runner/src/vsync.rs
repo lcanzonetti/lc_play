@@ -29,11 +29,17 @@
 
 use std::collections::VecDeque;
 
-/// Observations kept for the fit: ten seconds at 60 Hz. The driver's
-/// timestamps jitter by about ±0.2 ms; over two seconds (the window before)
-/// that let the period wander by ±50 ppm, which the Director passed on to
-/// every Runner's refresh grid. Ten seconds pin it to a few ppm.
-const WINDOW: usize = 600;
+/// Time the fit's observations span: ten seconds, at any refresh rate. The
+/// driver's timestamps jitter by about ±0.2 ms; over two seconds (the window
+/// before) that let the period wander by ±50 ppm, which the Director passed
+/// on to every Runner's refresh grid. Ten seconds pin it to a few ppm. A
+/// window of a fixed *count* would span less time the faster the display
+/// (600 observations are 1.2 s at 500 Hz), and a fit that never spans
+/// [`MATURE_SPAN_NS`] is never given to the Director.
+const WINDOW_NS: i64 = 10_000_000_000;
+/// …and at most this many observations: ten seconds at 600 Hz, above the
+/// fastest plausible display, so only a flood of reports hits it.
+const WINDOW: usize = 6000;
 /// Fewer observations than this and there is no estimate yet.
 const MIN_SAMPLES: usize = 8;
 /// A fit spanning less time than this is not reported to the Director
@@ -130,7 +136,10 @@ impl RefreshClock {
     }
 
     /// Whether the driver's reports tick faster than this display refreshes:
-    /// they describe another clock. On a Windows laptop with a 165 Hz panel
+    /// they describe another clock. While foreign, the fit keeps the mode's
+    /// period but its *phase* is fitted to timestamps that are not on this
+    /// display's refreshes, so the refresh instants it predicts are not to be
+    /// trusted: that is why a foreign clock is neither exact nor mature. On a Windows laptop with a 165 Hz panel
     /// and a 60 Hz output, a window composed by the desktop compositor
     /// reported the panel's refreshes. The timestamps are then not this
     /// display's refreshes: the clock keeps the mode's period, and the
@@ -228,9 +237,7 @@ impl RefreshClock {
         };
         self.driver_last = Some(count);
         self.samples.push_back((n, local_ns));
-        while self.samples.len() > WINDOW {
-            self.samples.pop_front();
-        }
+        self.trim();
         if self.fit.is_none() {
             // No line yet: the samples so far were numbered with what was
             // known then. Number them again from their times with the best
@@ -247,6 +254,21 @@ impl RefreshClock {
         self.refit();
         let last_n = self.samples.back().map_or(n, |s| s.0);
         self.driver_offset = last_n - count;
+    }
+
+    /// Keep the observations within the window: [`WINDOW_NS`] of time, at
+    /// most [`WINDOW`] of them, and never fewer than [`MIN_SAMPLES`].
+    fn trim(&mut self) {
+        while self.samples.len() > MIN_SAMPLES {
+            let (Some(first), Some(last)) = (self.samples.front(), self.samples.back()) else {
+                break;
+            };
+            if self.samples.len() > WINDOW || last.1 - first.1 > WINDOW_NS {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Forget the samples, the provisional period and the driver's rate (not
@@ -275,8 +297,9 @@ impl RefreshClock {
     /// [`observe_refresh`](Self::observe_refresh); and a count the driver lost
     /// between that refresh and the report would put it one refresh early.
     /// In practice they are the same refresh: in every one of the 3147
-    /// reports (data rows) of `testdata/vsync-laptop-slow.csv`, which the
-    /// replay test checks.
+    /// reports of `testdata/vsync-laptop-slow.csv` (its data rows: the file's
+    /// other 8 lines are comments and the header), which the replay test
+    /// checks.
     pub fn from_driver(&self, count: i64) -> i64 {
         count + self.driver_offset
     }
@@ -306,9 +329,7 @@ impl RefreshClock {
             }
         };
         self.samples.push_back((n, local_ns));
-        while self.samples.len() > WINDOW {
-            self.samples.pop_front();
-        }
+        self.trim();
         self.refit();
     }
 
@@ -979,6 +1000,33 @@ mod tests {
         assert_eq!((t.presents, t.missed), (presents, missed));
         assert_eq!(t.correction(), 0, "nothing learnt any more");
         assert!(t.pending.is_empty());
+    }
+
+    /// On a fast display the window still spans ten seconds, so the fit
+    /// matures (a window of 600 observations spanned 1.67 s at 360 Hz and
+    /// never did); and it never spans more.
+    #[test]
+    fn fast_displays_mature_and_the_window_spans_ten_seconds() {
+        for hz in [360.0, 500.0] {
+            let period = 1e9 / hz;
+            let mut c = RefreshClock::default();
+            c.set_nominal(Some(period));
+            let mut matured_at = None;
+            for n in 0..(hz as i64 * 15) {
+                c.observe_refresh(n, (period * n as f64) as i64);
+                if matured_at.is_none() && c.is_mature() {
+                    matured_at = Some(n);
+                }
+            }
+            let at = matured_at.unwrap_or_else(|| panic!("{hz} Hz never matured"));
+            assert!(
+                (at as f64 / hz - 2.0).abs() < 0.01,
+                "{hz} Hz matured at {at}"
+            );
+            let span = c.samples.back().unwrap().1 - c.samples.front().unwrap().1;
+            assert!(span <= WINDOW_NS && span > WINDOW_NS - 2 * period as i64);
+            assert!((c.period().unwrap() - period).abs() < 1.0);
+        }
     }
 
     #[test]
