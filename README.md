@@ -361,8 +361,14 @@ the own swap chain without the barrier, `LCPLAY_FRAME_LATENCY=1..3` (default
 
 The render loop runs at multimedia priority (MMCSS "Playback") and decoding
 below normal, so a busy CPU delays a video layer rather than every output.
-If `late` climbs on a machine where other software competes for the CPU,
-`LCPLAY_THREAD_PRIORITY=0` leaves priorities as Windows sets them.
+The Runner also opts out of Windows power throttling: otherwise Windows
+lowers a program's CPU speed (and, on CPUs with efficiency cores, moves it
+to them) while another window has the focus — on a laptop running the
+Producer next to its output, playback fell to ~40 fps whenever the Producer
+or a browser was in front. The start of the Runner's log says
+`power throttling off`. If `late` climbs on a machine where other software
+competes for the CPU, `LCPLAY_THREAD_PRIORITY=0` leaves priorities and power
+throttling as Windows sets them.
 
 Stutters are logged: a frame that takes longer than two refreshes writes a
 `slow frame` line to the Runner's log (the Producer's **Log** button) with

@@ -233,6 +233,8 @@ fn main() -> anyhow::Result<()> {
     };
     let event_loop = EventLoop::new()?;
     let mut app = App::new(source, playhead);
+    // Full speed even while another window (the Producer) has the focus.
+    lc_runner::priority::full_speed_process();
     // This thread renders every frame: it goes before the decoders.
     lc_runner::priority::render_thread();
     event_loop.run_app(&mut app)?;
