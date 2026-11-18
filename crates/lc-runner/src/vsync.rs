@@ -33,6 +33,9 @@ use std::collections::VecDeque;
 const WINDOW: usize = 120;
 /// Fewer observations than this and there is no estimate yet.
 const MIN_SAMPLES: usize = 8;
+/// Between two driver reports, the longest gap still numbered from time
+/// (see [`RefreshClock::observe_refresh`]).
+const LONG_GAP_NS: i64 = 1_000_000_000;
 /// Plausible refresh periods: 20 Hz .. 500 Hz.
 const MIN_PERIOD_NS: f64 = 2_000_000.0;
 const MAX_PERIOD_NS: f64 = 50_000_000.0;
@@ -68,7 +71,12 @@ impl RefreshClock {
     /// provisional period (see `shortest`). Rounding needs the period right
     /// to within half a refresh over the gap between reports: at 60 Hz a
     /// one-second gap tolerates an error of 0.8 % (0.3 % at 165 Hz), far more
-    /// than a fit of exact timestamps has.
+    /// than a fit of exact timestamps has. Over a longer gap (a hidden
+    /// window, a debugger) an error too small to see could add up to half a
+    /// refresh, so after [`LONG_GAP_NS`] the fit starts again and the report
+    /// is numbered by the driver's count: across a stall the counts it may
+    /// have lost matter less than a refresh numbered wrong next to the
+    /// window's correctly numbered samples.
     pub fn observe_refresh(&mut self, count: i64, local_ns: i64) {
         if !self.exact {
             // Switching from inferred to exact numbering: start over.
@@ -86,6 +94,19 @@ impl RefreshClock {
                     // The clock went backwards: time cannot number this one.
                     self.restart();
                     last_n + dc.max(1)
+                } else if dt > LONG_GAP_NS || dc < 0 {
+                    // A long gap (see above), or a new counter (swap chain
+                    // re-created, mode change) whose old line may not hold:
+                    // fit a new line, numbered on from the old so that
+                    // refreshes predicted before keep their meaning. A new
+                    // counter's count says nothing about the gap, so then
+                    // time numbers it, with the old period.
+                    let by_time = self
+                        .period()
+                        .or(self.shortest)
+                        .map(|p| ((dt as f64 / p).round() as i64).max(1));
+                    self.restart();
+                    last_n + if dc > 0 { dc } else { by_time.unwrap_or(1) }
                 } else {
                     if dc > 0 {
                         // Lost counts only ever lengthen time-per-count, so
@@ -99,13 +120,6 @@ impl RefreshClock {
                         Some(p) => ((dt as f64 / p).round() as i64).max(1),
                         None => dc.max(1),
                     };
-                    if dc < 0 {
-                        // A new counter (swap chain re-created, mode change):
-                        // the old line may not hold. Fit a new one, numbered
-                        // on from the old so that refreshes predicted before
-                        // keep their meaning.
-                        self.restart();
-                    }
                     last_n + step
                 }
             }
@@ -551,6 +565,31 @@ mod tests {
         }
         assert!((c.period().unwrap() - P).abs() < 1.0);
         assert_eq!(c.from_driver(20), before + 20);
+    }
+
+    /// Two minutes without a report (a hidden window). Whatever small error
+    /// the period has adds up over the gap — here to 0.6 of a refresh, which
+    /// time alone would round to the wrong refresh. The driver's count
+    /// numbers it instead, and the line is fitted anew.
+    #[test]
+    fn after_a_long_gap_the_driver_count_numbers_the_refresh() {
+        let mut c = RefreshClock::default();
+        for n in 0..30i64 {
+            c.observe_refresh(n, (P * n as f64) as i64);
+        }
+        let before = c.from_driver(29);
+        let gap = 7200; // refreshes: two minutes at 60 Hz
+        let t = (P * (29 + gap) as f64 + 0.6 * P) as i64;
+        c.observe_refresh(29 + gap, t);
+        assert_eq!(c.from_driver(29 + gap), before + gap);
+        assert_eq!(c.period(), None, "a new line is fitted");
+        // Reports go on at the display's real rate: a new line, on the
+        // driver's numbering.
+        for k in 1..20i64 {
+            c.observe_refresh(29 + gap + k, t + (P * k as f64) as i64);
+        }
+        assert!((c.period().unwrap() - P).abs() < 1.0);
+        assert_eq!(c.from_driver(29 + gap + 19), before + gap + 19);
     }
 
     /// Replay of a real capture (`testdata/vsync-laptop-slow.csv`, a Windows

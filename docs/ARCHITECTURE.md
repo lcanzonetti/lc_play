@@ -166,7 +166,10 @@ at a frame boundary. The renderer now works per refresh:
    clock numbers refreshes from the timestamps (elapsed time over the period,
    rounded) and uses the counter only to tell a new report from a repeated
    one and, before the first fit, for a provisional period (the shortest
-   time per count, which lost counts can only lengthen). Refresh numbers the
+   time per count, which lost counts can only lengthen). After more than a
+   second without a report the fit starts again and the count numbers the
+   report, since a period error too small to see could add up to half a
+   refresh over a long gap. Refresh numbers the
    driver reports, such as the refresh a present reached, are translated into
    the clock's numbering (`RefreshClock::from_driver`). A replay of the
    laptop capture (`crates/lc-runner/testdata/vsync-laptop-slow.csv`) is a
