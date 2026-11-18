@@ -385,6 +385,13 @@ Runner write one row per frame with the display driver's raw refresh reports
 loop waited for the swap chain, and the refresh period it estimated. It is
 off unless set; the Runner's log says where the file is.
 
+Each output's `output opened` line in the Runner's log gives its presenter
+(`dxgi` or `wgpu`), the frame latency in force and the display mode's refresh
+rate. A warning that *the driver reports refreshes at … Hz on a … Hz display*
+means Windows' desktop compositor is presenting that output on another
+display's clock: expect dropped frames, and run every display of the machine
+at the same refresh rate.
+
 When a client loses the Director, the Director's log says why
 (`Producer 'name' disconnected: idle timeout` = it sent nothing, not even its
 pings, for 6 s). The Producer notices when its own window froze for more than

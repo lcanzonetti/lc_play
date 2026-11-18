@@ -428,13 +428,15 @@ impl Gpu {
         let (width, height) = (phys.width.clamp(1, max), phys.height.clamp(1, max));
         let presenter = self.make_presenter(window.clone(), width, height)?;
         let res = self.build_resources(width, height, output, layer_count);
+        let mut timing = OutputTiming::default();
+        timing.clock.set_nominal(nominal_period(&window));
         Ok(OutputGpu {
             window,
             presenter,
             width,
             height,
             res,
-            timing: OutputTiming::default(),
+            timing,
         })
     }
 
@@ -684,8 +686,10 @@ impl Gpu {
         }
         out.width = width;
         out.height = height;
-        // A new size means a new mode: the refresh train is measured afresh.
+        // A new size means a new mode: the refresh train is measured afresh,
+        // against the mode the window is on now.
         out.timing.clock = RefreshClock::default();
+        out.timing.clock.set_nominal(nominal_period(&out.window));
         let res = &mut out.res;
         let (tex, view, bg) = self.make_scene_target(width, height, res.rotated);
         res._scene_tex = tex;
@@ -740,10 +744,19 @@ impl Gpu {
                     Some(st) => {
                         let at = crate::dxgi::qpc_to_local(st.sync_qpc, now);
                         out.timing.clock.observe_refresh(st.sync_refresh, at);
-                        // The refresh the present reached, in the clock's
-                        // numbering (not the driver's, which loses counts).
-                        let reached = out.timing.clock.from_driver(st.present_refresh);
-                        out.timing.tracker.landed(st.present_count, reached);
+                        let foreign = out.timing.clock.is_foreign();
+                        if foreign != out.timing.foreign {
+                            out.timing.foreign = foreign;
+                            report_foreign(&out.timing.clock, foreign);
+                            // Lags learnt from the other clock mean nothing.
+                            out.timing.tracker = PresentTracker::default();
+                        }
+                        if !foreign {
+                            // The refresh the present reached, in the clock's
+                            // numbering (not the driver's, which loses counts).
+                            let reached = out.timing.clock.from_driver(st.present_refresh);
+                            out.timing.tracker.landed(st.present_count, reached);
+                        }
                         if let Some(log) = crate::vsync::RawLog::global() {
                             log.row(&crate::vsync::RawRow {
                                 width: out.width,
@@ -1282,6 +1295,36 @@ pub struct OutputTiming {
     /// Frames left during which a stalled output is only polled, not waited
     /// for (see [`Gpu::acquire`]).
     pub stalled: u32,
+    /// The driver's reports were last seen to describe another display's
+    /// refreshes (see [`RefreshClock::is_foreign`]); said in the log on
+    /// every change.
+    pub foreign: bool,
+}
+
+/// The period of the display mode of the monitor `window` is on, ns, from
+/// the window system (`None` if it does not say).
+pub fn nominal_period(window: &Window) -> Option<f64> {
+    let mhz = window.current_monitor()?.refresh_rate_millihertz()?;
+    (mhz > 0).then(|| 1e12 / mhz as f64)
+}
+
+/// Say in the log that an output's refresh reports turned out to come from
+/// another display's clock, or no longer do.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn report_foreign(clock: &RefreshClock, foreign: bool) {
+    let hz = |p: Option<f64>| p.map_or_else(|| "?".to_string(), |p| format!("{:.2}", 1e9 / p));
+    if foreign {
+        tracing::warn!(
+            "output: the driver reports refreshes at {} Hz on a {} Hz display: the \
+             desktop compositor is presenting this output on another display's \
+             clock (expect dropped frames; check that every display runs at the \
+             same refresh rate). Frame timing uses the display's own rate.",
+            hz(clock.driver_period()),
+            hz(clock.nominal())
+        );
+    } else {
+        tracing::info!("output: the driver's refresh reports match the display again");
+    }
 }
 
 /// Per-output GPU state: how it is presented plus its render resources.

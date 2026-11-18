@@ -171,9 +171,40 @@ at a frame boundary. The renderer now works per refresh:
    report, since a period error too small to see could add up to half a
    refresh over a long gap. Refresh numbers the
    driver reports, such as the refresh a present reached, are translated into
-   the clock's numbering (`RefreshClock::from_driver`). A replay of the
-   laptop capture (`crates/lc-runner/testdata/vsync-laptop-slow.csv`) is a
-   unit test.
+   the clock's numbering (`RefreshClock::from_driver`).
+
+   Numbering by time can lock onto a wrong period (a wrong first estimate
+   numbers the next observations to match it), and the render loop's own
+   timing can run away while frames are irregular (on a laptop it slid from
+   16.7 to 6.9 ms, and the Director's grid followed to 145 Hz). So every fit
+   is checked against the period of the display's mode, read from the window
+   system (`render::nominal_period`, refreshed twice a second): one more than
+   3 % away is not believed, the observations are numbered again with the
+   mode's period and fitted again, and failing that only the phase is fitted
+   (whole-hertz mode rates, 59 for 59.94 Hz, are 1.6 % off by themselves).
+   Observations more than a quarter period off the line are dropped first,
+   unless more than a quarter of them are (then the numbering is at fault);
+   that removes the off-grid report the driver gives when a swap chain's
+   counter starts, which had made the first fit 1 % fast. The fit spans 600
+   observations (ten seconds at 60 Hz): the driver's timestamps jitter by
+   about ±0.2 ms, which over two seconds let the period wander by ±50 ppm.
+
+   When the driver's counter ticks faster than the mode (its lower-quartile
+   time per count more than 3 % short of the mode's period), its reports
+   describe another display: on a laptop whose output was composed by the
+   desktop compositor, they counted the 165 Hz panel's refreshes for a 60 Hz
+   output. The clock then keeps the mode's period, the reports are no longer
+   `exact`, the `PresentTracker` stops learning from them, and the Runner
+   logs a warning that the compositor is presenting the output on another
+   display's clock. A counter slower than the display cannot be told from one
+   that loses counts.
+
+   The period is reported to the Director (for the grid, below) only once the
+   fit is *mature*: at least two seconds of observations, not foreign.
+
+   Replays of three laptop captures (`crates/lc-runner/testdata/`: a slow
+   stretch with lost counts, the start-up with the off-grid report, and the
+   composed output) are unit tests.
 2. **The target refresh.** After waiting for the swap chain, the frame will
    reach refresh `next + latency − 1 + correction`, where `latency` is the
    number of frames queued (`LCPLAY_FRAME_LATENCY`, default 2) and

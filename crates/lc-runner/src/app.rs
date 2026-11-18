@@ -592,6 +592,12 @@ impl App {
             display = %output.id,
             gpu = %gpu.adapter_info(),
             presenter = out_gpu.presenter_name(),
+            frame_latency = crate::render::frame_latency(),
+            mode_hz = out_gpu
+                .timing
+                .clock
+                .nominal()
+                .map_or_else(|| "unknown".to_string(), |p| format!("{:.3}", 1e9 / p)),
             "output opened"
         );
         Ok(RenderWindow {
@@ -746,6 +752,12 @@ impl App {
         }
         if self.health_at.elapsed() >= Duration::from_millis(500) {
             self.health_at = Instant::now();
+            // A window can be moved to another monitor, or the mode changed:
+            // keep each clock's yardstick current.
+            for rw in &mut self.windows {
+                let nominal = crate::render::nominal_period(&rw.window);
+                rw.gpu.timing.clock.set_nominal(nominal);
+            }
             self.publish_output_health();
         }
         sampled.is_some()
@@ -1045,6 +1057,10 @@ impl App {
             .collect();
         let vblank = self.windows.first().and_then(|rw| {
             let clock = &rw.gpu.timing.clock;
+            // A young or foreign estimate would become every Runner's grid.
+            if !clock.is_mature() {
+                return None;
+            }
             let (_, at) = clock.last_refresh(now)?;
             let period = clock.period()?;
             let reading = self.playhead.clock.read(at);

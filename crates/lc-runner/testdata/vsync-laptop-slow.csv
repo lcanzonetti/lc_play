@@ -3,7 +3,8 @@
 # (about 26..41 s and 56 s..end after the first row) it ran at ~40 fps, and the
 # driver's refresh counter then skipped counts. It starts on the swap chain's
 # old counter (the window was moving from the panel), which then resets.
-# Columns are the driver's report; sync_ns is in local time.
+# Columns are the driver's report; sync_ns is in local time. Trimmed to the
+# four columns the clock reads: a live LCPLAY_VSYNC_LOG file has eleven.
 sync_refresh,sync_ns,present_count,present_refresh
 2596247,9501431000,338,2596247
 2596247,9501442000,338,2596247
