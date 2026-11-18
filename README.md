@@ -379,6 +379,12 @@ happened in that frame. The frame-rate line every 5 s adds the slowest frame
 and how many were over. `LCPLAY_FRAME_LOG=<ms>` sets another threshold,
 `LCPLAY_FRAME_LOG=0` turns the log off.
 
+For timing problems on Windows, `LCPLAY_VSYNC_LOG=<file.csv>` makes the
+Runner write one row per frame with the display driver's raw refresh reports
+(refresh counter, its time, which refresh each present reached), how long the
+loop waited for the swap chain, and the refresh period it estimated. It is
+off unless set; the Runner's log says where the file is.
+
 When a client loses the Director, the Director's log says why
 (`Producer 'name' disconnected: idle timeout` = it sent nothing, not even its
 pings, for 6 s). The Producer notices when its own window froze for more than

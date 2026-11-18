@@ -726,12 +726,14 @@ impl Gpu {
                 } else {
                     100
                 };
+                let waiting = std::time::Instant::now();
                 if !sc.wait(timeout) {
                     if timeout > 0 {
                         out.timing.stalled = 60;
                     }
                     return Err(wgpu::SurfaceError::Timeout);
                 }
+                let waited = waiting.elapsed();
                 out.timing.stalled = 0;
                 let now = local_now();
                 match sc.statistics() {
@@ -741,6 +743,20 @@ impl Gpu {
                         out.timing
                             .tracker
                             .landed(st.present_count, st.present_refresh);
+                        if let Some(log) = crate::vsync::RawLog::global() {
+                            log.row(&crate::vsync::RawRow {
+                                width: out.width,
+                                height: out.height,
+                                wake_ns: now,
+                                wait_ns: waited.as_nanos() as i64,
+                                sync_refresh: st.sync_refresh,
+                                sync_ns: at,
+                                present_count: st.present_count,
+                                present_refresh: st.present_refresh,
+                                period_ns: out.timing.clock.period(),
+                                correction: out.timing.tracker.correction(),
+                            });
+                        }
                     }
                     // No statistics (composed window, mode change): the
                     // loop's own timing is the best there is.

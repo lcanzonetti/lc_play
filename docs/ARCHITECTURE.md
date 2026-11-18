@@ -214,6 +214,17 @@ logged), and the periodic frame-rate line adds
 the slowest frame and the count over the threshold. `LCPLAY_FRAME_LOG=0`
 turns it off, `LCPLAY_FRAME_LOG=<ms>` sets the threshold.
 
+**Raw refresh log** (`vsync.rs` `RawLog`, opt-in: `LCPLAY_VSYNC_LOG=<file.csv>`).
+One CSV row per frame on LC Play's own DXGI swap chain: the
+`DXGI_FRAME_STATISTICS` sync refresh and its time (converted to local time),
+the last present's id and the refresh it reached, the wait for the
+frame-latency waitable, and the `RefreshClock` period and `PresentTracker`
+correction after the report. It exists because a drifting period estimate
+cannot be diagnosed from the estimate: over a two-second fitting window, reports
+arriving progressively late and a refresh counter that skips refreshes give
+the same straight line. Over a whole run the raw counter steps against time
+tell them apart.
+
 **[Not yet verified on frame-locked hardware.]** The pieces are unit-tested
 (grid arithmetic, refresh fitting, present tracking, the Director's grid
 selection) and run end to end on Linux, but the D3D12/NVAPI path has only

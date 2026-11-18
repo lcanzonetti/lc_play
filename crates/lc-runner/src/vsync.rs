@@ -221,6 +221,117 @@ impl PresentTracker {
     }
 }
 
+/// One frame's raw timing, as the driver reported it (see [`RawLog`]).
+// Only the Windows swap chain reports refreshes.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub struct RawRow {
+    /// Output size, to tell outputs apart in one file.
+    pub width: u32,
+    pub height: u32,
+    /// Local time when the swap chain released the loop, and how long the
+    /// loop waited for it.
+    pub wake_ns: i64,
+    pub wait_ns: i64,
+    /// `DXGI_FRAME_STATISTICS`, the QPC time converted to local time.
+    pub sync_refresh: i64,
+    pub sync_ns: i64,
+    pub present_count: u32,
+    pub present_refresh: i64,
+    /// The clock's period estimate and the tracker's correction after this
+    /// report was taken in.
+    pub period_ns: Option<f64>,
+    pub correction: i64,
+}
+
+/// Opt-in CSV of every refresh report the driver gives
+/// (`LCPLAY_VSYNC_LOG=<file.csv>`), for diagnosing timing on a machine.
+///
+/// Why raw rows rather than a smarter estimate: when the period estimate
+/// drifts (16.7 ms becoming 17–19 ms on a 60 Hz screen), a few seconds of
+/// samples cannot tell "the reports arrive late" from "the refresh counter
+/// does not count this monitor's refreshes" — a steady lateness ramp and a
+/// longer period are the same straight line. Over a whole test, laid next to
+/// PresentMon's capture of the same run, the raw rows can: the counter's
+/// steps against QPC time show whether it advances once per 16.7 ms.
+// Only the Windows swap chain reports refreshes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct RawLog {
+    /// The file, and the rows written to it.
+    out: std::sync::Mutex<(std::io::BufWriter<std::fs::File>, u64)>,
+}
+
+// Only the Windows swap chain reports refreshes.
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RawLog {
+    const HEADER: &'static str = "width,height,wake_ns,wait_ms,sync_refresh,sync_ns,\
+        present_count,present_refresh,period_ms,correction";
+
+    /// Create (truncate) `path` and write the header.
+    pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(out, "{}", Self::HEADER)?;
+        Ok(RawLog {
+            out: std::sync::Mutex::new((out, 0)),
+        })
+    }
+
+    /// The log named by `LCPLAY_VSYNC_LOG`, opened on first use; `None` when
+    /// the variable is unset or the file cannot be created (said once).
+    pub fn global() -> Option<&'static RawLog> {
+        static LOG: std::sync::OnceLock<Option<RawLog>> = std::sync::OnceLock::new();
+        LOG.get_or_init(|| {
+            let path = std::env::var_os("LCPLAY_VSYNC_LOG").filter(|v| !v.is_empty())?;
+            let path = std::path::PathBuf::from(path);
+            match RawLog::create(&path) {
+                Ok(log) => {
+                    let shown = std::fs::canonicalize(&path).unwrap_or(path);
+                    tracing::info!("vsync log: writing {}", shown.display());
+                    Some(log)
+                }
+                Err(e) => {
+                    tracing::warn!("vsync log: cannot create {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .as_ref()
+    }
+
+    /// Append a row. Flushed every 60 rows (about a second), so a run that
+    /// is killed loses at most that much. Write errors are ignored: this is
+    /// a diagnostic and must never disturb the output.
+    pub fn row(&self, r: &RawRow) {
+        use std::io::Write as _;
+        let Ok(mut guard) = self.out.lock() else {
+            return;
+        };
+        let (out, rows) = &mut *guard;
+        let period = r
+            .period_ns
+            .map_or(String::new(), |p| format!("{:.4}", p / 1e6));
+        let _ = writeln!(
+            out,
+            "{},{},{},{:.3},{},{},{},{},{},{}",
+            r.width,
+            r.height,
+            r.wake_ns,
+            r.wait_ns as f64 / 1e6,
+            r.sync_refresh,
+            r.sync_ns,
+            r.present_count,
+            r.present_refresh,
+            period,
+            r.correction
+        );
+        *rows += 1;
+        if *rows % 60 == 0 {
+            let _ = out.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +368,48 @@ mod tests {
         let (_, t) = c.next_after((P * 500.2) as i64).unwrap();
         let err = t as f64 - P * 501.0;
         assert!((0.0..2_000_000.0).contains(&err), "error {err}");
+    }
+
+    #[test]
+    fn the_raw_log_writes_a_header_and_one_line_per_row() {
+        let dir = std::env::temp_dir().join(format!("lcplay-vsync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vsync.csv");
+        let log = RawLog::create(&path).unwrap();
+        let row = RawRow {
+            width: 3840,
+            height: 2160,
+            wake_ns: 1_000_000_000,
+            wait_ns: 15_500_000,
+            sync_refresh: 42,
+            sync_ns: 990_000_000,
+            present_count: 40,
+            present_refresh: 41,
+            period_ns: Some(P),
+            correction: 1,
+        };
+        log.row(&row);
+        log.row(&RawRow {
+            period_ns: None,
+            ..row
+        });
+        drop(log); // flushes
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], RawLog::HEADER);
+        assert_eq!(
+            lines[1],
+            "3840,2160,1000000000,15.500,42,990000000,40,41,16.6833,1"
+        );
+        assert_eq!(
+            lines[2],
+            "3840,2160,1000000000,15.500,42,990000000,40,41,,1"
+        );
+        assert_eq!(lines.len(), 3);
+        // Every row has as many fields as the header.
+        let fields = lines[0].split(',').count();
+        assert!(lines.iter().all(|l| l.split(',').count() == fields));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
