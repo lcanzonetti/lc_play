@@ -10,8 +10,14 @@
 //! `t(n) = phase + n × period` in local nanoseconds, fitted by least squares
 //! to recent observations. Observations come either
 //!
-//! * from the display driver (`exact`): refresh counter and its timestamp
-//!   (DXGI frame statistics) — what LC Play's own swap chain uses on Windows;
+//! * from the display driver (`exact`): the time of a refresh (DXGI frame
+//!   statistics) — what LC Play's own swap chain uses on Windows. The
+//!   driver's timestamps are exact, but its refresh *counter* is not: on a
+//!   Windows laptop it lost one refresh at a time whenever frames were
+//!   repeated (a 60 Hz output whose window lacked the focus), each loss
+//!   shifting the line by a whole period and the fitted period from 16.67 to
+//!   18.8 ms. So refreshes are numbered from the timestamps, and the driver's
+//!   count only serves before there is a period to number with;
 //! * or from the render loop (`tick`): the moment the swap chain let the loop
 //!   continue, which follows the refreshes with some scheduling jitter. The
 //!   refresh number is inferred from the elapsed time.
@@ -42,25 +48,105 @@ pub struct RefreshClock {
     fit: Option<(f64, f64)>,
     /// Whether the samples come from the driver.
     exact: bool,
+    /// The driver's counter at the last driver sample.
+    driver_last: Option<i64>,
+    /// This clock's refresh number minus the driver's, at the last driver
+    /// sample: translates refresh numbers the driver reports (the refresh a
+    /// present reached) into this clock's numbering.
+    driver_offset: i64,
+    /// Before there is a fit: the shortest time per driver count between
+    /// consecutive reports since the last restart, a provisional period.
+    shortest: Option<f64>,
 }
 
 impl RefreshClock {
     /// A refresh reported by the driver: its counter value and time.
+    ///
+    /// The refresh is numbered from its time: the last sample's number plus
+    /// the elapsed time in periods, rounded. The driver's counter only tells
+    /// whether this is a new report, and, before there is a fit, gives a
+    /// provisional period (see `shortest`). Rounding needs the period right
+    /// to within half a refresh over the gap between reports: at 60 Hz a
+    /// one-second gap tolerates an error of 0.8 % (0.3 % at 165 Hz), far more
+    /// than a fit of exact timestamps has.
     pub fn observe_refresh(&mut self, count: i64, local_ns: i64) {
         if !self.exact {
             // Switching from inferred to exact numbering: start over.
-            self.samples.clear();
+            self.restart();
             self.exact = true;
+            self.driver_last = None;
         }
-        if let Some(&(last_n, last_t)) = self.samples.back() {
-            if count == last_n {
-                return; // the same refresh, reported again
+        let n = match (self.samples.back().copied(), self.driver_last) {
+            (Some((last_n, last_t)), Some(last_count)) => {
+                if count == last_count {
+                    return; // the same report, read again
+                }
+                let (dt, dc) = (local_ns - last_t, count - last_count);
+                if dt <= 0 {
+                    // The clock went backwards: time cannot number this one.
+                    self.restart();
+                    last_n + dc.max(1)
+                } else {
+                    if dc > 0 {
+                        // Lost counts only ever lengthen time-per-count, so
+                        // the shortest seen is the best provisional period.
+                        let ratio = dt as f64 / dc as f64;
+                        if (MIN_PERIOD_NS..=MAX_PERIOD_NS).contains(&ratio) {
+                            self.shortest = Some(self.shortest.map_or(ratio, |s| s.min(ratio)));
+                        }
+                    }
+                    let step = match self.period().or(self.shortest) {
+                        Some(p) => ((dt as f64 / p).round() as i64).max(1),
+                        None => dc.max(1),
+                    };
+                    if dc < 0 {
+                        // A new counter (swap chain re-created, mode change):
+                        // the old line may not hold. Fit a new one, numbered
+                        // on from the old so that refreshes predicted before
+                        // keep their meaning.
+                        self.restart();
+                    }
+                    last_n + step
+                }
             }
-            if count < last_n || local_ns <= last_t {
-                self.samples.clear(); // counter or clock reset (mode change)
+            _ => count,
+        };
+        self.driver_last = Some(count);
+        self.samples.push_back((n, local_ns));
+        while self.samples.len() > WINDOW {
+            self.samples.pop_front();
+        }
+        if self.fit.is_none() {
+            // No line yet: the samples so far were numbered with what was
+            // known then. Number them again from their times with the best
+            // provisional period, so that a count lost early on cannot bend
+            // the first fit.
+            if let Some(p) = self.shortest {
+                let (n0, t0) = self.samples[0];
+                for s in self.samples.iter_mut() {
+                    s.0 = n0 + ((s.1 - t0) as f64 / p).round() as i64;
+                }
             }
         }
-        self.push(count, local_ns);
+        self.refit();
+        let last_n = self.samples.back().map_or(n, |s| s.0);
+        self.driver_offset = last_n - count;
+    }
+
+    /// Forget the samples and the provisional period (not the numbering:
+    /// the next sample is numbered on from the last).
+    fn restart(&mut self) {
+        self.samples.clear();
+        self.shortest = None;
+    }
+
+    /// This clock's number for a refresh the driver numbered `count`, such as
+    /// the refresh a present reached. Translated with the offset of the
+    /// latest report, so a count the driver lost between that refresh and the
+    /// report would put it one refresh early. In practice they are the same
+    /// refresh (all 3480 reports of the laptop capture in `testdata`).
+    pub fn from_driver(&self, count: i64) -> i64 {
+        count + self.driver_offset
     }
 
     /// The render loop was released by the swap chain at `local_ns`.
@@ -238,6 +324,10 @@ pub struct RawRow {
     pub sync_ns: i64,
     pub present_count: u32,
     pub present_refresh: i64,
+    /// The clock's own number for `sync_refresh` (see
+    /// [`RefreshClock::observe_refresh`]): where it runs ahead of the
+    /// driver's, the driver lost counts.
+    pub clock_refresh: i64,
     /// The clock's period estimate and the tracker's correction after this
     /// report was taken in.
     pub period_ns: Option<f64>,
@@ -265,7 +355,7 @@ pub struct RawLog {
 #[cfg_attr(not(windows), allow(dead_code))]
 impl RawLog {
     const HEADER: &'static str = "width,height,wake_ns,wait_ms,sync_refresh,sync_ns,\
-        present_count,present_refresh,period_ms,correction";
+        present_count,present_refresh,period_ms,correction,clock_refresh";
 
     /// Create (truncate) `path` and write the header.
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
@@ -313,7 +403,7 @@ impl RawLog {
             .map_or(String::new(), |p| format!("{:.4}", p / 1e6));
         let _ = writeln!(
             out,
-            "{},{},{},{:.3},{},{},{},{},{},{}",
+            "{},{},{},{:.3},{},{},{},{},{},{},{}",
             r.width,
             r.height,
             r.wake_ns,
@@ -323,7 +413,8 @@ impl RawLog {
             r.present_count,
             r.present_refresh,
             period,
-            r.correction
+            r.correction,
+            r.clock_refresh
         );
         *rows += 1;
         if *rows % 60 == 0 {
@@ -385,6 +476,7 @@ mod tests {
             sync_ns: 990_000_000,
             present_count: 40,
             present_refresh: 41,
+            clock_refresh: 43,
             period_ns: Some(P),
             correction: 1,
         };
@@ -399,17 +491,114 @@ mod tests {
         assert_eq!(lines[0], RawLog::HEADER);
         assert_eq!(
             lines[1],
-            "3840,2160,1000000000,15.500,42,990000000,40,41,16.6833,1"
+            "3840,2160,1000000000,15.500,42,990000000,40,41,16.6833,1,43"
         );
         assert_eq!(
             lines[2],
-            "3840,2160,1000000000,15.500,42,990000000,40,41,,1"
+            "3840,2160,1000000000,15.500,42,990000000,40,41,,1,43"
         );
         assert_eq!(lines.len(), 3);
         // Every row has as many fields as the header.
         let fields = lines[0].split(',').count();
         assert!(lines.iter().all(|l| l.split(',').count() == fields));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A driver whose counter loses one refresh every `every` reports while
+    /// the timestamps stay exact: the period and the numbering must not
+    /// notice.
+    #[test]
+    fn a_counter_that_loses_refreshes_does_not_bend_the_clock() {
+        let mut c = RefreshClock::default();
+        let mut count = 1000i64;
+        // Reports 1 or 3 refreshes apart, as when frames are repeated.
+        let mut previous = 1000i64;
+        for k in 0..600i64 {
+            let refresh = 1000 + k * 2 + (k % 2);
+            count += refresh - previous;
+            previous = refresh;
+            if k % 7 == 6 {
+                count -= 1; // the driver loses one
+            }
+            c.observe_refresh(count, (P * refresh as f64) as i64);
+            if k >= MIN_SAMPLES as i64 {
+                let p = c.period().unwrap();
+                assert!((p - P).abs() < P * 1e-4, "report {k}: period {p}");
+            }
+        }
+        // The clock's numbering follows time, not the driver's count…
+        let last = 1000 + 599 * 2 + (599 % 2);
+        assert_eq!(c.from_driver(count), last);
+        assert!(count < last, "the scenario must lose counts");
+        // …and its line still lands on the refreshes.
+        let t = c.time_of(last + 10).unwrap();
+        assert!((t as f64 - P * (last + 10) as f64).abs() < 100_000.0);
+    }
+
+    #[test]
+    fn a_new_counter_continues_the_numbering() {
+        let mut c = RefreshClock::default();
+        for n in 0..30i64 {
+            c.observe_refresh(500 + n, (P * n as f64) as i64);
+        }
+        let before = c.from_driver(529);
+        // The swap chain is re-created: its counter starts again near 0.
+        c.observe_refresh(3, (P * 32.0) as i64);
+        assert_eq!(c.from_driver(3), before + 3, "numbered on by time");
+        assert_eq!(c.period(), None, "a new line is fitted");
+        for n in 33..50i64 {
+            c.observe_refresh(n - 29, (P * n as f64) as i64);
+        }
+        assert!((c.period().unwrap() - P).abs() < 1.0);
+        assert_eq!(c.from_driver(20), before + 20);
+    }
+
+    /// Replay of a real capture (`testdata/vsync-laptop-slow.csv`, a Windows
+    /// laptop whose driver lost counts while the output ran slowly). By the
+    /// driver's own numbering the refreshes end up more than 400 ms off a
+    /// 60 Hz train; the clock must hold 60 Hz throughout.
+    #[test]
+    fn replay_of_a_laptop_capture_holds_sixty_hertz() {
+        const NOMINAL: f64 = 1e9 / 60.0;
+        let rows: Vec<[i64; 4]> = include_str!("../testdata/vsync-laptop-slow.csv")
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with("sync_refresh"))
+            .map(|l| {
+                let v: Vec<i64> = l.split(',').map(|f| f.parse().unwrap()).collect();
+                [v[0], v[1], v[2], v[3]]
+            })
+            .collect();
+        assert!(rows.len() > 3000);
+        // Where the second swap-chain counter starts.
+        let reset = rows.windows(2).position(|w| w[1][0] < w[0][0]).unwrap() + 1;
+
+        // The capture does exercise the fault: the driver's count falls
+        // behind the time elapsed.
+        let ([c0, t0, ..], [c1, t1, ..]) = (rows[reset], rows[rows.len() - 1]);
+        let behind = (t1 - t0) as f64 - (c1 - c0) as f64 * NOMINAL;
+        assert!(behind > 400e6, "driver numbering is off by {behind} ns");
+
+        let mut clock = RefreshClock::default();
+        let mut worst: f64 = 0.0;
+        let mut n_at_reset = None;
+        for (i, &[count, t, _, reached]) in rows.iter().enumerate() {
+            clock.observe_refresh(count, t);
+            if i == reset {
+                n_at_reset = Some(clock.from_driver(count));
+            }
+            if i >= reset + MIN_SAMPLES {
+                let p = clock.period().expect("a fit");
+                worst = worst.max((p - NOMINAL).abs() / NOMINAL);
+                // The refresh a present reached is the report's refresh.
+                assert_eq!(clock.from_driver(reached), clock.from_driver(count));
+            }
+        }
+        assert!(worst < 1e-3, "period off by {:.3} %", worst * 100.0);
+        // From the reset to the end, the clock counted the refreshes that
+        // elapsed, to within one.
+        let counted = clock.from_driver(c1) - n_at_reset.unwrap();
+        let elapsed = ((t1 - t0) as f64 / NOMINAL).round() as i64;
+        assert!((counted - elapsed).abs() <= 1, "{counted} vs {elapsed}");
     }
 
     #[test]

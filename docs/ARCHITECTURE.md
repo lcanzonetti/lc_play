@@ -160,7 +160,17 @@ at a frame boundary. The renderer now works per refresh:
    observations are the driver's own (`GetFrameStatistics`: refresh counter
    and the QPC time of a refresh) through LC Play's own DXGI swap chain
    (`dxgi.rs`); elsewhere they are the moments the swap chain released the
-   render loop.
+   render loop. The driver's *timestamps* are exact, but its *counter* is
+   not: on a Windows laptop it lost one refresh at a time while frames were
+   being repeated, which bent the fitted period from 16.67 to 18.8 ms. So the
+   clock numbers refreshes from the timestamps (elapsed time over the period,
+   rounded) and uses the counter only to tell a new report from a repeated
+   one and, before the first fit, for a provisional period (the shortest
+   time per count, which lost counts can only lengthen). Refresh numbers the
+   driver reports, such as the refresh a present reached, are translated into
+   the clock's numbering (`RefreshClock::from_driver`). A replay of the
+   laptop capture (`crates/lc-runner/testdata/vsync-laptop-slow.csv`) is a
+   unit test.
 2. **The target refresh.** After waiting for the swap chain, the frame will
    reach refresh `next + latency − 1 + correction`, where `latency` is the
    number of frames queued (`LCPLAY_FRAME_LATENCY`, default 2) and
@@ -219,11 +229,13 @@ One CSV row per frame on LC Play's own DXGI swap chain: the
 `DXGI_FRAME_STATISTICS` sync refresh and its time (converted to local time),
 the last present's id and the refresh it reached, the wait for the
 frame-latency waitable, and the `RefreshClock` period and `PresentTracker`
-correction after the report. It exists because a drifting period estimate
+correction after the report, and the clock's own number for the reported
+refresh (`clock_refresh`: where it runs ahead of the driver's `sync_refresh`,
+the driver lost counts). It exists because a drifting period estimate
 cannot be diagnosed from the estimate: over a two-second fitting window, reports
 arriving progressively late and a refresh counter that skips refreshes give
 the same straight line. Over a whole run the raw counter steps against time
-tell them apart.
+tell them apart — which is how the counter fault above was found.
 
 **[Not yet verified on frame-locked hardware.]** The pieces are unit-tested
 (grid arithmetic, refresh fitting, present tracking, the Director's grid

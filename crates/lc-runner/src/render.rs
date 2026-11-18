@@ -740,9 +740,10 @@ impl Gpu {
                     Some(st) => {
                         let at = crate::dxgi::qpc_to_local(st.sync_qpc, now);
                         out.timing.clock.observe_refresh(st.sync_refresh, at);
-                        out.timing
-                            .tracker
-                            .landed(st.present_count, st.present_refresh);
+                        // The refresh the present reached, in the clock's
+                        // numbering (not the driver's, which loses counts).
+                        let reached = out.timing.clock.from_driver(st.present_refresh);
+                        out.timing.tracker.landed(st.present_count, reached);
                         if let Some(log) = crate::vsync::RawLog::global() {
                             log.row(&crate::vsync::RawRow {
                                 width: out.width,
@@ -753,6 +754,7 @@ impl Gpu {
                                 sync_ns: at,
                                 present_count: st.present_count,
                                 present_refresh: st.present_refresh,
+                                clock_refresh: out.timing.clock.from_driver(st.sync_refresh),
                                 period_ns: out.timing.clock.period(),
                                 correction: out.timing.tracker.correction(),
                             });
