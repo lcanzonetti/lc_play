@@ -373,7 +373,28 @@ function saveUser() {
 
 /** Tell the other Producers who we are and what we are working on. */
 function sendPresence() {
-  send({ type: 'presence', name: S.user.name, color: S.user.color, selection: S.sel, dragging: !!(drag?.undone || tlDrag?.undone) });
+  send({ type: 'presence', name: S.user.name, color: S.user.color, selection: presenceSelection(), dragging: !!(drag?.undone || tlDrag?.undone) });
+}
+
+/** The Director relays a presence only if its selection is at most this
+ *  many bytes of JSON (lc-director: MAX_PRESENCE_SELECTION_BYTES). */
+const MAX_SELECTION_BYTES = 4096;
+/** The selection as sent to the others. A very large multiple selection is
+ *  cut down to what the Director relays (the primary cue always kept): the
+ *  others then see part of it outlined, instead of a stale one. */
+function presenceSelection() {
+  const sel = S.sel;
+  if (!sel?.ids) return sel;
+  const bytes = (v) => new TextEncoder().encode(JSON.stringify(v)).length;
+  const ids = [sel.id];
+  let size = bytes({ ...sel, ids }) + 8; // + 8: margin for rounding of the estimate below
+  for (const id of sel.ids) {
+    if (id === sel.id) continue;
+    size += bytes(id) + 1; // the id and its comma
+    if (size > MAX_SELECTION_BYTES) break;
+    ids.push(id);
+  }
+  return { ...sel, ids };
 }
 
 /** A colour from another user, safe to put in a style attribute. */
@@ -1749,6 +1770,15 @@ function renderTimeline() {
   });
 }
 
+/** preventDefault() on a mousedown (needed so a drag does not select page
+ *  text) also stops it from taking the focus: leave a field being typed in
+ *  ourselves, so its value is committed before the selection changes and
+ *  the inspector is rebuilt. */
+function leaveField() {
+  const f = document.activeElement;
+  if (f && ['INPUT', 'SELECT', 'TEXTAREA'].includes(f.tagName)) f.blur();
+}
+
 // One mousedown handler for all cues (they are rebuilt constantly, so
 // per-element listeners would be lost mid-drag).
 //
@@ -1768,12 +1798,14 @@ $('#tracks').addEventListener('mousedown', (e) => {
       // Box selection. A plain click on an empty lane still deselects (on
       // mouseup, when the pointer has not moved).
       tlDrag = { kind: 'box', mx: e.clientX, my: e.clientY, additive, base: additive ? selCueIds() : [], moved: false, key: '', undone: false };
+      leaveField();
       e.preventDefault();
     }
     return;
   }
   const hit = findCue(node.dataset.id);
   if (!hit) return;
+  leaveField();
   e.preventDefault();
   const id = hit.cue.id;
   if (additive) {

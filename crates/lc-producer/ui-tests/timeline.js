@@ -124,6 +124,25 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await opInput.fill('40');
   await opInput.press('Enter');
   assert((await p.evaluate((i) => findCue(i).cue.opacity, ids[1])) === 0.4, 'Enter commits a number field');
+  // Typing without Enter, then clicking on the timeline, commits too (the
+  // timeline's mousedown must not keep the focus in the field).
+  await opInput.fill('30');
+  await p.mouse.click(lane0.x + 0.25 * pps, lane0.y + lane0.height / 2);
+  assert((await p.evaluate((i) => findCue(i).cue.opacity, ids[1])) === 0.3, 'clicking an empty lane commits a typed value');
+  await p.click(`#tracks .cue[data-id="${ids[1]}"]`);
+  await opInput.fill('20');
+  await p.click(`#tracks .cue[data-id="${ids[0]}"]`);
+  assert((await p.evaluate((i) => findCue(i).cue.opacity, ids[1])) === 0.2, 'clicking another cue commits a typed value');
+  await p.click(`#tracks .cue[data-id="${ids[1]}"]`);
+  // A very large selection is trimmed to what the Director relays.
+  const big = await p.evaluate(() => {
+    const keep = S.sel;
+    S.sel = { type: 'cue', id: 'x0', ids: Array.from({ length: 1000 }, (_, i) => 'x' + i) };
+    const sent = presenceSelection();
+    S.sel = keep;
+    return [new TextEncoder().encode(JSON.stringify(sent)).length, sent.ids.length, sent.ids[0]];
+  });
+  assert(big[0] <= 4096 && big[1] > 200 && big[2] === 'x0', `a large selection is trimmed to fit the Director's limit (${big})`);
   // Show inspector (nothing selected): its fields commit on Enter too.
   await p.evaluate(() => select(null));
   const lenInput = p.locator('#inspector .row', { hasText: 'Length (s)' }).locator('input');

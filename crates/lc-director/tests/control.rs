@@ -821,6 +821,44 @@ async fn two_producers_editing_at_once_both_keep_their_changes() {
             break;
         }
     }
+    // A box selection of many cues is relayed whole (it is well over the
+    // old 512-byte limit) ...
+    let many: Vec<String> = (0..200).map(|i| format!("cue{i:05}")).collect();
+    let presence = |ids: &[String]| {
+        ClientMessage::Presence(lc_proto::Presence {
+            name: "Alice".into(),
+            color: "#e44".into(),
+            selection: Some(serde_json::json!({ "type": "cue", "id": ids[0], "ids": ids })),
+            dragging: false,
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(250)).await; // presence is rate-limited
+    alice.send(&presence(&many)).await.unwrap();
+    loop {
+        if let ServerMessage::Presence { presence, .. } =
+            bob.recv_timeout(Duration::from_secs(3)).await.unwrap()
+        {
+            let sel = presence.unwrap().selection.unwrap();
+            assert_eq!(sel["ids"].as_array().unwrap().len(), 200);
+            break;
+        }
+    }
+    // ... one past the limit is not.
+    let too_many: Vec<String> = (0..400).map(|i| format!("cue{i:05}")).collect();
+    assert!(
+        serde_json::json!({ "type": "cue", "id": too_many[0], "ids": too_many })
+            .to_string()
+            .len()
+            > lc_director::MAX_PRESENCE_SELECTION_BYTES
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    alice.send(&presence(&too_many)).await.unwrap();
+    while let Ok(msg) = bob.recv_timeout(Duration::from_millis(400)).await {
+        assert!(
+            !matches!(msg, ServerMessage::Presence { .. }),
+            "an oversized selection was relayed"
+        );
+    }
     drop(alice);
     loop {
         if let ServerMessage::Presence { node_id, presence } =

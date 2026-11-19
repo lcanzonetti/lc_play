@@ -121,7 +121,10 @@ most five times a second per client.
 Producers also send `{ "type": "presence", "name": "Alice", "color":
 "#ff6b6b", "selection": { "type": "cue", "id": "c1" }, "dragging": false }`
 (on selection changes and every 3 s; name ≤ 64 characters, colour `#rgb` to
-`#rrggbbaa`, selection ≤ 512 bytes, or it is dropped). The Director relays it to the other
+`#rrggbbaa`, selection ≤ 4096 bytes of JSON, or it is dropped). Several
+cues selected: `{ "type": "cue", "id": "c1", "ids": ["c1", "c2", …] }`
+(`id`, the cue clicked last, is also in `ids`); the Producer trims `ids` to
+stay within the limit. The Director relays it to the other
 Producers and controllers — never to Runners — as `{ "type": "presence",
 "node_id": "…", "presence": { … } }`, and with `"presence": null` when that
 Producer disconnects.

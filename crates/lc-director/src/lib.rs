@@ -129,6 +129,11 @@ fn cue_fire_time(
 /// Fastest/slowest playback rate accepted (±16×).
 const MAX_RATE_PERMILLE: u32 = 16_000;
 
+/// Largest presence `selection` (as JSON) relayed to the other Producers.
+/// Room for a box selection of a few hundred cues; the Producer trims a
+/// larger one to fit (`presenceSelection` in its app.js).
+pub const MAX_PRESENCE_SELECTION_BYTES: usize = 4096;
+
 pub struct DirectorConfig {
     pub name: String,
     /// TCP address of the control channel. Port 0 picks a free port (tests).
@@ -573,7 +578,8 @@ impl Core {
         }
     }
 
-    /// Relay a Producer's presence to the other Producers.
+    /// Relay a Producer's presence to the other Producers. (A larger one is
+    /// dropped; see [`MAX_PRESENCE_SELECTION_BYTES`].)
     pub fn presence(&self, conn: u64, presence: lc_proto::Presence) {
         // Relayed to everyone: keep it small, and the colour a plain colour
         // (it ends up in other users' pages).
@@ -584,7 +590,10 @@ impl Core {
         let color_ok = presence.color.len() <= 9
             && presence.color.starts_with('#')
             && presence.color[1..].chars().all(|c| c.is_ascii_hexdigit());
-        if presence.name.chars().count() > 64 || selection_len > 512 || !color_ok {
+        if presence.name.chars().count() > 64
+            || selection_len > MAX_PRESENCE_SELECTION_BYTES
+            || !color_ok
+        {
             return;
         }
         let node = self.state().nodes.get(&conn).cloned();
