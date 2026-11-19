@@ -1001,10 +1001,12 @@ function addVirtual() {
   });
 }
 
+/** A new task, on top: the first task is the front-most (as a new track is
+ *  added above the others). */
 function addTask() {
   edit(() => {
     const task = { id: 'task-' + uid(), name: `Task ${S.doc.tasks.length + 1}`, duration_s: 30, tracks: [{ id: uid(), name: 'Track 1', cues: [] }], control_cues: [] };
-    S.doc.tasks.push(task);
+    S.doc.tasks.unshift(task);
     normalize(S.doc);
     S.tl = task.id;
     S.sel = { type: 'task', id: task.id };
@@ -2118,19 +2120,197 @@ function renderTasks() {
     box.append(el('div', { class: 'empty' }, 'No tasks. A task is an extra timeline that runs independently of the main one — started by you, by a control cue, or by show control (OSC).'));
     return;
   }
+  // Top to bottom is front to back, as for tracks: drag a task up or down to
+  // change what covers what. The main timeline is always at the back.
   for (const task of S.doc.tasks) {
     const tr = currentTransport(task.id);
     const selected = (S.sel?.type === 'task' && S.sel.id === task.id) || S.tl === task.id;
-    box.append(el('div', { class: `task${selected ? ' sel' : ''}` },
+    const row = el('div', {
+      class: `task${selected ? ' sel' : ''}`, draggable: 'true', dataset: { id: task.id },
+      title: 'Click to select and open; drag up or down to bring it in front of / behind the other tasks',
+      onclick: (e) => { if (!e.target.closest('button')) { S.tl = task.id; select({ type: 'task', id: task.id }); } },
+      ondragstart: (e) => { e.dataTransfer.setData('text/lcplay-task', task.id); e.dataTransfer.effectAllowed = 'move'; },
+      ondragover: (e) => {
+        if (!e.dataTransfer.types.includes('text/lcplay-task')) return;
+        e.preventDefault();
+        const below = e.offsetY > row.offsetHeight / 2;
+        row.classList.toggle('drop-above', !below);
+        row.classList.toggle('drop-below', below);
+      },
+      ondragleave: () => row.classList.remove('drop-above', 'drop-below'),
+      ondrop: (e) => {
+        const below = row.classList.contains('drop-below');
+        row.classList.remove('drop-above', 'drop-below');
+        const id = e.dataTransfer.getData('text/lcplay-task');
+        if (!id) return;
+        e.preventDefault();
+        const to = S.doc.tasks.findIndex((t) => t.id === task.id) + (below ? 1 : 0);
+        moveTask(id, to);
+      },
+    });
+    box.append(row);
+    row.append(
       el('span', { class: `dot ${!tr?.active ? '' : tr.playing ? 'ok' : 'warn'}` }),
-      el('span', { class: 'name', title: 'Open in the Timeline window', onclick: () => { S.tl = task.id; select({ type: 'task', id: task.id }); } }, task.name || 'Task'),
+      el('span', { class: 'name', title: 'Open in the Timeline window' }, task.name || 'Task'),
       el('span', { class: 'state dim mono', dataset: { tl: task.id } }, taskStateText(task.id)),
       el('button', { class: 'small', title: 'Play', onclick: () => command({ type: 'play' }, task.id) }, '▶'),
       el('button', { class: 'small', title: 'Pause', onclick: () => command({ type: 'pause' }, task.id) }, '⏸'),
-      el('button', { class: 'small', title: 'Stop (take off stage)', onclick: () => command({ type: 'stop' }, task.id) }, '⏹')));
+      el('button', { class: 'small', title: 'Stop (take off stage)', onclick: () => command({ type: 'stop' }, task.id) }, '⏹'));
   }
+  box.append(el('div', { class: 'task main dim', title: 'The main timeline is always behind the tasks' }, el('span', { class: 'name' }, 'Main timeline (always at the back)')));
 }
 $('#btn-task').onclick = addTask;
+
+/** Move task `id` so that it ends up at index `to` of the task list as it is
+ *  now (0 = top, the front-most). */
+function moveTask(id, to) {
+  const from = S.doc.tasks.findIndex((t) => t.id === id);
+  if (from < 0) return;
+  const at = from < to ? to - 1 : to;
+  if (at === from) return;
+  edit(() => {
+    const [task] = S.doc.tasks.splice(from, 1);
+    S.doc.tasks.splice(clamp(at, 0, S.doc.tasks.length), 0, task);
+    S.sel = { type: 'task', id };
+  });
+}
+
+// ───────────────────────────── clipboard ─────────────────────────────
+// Ctrl+C / Ctrl+X / Ctrl+V for cues (one or several, on any timeline) and
+// for whole tasks. The clipboard is this page's: it holds copies, so editing
+// or deleting the originals afterwards does not change what is pasted.
+//
+// - Cues paste into the timeline open in the Timeline window, the earliest
+//   at its playhead, keeping their spacing in time and between tracks; the
+//   top one goes on the track of the selected cue (or track), otherwise on
+//   the top track. Missing tracks are added below.
+// - A task pastes above the selected task (or the one open), otherwise on
+//   top, and opens.
+// - Cut, then paste, is a move: ids still free are kept (so is a control cue
+//   elsewhere that started a cut task). A second paste gets new ids, and a
+//   pasted task whose name is in use is called "… copy".
+
+let clipboard = null; // { kind: 'cues', cues: [{ cue, ti }], assets } | { kind: 'task', task, targeting, assets }
+
+/** Every id in the show (ids are unique across all its lists). */
+function allIds() {
+  const ids = new Set();
+  const walk = (v) => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (isObj(v)) { if (typeof v.id === 'string') ids.add(v.id); Object.values(v).forEach(walk); }
+  };
+  walk(S.doc);
+  return ids;
+}
+
+/** The asset entries the cues use (pasted into a show that lacks them). */
+const assetsOf = (cues) => clone(S.doc.assets.filter((a) => cues.some((c) => c.source.type === 'asset' && c.source.asset === a.id)));
+
+function copySelection(cut = false) {
+  if (S.sel?.type === 'cue') {
+    const hits = selCueIds().map(findCue).filter(Boolean);
+    if (!hits.length) return;
+    clipboard = { kind: 'cues', cues: hits.map((h) => ({ cue: clone(h.cue), ti: h.ti })), assets: assetsOf(hits.map((h) => h.cue)) };
+    if (cut) {
+      edit(() => {
+        for (const h of hits) { const now = findCue(h.cue.id); if (now) now.track.cues.splice(now.ci, 1); }
+        S.sel = null;
+      });
+    }
+    toast(`${cut ? 'Cut' : 'Copied'} ${hits.length} cue${hits.length > 1 ? 's' : ''}: Ctrl+V pastes at the playhead of the open timeline.`, true);
+  } else if (S.sel?.type === 'task') {
+    const task = tlObj(S.sel.id);
+    if (!task) return;
+    // Control cues elsewhere that act on it: they come back if it is cut and
+    // pasted (the Director refuses one that names a task that is not there).
+    const targeting = [];
+    for (const tl of tlIds()) for (const cc of tlObj(tl).control_cues) if (tl !== task.id && cc.target === task.id) targeting.push({ tl, cc: clone(cc) });
+    clipboard = { kind: 'task', task: clone(task), targeting, assets: assetsOf(task.tracks.flatMap((t) => t.cues)) };
+    if (cut) {
+      edit(() => {
+        S.doc.tasks = S.doc.tasks.filter((t) => t.id !== task.id);
+        for (const tl of tlIds()) { const o = tlObj(tl); o.control_cues = o.control_cues.filter((cc) => cc.target !== task.id); }
+        S.sel = null;
+      });
+    }
+    toast(`${cut ? 'Cut' : 'Copied'} the task "${task.name || 'Task'}": Ctrl+V pastes it above the selected task.`, true);
+  }
+}
+
+/** A cue from the clipboard can go into the show: what it shows exists. */
+const pastable = (cue) => cue.source.type !== 'virtual' || !!findVirtual(cue.source.virtual);
+
+function paste() {
+  if (clipboard?.kind === 'cues') pasteCues();
+  else if (clipboard?.kind === 'task') pasteTask();
+}
+
+function pasteCues() {
+  const items = clipboard.cues.filter((i) => pastable(i.cue));
+  if (!items.length) { toast('Nothing to paste: the virtual displays those cues showed are gone.'); return; }
+  const tl = S.tl, at = round2(Math.max(0, showSeconds(tl)));
+  const t0 = Math.min(...items.map((i) => i.cue.start_s)), ti0 = Math.min(...items.map((i) => i.ti));
+  const lead = S.sel?.type === 'cue' ? findCue(S.sel.id) : S.sel?.type === 'track' ? findTrack(S.sel.id) : null;
+  const base = lead?.tl === tl ? lead.ti : 0;
+  edit(() => {
+    const obj = tlObj(tl), ids = allIds(), pasted = [];
+    for (const a of clipboard.assets) if (!S.doc.assets.some((x) => x.id === a.id)) S.doc.assets.push(clone(a));
+    for (const { cue, ti } of items) {
+      const c = clone(cue);
+      if (ids.has(c.id)) c.id = uid();
+      ids.add(c.id);
+      c.start_s = round2(at + (cue.start_s - t0));
+      const target = base + (ti - ti0);
+      while (obj.tracks.length <= target) obj.tracks.push({ id: uid(), name: `Track ${obj.tracks.length + 1}`, cues: [] });
+      obj.tracks[target].cues.push(c);
+      obj.duration_s = Math.max(obj.duration_s, Math.ceil(c.start_s + c.duration_s));
+      pasted.push(c.id);
+    }
+    normalize(S.doc);
+    S.sel = cueSelection(pasted, pasted[0]);
+  });
+  if (tl === MAIN) syncLoop();
+}
+
+function pasteTask() {
+  const src = clipboard.task, ids = allIds();
+  const task = clone(src);
+  const keep = !ids.has(task.id);
+  if (!keep) task.id = 'task-' + uid();
+  ids.add(task.id);
+  if (!keep || S.doc.tasks.some((t) => t.name === task.name)) task.name = `${src.name || 'Task'} copy`;
+  // Fresh ids for whatever inside is taken; nothing that refers to what is
+  // not there (the Director would refuse the show).
+  const known = new Set([MAIN, task.id, ...S.doc.tasks.map((t) => t.id)]);
+  for (const t of task.tracks) {
+    if (ids.has(t.id)) t.id = uid();
+    ids.add(t.id);
+    t.cues = t.cues.filter(pastable);
+    for (const c of t.cues) { if (ids.has(c.id)) c.id = uid(); ids.add(c.id); }
+  }
+  task.control_cues = task.control_cues.filter((cc) => {
+    if (ids.has(cc.id)) cc.id = uid();
+    ids.add(cc.id);
+    if (cc.target === src.id) cc.target = '';
+    return !cc.target || known.has(cc.target);
+  });
+  // Above the selected (or open) task, else on top.
+  const anchor = S.sel?.type === 'task' ? S.sel.id : S.tl;
+  const index = Math.max(0, S.doc.tasks.findIndex((t) => t.id === anchor));
+  edit(() => {
+    for (const a of clipboard.assets) if (!S.doc.assets.some((x) => x.id === a.id)) S.doc.assets.push(clone(a));
+    S.doc.tasks.splice(index, 0, task);
+    if (keep) {
+      for (const { tl, cc } of clipboard.targeting) {
+        const o = tlObj(tl);
+        if (o && !ids.has(cc.id)) { o.control_cues.push(clone(cc)); ids.add(cc.id); }
+      }
+    }
+    normalize(S.doc);
+    S.tl = task.id;
+    S.sel = { type: 'task', id: task.id };
+  });
+}
 
 // ───────────────────────────── runners ─────────────────────────────
 // One card per Runner — connected, remembered from earlier, or named by a
@@ -2503,10 +2683,13 @@ function arrangeSideBySide() {
 /** Call `commit` when a typed value is entered: on Enter, and on leaving
  *  the field (the 'change' event), but only once per value — browsers also
  *  fire 'change' on Enter, and leaving the field after Enter must not make a
- *  second undo step. Enter keeps the cursor in the field with its text
- *  selected, so the next value can be typed straight away. `commit` may
- *  rewrite the field (a refused value goes back); that is the new baseline.
- *  (Checkboxes, colours and dropdowns commit on 'change' directly.) */
+ *  second undo step. `commit` may rewrite the field (a refused value goes
+ *  back); that is the new baseline. (Checkboxes, colours and dropdowns
+ *  commit on 'change' directly.)
+ *
+ *  Enter also moves to the next typed field of the same panel, with its
+ *  text selected, so several values can be typed in a row (Shift+Enter: the
+ *  previous one). On the last field the cursor stays, its text selected. */
 function onCommit(input, commit) {
   let last = input.value;
   const fire = () => {
@@ -2519,8 +2702,22 @@ function onCommit(input, commit) {
     if (e.key !== 'Enter') return;
     e.preventDefault();
     fire();
-    input.select();
+    focusNextField(input, e.shiftKey ? -1 : 1);
   });
+}
+
+/** Text and number inputs, in page order, that Enter moves between. */
+const TYPED_FIELD = 'input:not([type]), input[type=text], input[type=number]';
+
+/** Put the cursor in the typed field `step` places after `input` in its
+ *  panel (the window it is in), with that field's text selected; stay on
+ *  `input` if there is none. */
+function focusNextField(input, step) {
+  const scope = input.closest('.win') || document;
+  const fields = [...scope.querySelectorAll(TYPED_FIELD)].filter((n) => !n.disabled && n.offsetParent !== null);
+  const next = fields[fields.indexOf(input) + step] || input;
+  next.focus();
+  next.select();
 }
 
 /** Parse what a field holds: a number (or null when empty) for number
@@ -2792,7 +2989,7 @@ function renderInspector() {
       el('h3', {}, 'Task'),
       field('Name', task, 'name', { type: 'text' }),
       field('Length (s)', task, 'duration_s', { min: 1 }),
-      note(`An auxiliary timeline with its own transport. It is off stage until played, and is drawn in front of the main timeline. Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
+      note(`An auxiliary timeline with its own transport. It is off stage until played, and is drawn in front of the main timeline; among the tasks, the order in the Tasks window is the stacking (the top one in front — drag to reorder; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste a task). Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
       deleteButton('Delete task'));
     return;
   }
@@ -2968,6 +3165,10 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelection(); }
   else if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); (e.shiftKey ? $('#btn-redo') : $('#btn-undo')).click(); }
   else if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); $('#btn-redo').click(); }
+  // Copy / cut / paste: cues and tasks (anything else: the browser's own).
+  else if (mod && e.key.toLowerCase() === 'c' && ['cue', 'task'].includes(S.sel?.type)) { e.preventDefault(); copySelection(); }
+  else if (mod && e.key.toLowerCase() === 'x' && ['cue', 'task'].includes(S.sel?.type)) { e.preventDefault(); copySelection(true); }
+  else if (mod && e.key.toLowerCase() === 'v') { if (clipboard) { e.preventDefault(); paste(); } }
 });
 // Close the Windows menu when clicking elsewhere.
 window.addEventListener('mousedown', (e) => { if (!e.target.closest('#win-menu')) $('#win-menu').open = false; });

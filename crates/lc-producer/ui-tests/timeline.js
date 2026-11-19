@@ -69,7 +69,8 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await p.click(`#tracks .cue[data-id="${ids[2]}"]`, { modifiers: ['Shift'] });
 
   // ── 4. Mixed values show empty; a value + Enter sets it on all of them,
-  //       applies at once, keeps the field focused, and is one undo step.
+  //       applies at once, moves to the next field with its text selected,
+  //       and is one undo step.
   const startInput = p.locator('#inspector .row', { hasText: 'Start (s)' }).locator('input');
   assert((await startInput.inputValue()) === '' && (await startInput.getAttribute('placeholder')) === 'mixed', 'differing start times show as "mixed"');
   const durInput = p.locator('#inspector .row', { hasText: 'Duration (s)' }).locator('input');
@@ -79,10 +80,21 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await durInput.press('Enter');
   let durs = await p.evaluate(() => selectedCues().map((c) => c.duration_s));
   assert(durs.length === 3 && durs.every((d) => d === 4.5), `Enter sets the duration on every selected cue (${durs})`);
-  assert(await durInput.evaluate((n) => n === document.activeElement), 'the field keeps the focus after Enter');
   assert((await p.$$eval('#tracks .cue.sel', (n) => n.map((x) => x.style.width))).every((w) => w === `${4.5 * pps}px`), 'the timeline shows the new duration at once');
+  const fadeIn = p.locator('#inspector .row', { hasText: 'Fade in (s)' }).locator('input');
+  const fadeOut = p.locator('#inspector .row', { hasText: 'Fade out (s)' }).locator('input');
+  const focused = (loc) => loc.evaluate((n) => n === document.activeElement);
+  assert(await focused(fadeIn), 'Enter moves the cursor to the next field');
+  // Its text is selected: typing replaces it.
+  await p.keyboard.type('0.5');
+  await p.keyboard.press('Enter');
+  const fades = await p.evaluate(() => selectedCues().map((c) => c.fade_in_s));
+  assert(fades.every((f) => f === 0.5), `typing replaces the next field's selected text (${fades})`);
+  assert(await focused(fadeOut), 'and Enter moves on again');
+  await p.keyboard.press('Shift+Enter');
+  assert(await focused(fadeIn), 'Shift+Enter goes back to the previous field');
   await startInput.click();
-  assert((await p.evaluate(() => S.undo.length)) === undoBefore + 1, 'Enter, then leaving the field, is one undo step');
+  assert((await p.evaluate(() => S.undo.length)) === undoBefore + 2, 'each Enter is one undo step; leaving the field adds none');
   await startInput.fill('3');
   await startInput.press('Enter');
   const starts = await p.evaluate(() => selectedCues().map((c) => c.start_s));
@@ -94,9 +106,9 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await p.waitForTimeout(600);
   const server = await p.evaluate((i) => S.server.tracks.flatMap((t) => t.cues).filter((c) => i.includes(c.id)).map((c) => [c.start_s, c.duration_s]), ids);
   assert(server.length === 3 && server.every(([s, d]) => s === 3 && d === 4.5), 'the Director has the change for every cue');
-  await p.click('#btn-undo'); await p.click('#btn-undo');
-  durs = await p.evaluate((i) => S.doc.tracks.flatMap((t) => t.cues).filter((c) => i.includes(c.id)).map((c) => [c.start_s, c.duration_s]), ids);
-  assert(JSON.stringify(durs) === JSON.stringify([[1, 2], [5, 2], [9, 2]]), `two undos restore every cue (${JSON.stringify(durs)})`);
+  await p.click('#btn-undo'); await p.click('#btn-undo'); await p.click('#btn-undo');
+  durs = await p.evaluate((i) => S.doc.tracks.flatMap((t) => t.cues).filter((c) => i.includes(c.id)).map((c) => [c.start_s, c.duration_s, c.fade_in_s]), ids);
+  assert(JSON.stringify(durs) === JSON.stringify([[1, 2, 0], [5, 2, 0], [9, 2, 0]]), `three undos restore every cue (${JSON.stringify(durs)})`);
 
   // ── 5. Dragging one cue of the selection moves them all by the same time,
   //       and the one on the second track stays on its track.
