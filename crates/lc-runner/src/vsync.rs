@@ -52,9 +52,22 @@ const LONG_GAP_NS: i64 = 1_000_000_000;
 const MIN_PERIOD_NS: f64 = 2_000_000.0;
 const MAX_PERIOD_NS: f64 = 50_000_000.0;
 /// How far a measured period may stray from the display mode's own before
-/// it is not believed. Windows reports modes in whole hertz (59 for a
-/// 59.94 Hz mode), 1.6 % off by itself.
+/// it is not believed (see [`matches_mode`]). Windows reports modes in whole
+/// hertz, TV timings rounded down (59 for 59.94 Hz: 1.6 % off by itself).
 const NOMINAL_TOLERANCE: f64 = 0.03;
+/// …or how far, in hertz, a rate may be from the mode's whichever allows
+/// more. Rounding down to whole hertz loses up to 0.999 Hz (23.976 Hz is
+/// listed as 23: 4.2 %; 29.97 as 29: 3.3 %), beyond 3 % below 35 Hz.
+const WHOLE_HZ_SLACK: f64 = 1.05;
+
+/// Whether period `p` can be the period of a display whose mode is
+/// reported with period `nominal`: within [`NOMINAL_TOLERANCE`] of it, or
+/// within [`WHOLE_HZ_SLACK`] of its rate. Either suffices, so no rate the
+/// 3 % alone accepts is refused; only slow modes gain room.
+fn matches_mode(p: f64, nominal: f64) -> bool {
+    (p / nominal - 1.0).abs() <= NOMINAL_TOLERANCE
+        || (1e9 / p - 1e9 / nominal).abs() <= WHOLE_HZ_SLACK
+}
 /// Driver reports kept for judging the rate the driver counts at.
 const RATES: usize = 64;
 
@@ -90,8 +103,8 @@ pub struct RefreshClock {
 }
 
 impl RefreshClock {
-    /// The period of the display's mode (`None`: unknown). Measurements more
-    /// than [`NOMINAL_TOLERANCE`] away from it are not believed: the fit
+    /// The period of the display's mode (`None`: unknown). Measurements that
+    /// do not [match it](matches_mode) are not believed: the fit
     /// falls back to numbering the observations with this period. That is
     /// what stops a wrong numbering from feeding on itself, as it did twice
     /// on a Windows laptop: the render loop's own timing slid from 16.7 to
@@ -118,9 +131,7 @@ impl RefreshClock {
     /// and close to the mode's period when that is known.
     fn plausible(&self, p: f64) -> bool {
         (MIN_PERIOD_NS..=MAX_PERIOD_NS).contains(&p)
-            && self
-                .nominal
-                .is_none_or(|nom| (p / nom - 1.0).abs() <= NOMINAL_TOLERANCE)
+            && self.nominal.is_none_or(|nom| matches_mode(p, nom))
     }
 
     /// The period the driver's counter ticks at: the lower quartile of recent
@@ -156,7 +167,8 @@ impl RefreshClock {
     fn update_foreign(&mut self) {
         match (self.driver_period(), self.nominal) {
             (_, None) => self.foreign = false,
-            (Some(d), Some(nom)) => self.foreign = d < nom * (1.0 - NOMINAL_TOLERANCE),
+            // Faster than the mode, by more than the mode's rate allows.
+            (Some(d), Some(nom)) => self.foreign = d < nom && !matches_mode(d, nom),
             (None, Some(_)) => {}
         }
     }
@@ -1027,6 +1039,57 @@ mod tests {
             assert!(span <= WINDOW_NS && span > WINDOW_NS - 2 * period as i64);
             assert!((c.period().unwrap() - period).abs() < 1.0);
         }
+    }
+
+    /// TV-timing modes Windows lists in whole hertz, rounded down (Microsoft
+    /// KB 2006076), and a driver that rounds 59.94 up instead: the real rate
+    /// must be taken as the display's, neither refused nor mistaken for
+    /// another display's.
+    #[test]
+    fn whole_hertz_tv_rates_are_accepted() {
+        let cases = [
+            (30000.0 / 1001.0, 29.0),
+            (24000.0 / 1001.0, 23.0),
+            (60000.0 / 1001.0, 59.0),
+            (60000.0 / 1001.0, 60.0),
+            (24.0, 24.0),
+        ];
+        for (real_hz, listed_hz) in cases {
+            let period = 1e9 / real_hz;
+            let mut c = RefreshClock::default();
+            c.set_nominal(Some(1e9 / listed_hz));
+            for n in 0..(real_hz * 3.0) as i64 {
+                c.observe_refresh(n, (period * n as f64) as i64);
+            }
+            let p = c.period().unwrap();
+            let case = format!("{real_hz:.3} Hz listed as {listed_hz}");
+            assert!((p - period).abs() < 1.0, "{case}: period {p}");
+            assert!(!c.is_foreign(), "{case}: taken for another display");
+            assert!(c.is_exact() && c.is_mature(), "{case}");
+        }
+    }
+
+    /// The extra room for slow modes does not let gross errors through.
+    #[test]
+    fn slow_modes_still_catch_gross_errors() {
+        let tv = 1e9 / (24000.0 / 1001.0); // 23.976 Hz, listed as 23
+                                           // A driver losing every other count must not lock the clock at half
+                                           // the rate…
+        let mut c = RefreshClock::default();
+        c.set_nominal(Some(1e9 / 23.0));
+        for k in 0..100i64 {
+            c.observe_refresh(1000 + k, (tv * (2 * k) as f64) as i64);
+        }
+        let p = c.period().unwrap();
+        assert!((p - tv).abs() < tv * 1e-3, "period {p}");
+        // …and a driver counting a 60 Hz display's refreshes is another
+        // display's.
+        let mut c = RefreshClock::default();
+        c.set_nominal(Some(1e9 / 23.0));
+        for n in 0..200i64 {
+            c.observe_refresh(n, (P * n as f64) as i64);
+        }
+        assert!(c.is_foreign());
     }
 
     #[test]

@@ -179,9 +179,12 @@ at a frame boundary. The renderer now works per refresh:
    16.7 to 6.9 ms, and the Director's grid followed to 145 Hz). So every fit
    is checked against the period of the display's mode, read from the window
    system (`render::nominal_period`, refreshed twice a second): one more than
-   3 % away is not believed, the observations are numbered again with the
-   mode's period and fitted again, and failing that only the phase is fitted
-   (whole-hertz mode rates, 59 for 59.94 Hz, are 1.6 % off by themselves).
+   3 % away, and more than 1.05 Hz away, is not believed; the observations
+   are numbered again with the mode's period and fitted again, and failing
+   that only the phase is fitted. The 1.05 Hz is for Windows' whole-hertz
+   mode rates: it lists TV timings rounded down (59 for 59.94 Hz, 29 for
+   29.97, 23 for 23.976; Microsoft KB 2006076), up to 4.2 % off by
+   themselves, more than 3 % below 35 Hz.
    Observations more than a quarter period off the line are dropped first,
    unless more than a quarter of them are (then the numbering is at fault);
    that removes the off-grid report the driver gives when a swap chain's
@@ -191,7 +194,8 @@ at a frame boundary. The renderer now works per refresh:
    the fit used to span let the period wander by ±50 ppm.
 
    When the driver's counter ticks faster than the mode (its lower-quartile
-   time per count more than 3 % short of the mode's period), its reports
+   time per count shorter than the mode's period, by more than both 3 % and
+   1.05 Hz), its reports
    describe another display: on a laptop whose output was composed by the
    desktop compositor, they counted the 165 Hz panel's refreshes for a 60 Hz
    output. The clock then keeps the mode's period, the reports are no longer
