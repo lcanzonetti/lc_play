@@ -38,9 +38,10 @@ use crate::content::{self, Content};
 use crate::frametime::{FrameTimer, Phase};
 use crate::playhead::Playhead;
 use crate::playhead::Position;
-use crate::render::{Capture, Gpu, OutputGpu};
-use crate::show::{Canvas, Output, Playback, Show, Source};
+use crate::render::{Capture, Gpu, OutputGpu, VirtualGpu};
+use crate::show::{Canvas, Output, Playback, Rect, Show, Source};
 use crate::stage;
+use crate::virtuals::{self, overlaps};
 
 /// The cluster time at which a cue starting at `start_s` went on air under
 /// transport `state`, as seen at cluster time `now`.
@@ -124,6 +125,8 @@ pub struct App {
     contents: Vec<Vec<Box<dyn Content>>>,
     /// …and the identity of each, for reuse when the show is edited.
     content_keys: Vec<Vec<String>>,
+    /// Per card, one entry per virtual display, parallel to `show.virtuals`.
+    virtuals: Vec<Vec<VirtualGpu>>,
     /// When output health was last handed to the agent.
     health_at: Instant,
     windows: Vec<RenderWindow>,
@@ -202,6 +205,7 @@ fn empty_show() -> Show {
             background: [0.0, 0.0, 0.0, 1.0],
         },
         outputs: Vec::new(),
+        virtuals: Vec::new(),
         layers: Vec::new(),
         playback: Playback::default(),
     }
@@ -216,6 +220,7 @@ impl App {
             gpus: Vec::new(),
             contents: Vec::new(),
             content_keys: Vec::new(),
+            virtuals: Vec::new(),
             health_at: Instant::now(),
             windows: Vec::new(),
             window_outputs: Vec::new(),
@@ -363,8 +368,11 @@ impl App {
         self.reloads_done = requested;
         tracing::info!("reloading outputs");
         self.timing.note("outputs reloaded");
-        self.contents.clear();
-        self.content_keys.clear();
+        // Per card: the cards stay (`gpus`), so their lists must too —
+        // emptied, not removed, or the rebuild below would index past them.
+        self.contents.iter_mut().for_each(Vec::clear);
+        self.content_keys.iter_mut().for_each(Vec::clear);
+        self.virtuals.iter_mut().for_each(Vec::clear);
         self.windows.clear();
         self.by_id.clear();
         self.window_outputs.clear();
@@ -656,6 +664,7 @@ impl App {
         self.gpus.push(gpu);
         self.contents.push(Vec::new());
         self.content_keys.push(Vec::new());
+        self.virtuals.push(Vec::new());
         // The new card needs the show's contents too.
         self.rebuild_contents_on(self.gpus.len() - 1);
         Ok(self.gpus.len() - 1)
@@ -703,6 +712,27 @@ impl App {
         }
         // Whatever is left in `loaded` is no longer used and is dropped here
         // (for video that also stops its decoder).
+
+        // Virtual displays: keep the picture of one whose id and resolution
+        // did not change (a moved capture area needs nothing on the GPU).
+        let gpu = &self.gpus[g];
+        let layer_count = self.show.layers.len();
+        let mut kept: HashMap<(String, (u32, u32)), VirtualGpu> = self.virtuals[g]
+            .drain(..)
+            .map(|vg| ((vg.id.clone(), vg.size), vg))
+            .collect();
+        self.virtuals[g] = self
+            .show
+            .virtuals
+            .iter()
+            .map(|v| {
+                let mut vg = kept
+                    .remove(&(v.id.clone(), (v.width, v.height)))
+                    .unwrap_or_else(|| gpu.build_virtual(v, layer_count));
+                gpu.set_virtual_layer_count(&mut vg, layer_count);
+                vg
+            })
+            .collect();
     }
 
     /// A transport key was pressed. Honoured only on a stand-alone Runner:
@@ -830,8 +860,28 @@ impl App {
         let (position, grid_offset) = playhead.position_for_display(display_local, was_on_grid);
 
         let times = self.layer_times(&position);
+        // The virtual displays these outputs show: those on air now are
+        // rendered; the content of those on air or about to be is decoded
+        // (so a cue in a virtual display starts on its first frame too).
+        let areas: Vec<Rect> = outs
+            .iter()
+            .map(|&w| self.show.outputs[self.windows[w].output_idx].canvas_rect)
+            .collect();
+        let layers = &self.show.layers;
+        let on_air = |i: usize| times[i].is_some_and(|t| layers[i].timing.visible_at(t));
+        let soon = |i: usize| {
+            times[i].is_some_and(|t| {
+                let timing = &layers[i].timing;
+                timing.visible_at(t) || (0.0..=PREROLL_S).contains(&(timing.start - t))
+            })
+        };
+        let virtual_order = virtuals::plan(&self.show, on_air, &areas);
+        let virtual_areas: Vec<Rect> = virtuals::plan(&self.show, soon, &areas)
+            .into_iter()
+            .map(|v| self.show.virtuals[v].canvas_rect)
+            .collect();
         let updating = Instant::now();
-        let late = self.update_contents(g, &outs, &position, &times);
+        let late = self.update_contents(g, &outs, &virtual_areas, &position, &times);
         self.timing.since(Phase::Update, updating);
         if !late.is_empty() {
             self.timing.note("late decode");
@@ -851,6 +901,8 @@ impl App {
             &times,
             &self.contents[g],
             &self.draw_order,
+            &self.virtuals[g],
+            &virtual_order,
         );
         self.timing.since(Phase::Render, rendering);
         let presenting = Instant::now();
@@ -892,12 +944,14 @@ impl App {
     }
 
     /// Bring card `g`'s contents to `position`. Only layers that fall on one
-    /// of the card's outputs (`outs`) are decoded; the others are idle on
-    /// this card. Returns the outputs on which a video layer was late.
+    /// of the card's outputs (`outs`), or in the area of a virtual display
+    /// they show (`virtual_areas`), are decoded; the others are idle on this
+    /// card. Returns the outputs on which a video layer was late.
     fn update_contents(
         &mut self,
         g: usize,
         outs: &[usize],
+        virtual_areas: &[Rect],
         position: &Position,
         times: &[Option<f64>],
     ) -> Vec<usize> {
@@ -966,7 +1020,7 @@ impl App {
                 .filter(|(_, r)| overlaps(&layer.transform, r))
                 .map(|&(w, _)| w)
                 .collect();
-            if here.is_empty() {
+            if here.is_empty() && !virtual_areas.iter().any(|r| overlaps(&layer.transform, r)) {
                 c.idle();
                 continue;
             }
@@ -1099,15 +1153,6 @@ fn monitor_adapter(window: &Window) -> Option<i64> {
         let _ = window;
         None
     }
-}
-
-/// Whether a layer can touch the canvas area `r`. Conservative: the layer is
-/// taken as a circle around its anchor point as wide as its diagonal, which
-/// covers any rotation and anchor.
-fn overlaps(t: &crate::show::Transform, r: &crate::show::Rect) -> bool {
-    let reach = (t.size[0] * t.scale[0]).hypot(t.size[1] * t.scale[1]);
-    let [x, y] = t.position;
-    x + reach >= r.x && x - reach <= r.x + r.w && y + reach >= r.y && y - reach <= r.y + r.h
 }
 
 /// Build the winit window attributes for one output.

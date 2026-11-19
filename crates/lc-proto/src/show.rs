@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! ShowDocument
-//!  ├─ stage      the canvas (one big pixel space) and the displays cut from it
+//!  ├─ stage      the canvas (one big pixel space), the displays cut from it,
+//!  │             and the virtual displays that capture parts of it as media
 //!  ├─ assets[]   media known to the show, with where to fetch each
 //!  └─ tracks[]   the timeline: each track holds cues placed in time and space
 //! ```
@@ -128,6 +129,9 @@ pub struct Stage {
     /// Colour behind all cues, linear RGBA 0..1.
     pub background: [f32; 4],
     pub displays: Vec<Display>,
+    /// Virtual displays: cameras on the canvas whose picture is not sent to
+    /// any screen but used as the source of cues ([`CueSource::Virtual`]).
+    pub virtuals: Vec<VirtualDisplay>,
 }
 
 impl Default for Stage {
@@ -137,6 +141,7 @@ impl Default for Stage {
             height: 1080.0,
             background: [0.0, 0.0, 0.0, 1.0],
             displays: Vec::new(),
+            virtuals: Vec::new(),
         }
     }
 }
@@ -161,6 +166,49 @@ pub struct Display {
     /// A test pattern shown on this display only, over the content, fitted
     /// to it. `None` = off.
     pub test_pattern: Option<TestPattern>,
+}
+
+/// A virtual display: a rectangle of the canvas rendered — like a display —
+/// into a picture of `width` × `height` pixels, which is then available as
+/// the source of cues instead of going to a screen ("virtual display" in
+/// WATCHOUT). Uses: re-compositing (build a scene once, show it scaled,
+/// rotated or repeated elsewhere), feeding a part of the canvas at an exact
+/// resolution to a cue that maps it onto an LED processor's input, and so on.
+///
+/// What it captures: every cue on air in its rectangle, from every timeline,
+/// over a transparent background (not the stage background), so the
+/// captured picture keeps its alpha. A cue showing a virtual display may
+/// itself be captured by another virtual display. A cue that would show a
+/// virtual display inside that same virtual display's picture (directly, or
+/// through a chain that leads back to it) is left out of that picture:
+/// there is no feedback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VirtualDisplay {
+    pub id: String,
+    pub name: String,
+    /// The part of the canvas it captures.
+    pub canvas_rect: Rect,
+    /// Resolution of the captured picture, in pixels.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for VirtualDisplay {
+    fn default() -> Self {
+        VirtualDisplay {
+            id: String::new(),
+            name: String::new(),
+            canvas_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+            },
+            width: 1920,
+            height: 1080,
+        }
+    }
 }
 
 /// A display test pattern. Its frames follow the cluster clock — not the
@@ -294,6 +342,12 @@ pub enum CueSource {
         #[serde(default = "default_test_fps")]
         fps: f64,
     },
+    /// The live picture of a virtual display ([`Stage::virtuals`]), by id.
+    /// Always live: in point, loop and free run do not apply.
+    Virtual {
+        #[serde(rename = "virtual")]
+        virtual_id: String,
+    },
 }
 
 fn default_test_fps() -> f64 {
@@ -389,6 +443,10 @@ impl ShowDocument {
         self.assets.iter().find(|a| a.id == id)
     }
 
+    pub fn virtual_display(&self, id: &str) -> Option<&VirtualDisplay> {
+        self.stage.virtuals.iter().find(|v| v.id == id)
+    }
+
     /// Check the document for values that cannot be rendered. Returns the
     /// first problem as a message an operator can act on.
     ///
@@ -466,6 +524,36 @@ impl ShowDocument {
                         "{name}: window size must be 1..{MAX_OUTPUT_PIXELS} pixels per side"
                     ));
                 }
+            }
+        }
+
+        let mut virtual_ids = std::collections::HashSet::new();
+        for v in &s.virtuals {
+            let name = format!(
+                "virtual display '{}'",
+                if v.name.is_empty() { &v.id } else { &v.name }
+            );
+            if v.id.is_empty() {
+                return Err(format!("{name}: needs an id"));
+            }
+            if !virtual_ids.insert(v.id.as_str()) {
+                return Err(format!("{name}: duplicate id '{}'", v.id));
+            }
+            let r = &v.canvas_rect;
+            finite(&name, &[r.x as f64, r.y as f64, r.w as f64, r.h as f64])?;
+            if !(r.w > 0.0 && r.h > 0.0) {
+                return Err(format!(
+                    "{name}: canvas rect must have positive width and height"
+                ));
+            }
+            if v.width == 0
+                || v.height == 0
+                || v.width > MAX_OUTPUT_PIXELS
+                || v.height > MAX_OUTPUT_PIXELS
+            {
+                return Err(format!(
+                    "{name}: resolution must be 1..{MAX_OUTPUT_PIXELS} pixels per side"
+                ));
             }
         }
 
@@ -548,6 +636,13 @@ impl ShowDocument {
                             }
                         }
                         CueSource::Color { rgba } => finite(&name, &rgba.map(f64::from))?,
+                        CueSource::Virtual { virtual_id } => {
+                            if self.virtual_display(virtual_id).is_none() {
+                                return Err(format!(
+                                    "{name}: refers to virtual display '{virtual_id}', which is not in the show"
+                                ));
+                            }
+                        }
                         CueSource::SyncTest { fps } => {
                             if !(fps.is_finite() && (1.0..=1000.0).contains(fps)) {
                                 return Err(format!("{name}: test pattern fps must be 1..1000"));
@@ -667,5 +762,54 @@ mod tests {
         assert!(display(&|d| d.window.size = Some([19_200, 1080])).is_err());
         assert!(display(&|d| d.warp_corners = Some(bow_tie)).is_err());
         assert!(display(&|d| d.warp_corners = Some(square)).is_ok());
+    }
+
+    #[test]
+    fn virtual_displays_are_checked_and_cues_may_show_them() {
+        let doc = |virtuals: serde_json::Value, source: serde_json::Value| {
+            serde_json::from_value::<ShowDocument>(serde_json::json!({
+                "stage": { "virtuals": virtuals },
+                "tracks": [ { "cues": [ { "name": "c", "source": source } ] } ]
+            }))
+            .unwrap()
+            .validate()
+        };
+        let v1 = serde_json::json!([
+            { "id": "v1", "name": "Wall", "canvas_rect": { "x": 0, "y": 0, "w": 960, "h": 540 }, "width": 1920, "height": 1080 }
+        ]);
+        let shows_v1 = serde_json::json!({ "type": "virtual", "virtual": "v1" });
+        doc(v1.clone(), shows_v1.clone()).unwrap();
+        // The source as the Producer writes it.
+        let source: CueSource = serde_json::from_value(shows_v1.clone()).unwrap();
+        assert_eq!(
+            source,
+            CueSource::Virtual {
+                virtual_id: "v1".into()
+            }
+        );
+        let err = doc(
+            v1.clone(),
+            serde_json::json!({ "type": "virtual", "virtual": "v9" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("cue 'c'") && err.contains("v9"), "{err}");
+        // Defaults: a 1920×1080 area at a 1920×1080 resolution.
+        assert!(doc(serde_json::json!([{ "id": "v1" }]), shows_v1.clone()).is_ok());
+        for bad in [
+            serde_json::json!([{ "id": "" }]),
+            serde_json::json!([{ "id": "v1" }, { "id": "v1" }]),
+            serde_json::json!([{ "id": "v1", "width": 0 }]),
+            serde_json::json!([{ "id": "v1", "height": 40000 }]),
+            serde_json::json!([{ "id": "v1", "canvas_rect": { "w": 0, "h": 10 } }]),
+        ] {
+            assert!(
+                doc(
+                    bad.clone(),
+                    serde_json::json!({ "type": "color", "rgba": [1, 1, 1, 1] })
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 }

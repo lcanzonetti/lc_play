@@ -91,7 +91,7 @@ once (lc-proto `edit.rs`). An operation is one of
 ```
 
 A path step is a field name, or `{ "id": … }` for the element of a list
-(`tracks`, `cues`, `displays`, `tasks`, `control_cues`, `assets`) with that
+(`tracks`, `cues`, `displays`, `virtuals`, `tasks`, `control_cues`, `assets`) with that
 id. `after: null` inserts or moves to the start; an `after` that no longer
 exists, to the end. The Director applies edits in the order they arrive;
 operations whose target someone else has deleted meanwhile are skipped, and
@@ -277,6 +277,11 @@ broadcasts them back. Other tools may ignore it.
         "rotation_degrees": 0,
         "warp_corners": [[0,0],[1,0],[1,1],[0,1]],
         "blend": { "left": 0, "right": 0.125, "top": 0, "bottom": 0, "gamma": 2.2 } }
+    ],
+    "virtuals": [
+      { "id": "v1", "name": "LED feed",
+        "canvas_rect": { "x": 4000, "y": 0, "w": 960, "h": 540 },
+        "width": 1920, "height": 1080 }
     ]
   },
   "assets": [
@@ -313,7 +318,18 @@ broadcasts them back. Other tools may ignore it.
   `{ "type": "color", "rgba": [r, g, b, a] }` (linear 0..1), or
   `{ "type": "sync_test", "fps": 60 }` — a test pattern drawn by the Runner:
   frame number in digits and 16 binary cells, a marker stepping one place per
-  frame, and a white flash on the first frame of each second.
+  frame, and a white flash on the first frame of each second — or
+  `{ "type": "virtual", "virtual": <id> }`, the live picture of a virtual
+  display (`in_s`, `loop` and `free_run` do not apply).
+* `stage.virtuals` are virtual displays: `canvas_rect` is the area captured,
+  `width` × `height` (1..16384) the resolution it is captured at. Not tied
+  to any Runner: each Runner renders, each frame before its outputs, the
+  ones its outputs show (and those they show in turn). The picture has a
+  transparent background and holds every cue on air in the area, of every
+  timeline; display test patterns are not captured. In a loop (a virtual
+  display shown, directly or through others, inside its own area), one cue
+  of the loop is left out: no feedback, no picture from an earlier frame.
+  Runners older than this field refuse a show with a `virtual` source.
 * The first track is in front.
 * `runner` is a Runner's `--name`; empty means any Runner.
 * A display's `test_pattern` (optional): `{ "kind": "lines" | "counter",

@@ -5,7 +5,7 @@
 //! as a list of [`EditOp`]s. The Director applies them, in the order they
 //! arrive, to the show it holds, and distributes the result to everyone.
 //!
-//! Objects in lists — tracks, cues, displays, tasks, control cues, assets —
+//! Objects in lists — tracks, cues, displays, virtual displays, tasks, control cues, assets —
 //! are addressed by their `id`, never by position, so two people inserting,
 //! deleting or reordering at the same time cannot make each other's edits
 //! land on the wrong object. Conflicts resolve simply:
@@ -343,10 +343,11 @@ fn insertion_point(list: &[Value], after: Option<&str>) -> usize {
 }
 
 /// The lists whose elements are addressed by id.
-pub const KEYED_LISTS: [&str; 6] = [
+pub const KEYED_LISTS: [&str; 7] = [
     "tracks",
     "cues",
     "displays",
+    "virtuals",
     "tasks",
     "control_cues",
     "assets",

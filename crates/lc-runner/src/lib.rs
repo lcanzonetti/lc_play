@@ -14,7 +14,8 @@
 //!   Runner draws, fetching media into a local cache.
 //! * [`app`], [`render`], [`content`], [`video`], [`show`] — the renderer:
 //!   canvas → outputs with warp and edge blend (wgpu + winit); video frames
-//!   from an `ffmpeg` child process.
+//!   from an `ffmpeg` child process. [`virtuals`]: virtual displays, canvas
+//!   areas rendered into pictures that cues show.
 //!
 //! The split is what makes playback resilient: the renderer depends only on
 //! the playhead, never on the network.
@@ -41,4 +42,5 @@ pub mod show;
 pub mod stage;
 pub mod testpattern;
 pub mod video;
+pub mod virtuals;
 pub mod vsync;

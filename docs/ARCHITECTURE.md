@@ -245,8 +245,9 @@ at a frame boundary. The renderer now works per refresh:
    monitor is connected to (matched through DXGI), so Windows never copies a
    picture from one card to another (a frame of latency on that output only,
    and no barrier). Contents are loaded per card, and a card only decodes
-   the layers that fall on its outputs. Laptops whose screens hang off the
-   integrated GPU keep rendering on the discrete one.
+   the layers that fall on its outputs (or in the area of a virtual display
+   they show). Laptops whose screens hang off the integrated GPU keep
+   rendering on the discrete one.
 
 Escape hatches, for a driver that misbehaves: `LCPLAY_SWAPCHAIN=wgpu` (wgpu's
 own presentation, no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0`.
@@ -370,7 +371,7 @@ crates/
   lc-net        control-channel client (WebSocket)
   lc-director   Core (state + command logic) · server (WS/HTTP) · store (persistence)
   lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
-                renderer (app, render, content, video, show)
+                renderer (app, render, content, video, show, virtuals)
   lc-assets     media HTTP server (library, Range streaming, upload, thumbnails,
                 optimisation jobs)
   lc-hap        HAP frames (decode, encode, re-chunk) and QuickTime read/write
@@ -473,7 +474,9 @@ Producer ──load_show──▶ Director ──show──▶ Runner agent ─�
                                               stage::build(document, runner name, asset cache)
                                                               │
                               displays of this Runner ─▶ outputs (windows)
-                              all cues ─▶ layers ─▶ content (image / colour / video)
+                              virtual displays ─▶ virtuals (offscreen pictures)
+                              all cues ─▶ layers ─▶ content (image / colour / video
+                                                            / a virtual's picture)
 ```
 
 The renderer looks at the playhead's document every frame; when its id (or
@@ -564,6 +567,36 @@ and a second decoder is started just before a loop point. Every frame still
 crosses the CPU once, so this path scales with CPU and memory bandwidth, not
 GPU. Because the decoder only runs forward, reverse playback is choppy
 (restarts are limited to four a second).
+
+### Virtual displays
+
+A virtual display (`stage.virtuals`; WATCHOUT has the same idea under the
+same name) is a camera on the canvas whose picture goes not to a screen but
+to the cues whose source is that virtual display. It captures a rectangle of
+the canvas at its own resolution, so a scene can be built once and shown
+scaled, moved, rotated, faded or repeated elsewhere, or a part of the canvas
+fed at an exact resolution to a cue placed on an LED processor's input.
+
+Nothing about it travels over the network. Each Runner renders, per card and
+per frame, the virtual displays that its outputs need (`virtuals.rs`
+`plan`): those shown by a cue on air over one of its outputs, then those
+shown by a cue on air inside *those*, and so on — in that dependency order,
+before the outputs, in the same command buffer. Each is a scene pass like an
+output's, into its own texture, over a transparent background; a layer
+showing it then binds that texture in place of content of its own. Since all
+Runners compute the same frame from the same show and transport, the same
+picture is on every Runner on the same frame — no latency.
+
+A loop (a virtual display shown inside its own area, directly or through
+others) cannot be ordered: the plan is a depth-first walk, and a layer whose
+virtual display has not been rendered yet in this frame is left out. One cue
+of the loop is dropped; there is no feedback effect. Content inside a
+virtual display's area is decoded only while the virtual display is needed
+(or about to be: the same pre-roll as cues on outputs).
+
+Not done: per-virtual output delay, warp or colour correction (WATCHOUT has
+them), a higher-precision picture format (the picture is 8-bit sRGB, like
+the outputs), and 3D positioning.
 
 ### Outputs
 

@@ -168,6 +168,7 @@ h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spac
   padding: 2px 6px; font-size: 11px; white-space: nowrap; cursor: grab;
 }
 .cue.color { background: #5a4a7a; border-color: #8a76b8; }
+.cue.virtual { background: #1f4d3c; border-color: #3ddc97; } /* a cue showing a virtual display */
 .cue.free { background-image: repeating-linear-gradient(135deg, transparent 0 8px, rgba(255,255,255,.08) 8px 16px); }
 .cue.sel { border-color: #fff; box-shadow: 0 0 0 1px #fff inset; }
 /* drag handles on both ends of a cue: trim start / change duration */

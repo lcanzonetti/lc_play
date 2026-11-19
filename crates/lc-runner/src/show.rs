@@ -16,10 +16,24 @@ use serde::Deserialize;
 pub struct Show {
     pub canvas: Canvas,
     pub outputs: Vec<Output>,
+    /// Virtual displays: canvas areas rendered into a picture that layers
+    /// can show ([`Source::Virtual`]); see [`crate::virtuals`].
+    #[serde(default)]
+    pub virtuals: Vec<Virtual>,
     #[serde(default)]
     pub layers: Vec<Layer>,
     #[serde(default)]
     pub playback: Playback,
+}
+
+/// A virtual display: the region of the canvas it captures, and the
+/// resolution of the picture it captures it into.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Virtual {
+    pub id: String,
+    pub canvas_rect: Rect,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,6 +213,8 @@ pub enum Source {
     Video { path: String },
     /// Live input such as a capture card or NDI stream (not implemented).
     Live { kind: String },
+    /// The picture of the virtual display with this id, rendered this frame.
+    Virtual { id: String },
     /// Content that cannot be shown right now — an asset still downloading,
     /// or one the show refers to but does not define. Drawn as a placeholder
     /// so the layout stays readable and the gap is visible.
@@ -316,6 +332,15 @@ impl Default for Playback {
 }
 
 impl Rect {
+    /// Whether the two rectangles share any area (touching edges do not
+    /// count).
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.x + other.w
+            && other.x < self.x + self.w
+            && self.y < other.y + other.h
+            && other.y < self.y + self.h
+    }
+
     /// Orthographic view-projection mapping this canvas rect to clip space,
     /// honoring the canvas y-down convention.
     pub fn view_projection(&self) -> Mat4 {

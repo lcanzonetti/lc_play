@@ -31,7 +31,12 @@
 //!      output automatically);
 //!   2. **warp** → sample the slice through the perspective warp mesh and
 //!      multiply by the edge-blend mask, writing to the window surface.
+//!
+//! Before the outputs, the frame renders the virtual displays they need
+//! (see [`crate::virtuals`]): each is a scene pass like an output's, into its
+//! own picture ([`VirtualGpu`]), which the layers that show it then sample.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -40,7 +45,7 @@ use wgpu::util::DeviceExt as _;
 use winit::window::Window;
 
 use crate::content::{Content, TextureFactory, Uploads};
-use crate::show::{Output, Show};
+use crate::show::{Output, Rect, Show, Source, Virtual};
 use crate::vsync::{PresentTracker, RefreshClock};
 
 /// Offscreen "canvas slice" format. sRGB so shader math stays in linear space.
@@ -596,6 +601,34 @@ impl Gpu {
         }
     }
 
+    /// The GPU side of virtual display `v` on this card: the picture it is
+    /// rendered into (at its resolution, within the card's texture limit)
+    /// and its own per-layer uniforms.
+    pub fn build_virtual(&self, v: &Virtual, layer_count: usize) -> VirtualGpu {
+        let max = self.max_texture_dimension();
+        let (w, h) = (v.width.clamp(1, max), v.height.clamp(1, max));
+        let (tex, view, bind_group) = self.make_scene_target(w, h, false);
+        let (layer_uniforms, layer_uniform_bgs) = self.make_layer_uniforms(layer_count);
+        VirtualGpu {
+            id: v.id.clone(),
+            size: (v.width, v.height),
+            _tex: tex,
+            view,
+            bind_group,
+            layer_uniforms,
+            layer_uniform_bgs,
+        }
+    }
+
+    /// [`set_layer_count`](Self::set_layer_count) for a virtual display.
+    pub fn set_virtual_layer_count(&self, vg: &mut VirtualGpu, layer_count: usize) {
+        if vg.layer_uniforms.len() != layer_count {
+            let (bufs, bgs) = self.make_layer_uniforms(layer_count);
+            vg.layer_uniforms = bufs;
+            vg.layer_uniform_bgs = bgs;
+        }
+    }
+
     fn make_scene_target(
         &self,
         width: u32,
@@ -798,6 +831,7 @@ impl Gpu {
     /// Encode every acquired output and submit once. `times` gives each layer
     /// the time of the timeline it belongs to (`None` = that timeline is off
     /// stage).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         targets: &[(&OutputGpu, &Output, &wgpu::TextureView)],
@@ -805,30 +839,84 @@ impl Gpu {
         times: &[Option<f64>],
         contents: &[Box<dyn Content>],
         draw_order: &[usize],
+        virtuals: &[VirtualGpu],
+        virtual_order: &[usize],
     ) {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
-        for &(out, output, view) in targets {
-            self.encode_output(
-                &mut encoder,
-                view,
-                &out.res,
-                output,
-                show,
-                times,
-                contents,
-                draw_order,
-            );
-        }
+        let targets: Vec<_> = targets
+            .iter()
+            .map(|&(out, output, view)| (&out.res, output, view))
+            .collect();
+        self.encode_frame(
+            &mut encoder,
+            &targets,
+            show,
+            times,
+            contents,
+            draw_order,
+            virtuals,
+            virtual_order,
+        );
         // The frame's texture uploads first, in the same submission.
         self.queue.submit(
             self.take_uploads()
                 .into_iter()
                 .chain(Some(encoder.finish())),
         );
+    }
+
+    /// Record a frame: the virtual displays in `virtual_order` (indices into
+    /// `show.virtuals` and `virtuals`, dependencies first; see
+    /// [`crate::virtuals::plan`]), then every output in `targets`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &[(&OutputResources, &Output, &wgpu::TextureView)],
+        show: &Show,
+        times: &[Option<f64>],
+        contents: &[Box<dyn Content>],
+        draw_order: &[usize],
+        virtuals: &[VirtualGpu],
+        virtual_order: &[usize],
+    ) {
+        // The pictures rendered so far this frame, by virtual display id. A
+        // layer showing a virtual not (yet) in here is left out: that is
+        // how a loop of virtuals is broken (see `crate::virtuals`).
+        let mut ready: HashMap<&str, &wgpu::BindGroup> = HashMap::new();
+        for &v in virtual_order {
+            let (Some(spec), Some(vg)) = (show.virtuals.get(v), virtuals.get(v)) else {
+                continue;
+            };
+            self.encode_scene(
+                encoder,
+                &ScenePass {
+                    view: &vg.view,
+                    uniforms: &vg.layer_uniforms,
+                    uniform_bgs: &vg.layer_uniform_bgs,
+                    area: spec.canvas_rect,
+                    output_id: None,
+                    // Transparent, not the stage colour: the picture keeps
+                    // its alpha wherever it is shown.
+                    clear: wgpu::Color::TRANSPARENT,
+                },
+                show,
+                times,
+                contents,
+                draw_order,
+                &ready,
+            );
+            ready.insert(spec.id.as_str(), &vg.bind_group);
+        }
+        for &(res, output, view) in targets {
+            self.encode_output(
+                encoder, view, res, output, show, times, contents, draw_order, &ready,
+            );
+        }
     }
 
     /// Put a rendered frame on screen. `target` is the refresh it was
@@ -859,6 +947,8 @@ impl Gpu {
         let _ = target;
     }
 
+    /// One output: its canvas slice (scene pass), then warp and blend into
+    /// `frame_view`.
     #[allow(clippy::too_many_arguments)]
     fn encode_output(
         &self,
@@ -870,8 +960,56 @@ impl Gpu {
         times: &[Option<f64>],
         contents: &[Box<dyn Content>],
         draw_order: &[usize],
+        ready: &HashMap<&str, &wgpu::BindGroup>,
     ) {
-        let view_proj = output.canvas_rect.view_projection();
+        // Clear color is premultiplied like everything else in the slice.
+        let [r, g, b, a] = show.canvas.background.map(f64::from);
+        self.encode_scene(
+            encoder,
+            &ScenePass {
+                view: &out.scene_view,
+                uniforms: &out.layer_uniforms,
+                uniform_bgs: &out.layer_uniform_bgs,
+                area: output.canvas_rect,
+                output_id: Some(&output.id),
+                clear: wgpu::Color {
+                    r: r * a,
+                    g: g * a,
+                    b: b * a,
+                    a,
+                },
+            },
+            show,
+            times,
+            contents,
+            draw_order,
+            ready,
+        );
+
+        // --- warp + blend pass ---
+        self.encode_warp(encoder, frame_view, out);
+    }
+
+    /// The scene pass: the layers on air in `pass.area`, back to front, into
+    /// `pass.view` — an output's canvas slice, or a virtual display's
+    /// picture. A layer showing a virtual display samples that display's
+    /// picture from `ready`, and is left out if it is not there.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &ScenePass,
+        show: &Show,
+        times: &[Option<f64>],
+        contents: &[Box<dyn Content>],
+        draw_order: &[usize],
+        ready: &HashMap<&str, &wgpu::BindGroup>,
+    ) {
+        let view_proj = pass.area.view_projection();
+        let picture = |i: usize| match &show.layers[i].source {
+            Source::Virtual { id } => ready.get(id.as_str()).copied(),
+            _ => Some(contents[i].bind_group()),
+        };
         let visible = || {
             draw_order
                 .iter()
@@ -879,17 +1017,19 @@ impl Gpu {
                 // `times[i]` is layer i's own timeline time, `None` while
                 // that timeline is off stage.
                 .filter(|&i| times[i].is_some_and(|t| show.layers[i].timing.visible_at(t)))
-                // A display's test pattern is for that display only.
+                // A display's test pattern is for that display only (and
+                // never in a virtual display).
                 .filter(|&i| {
                     show.layers[i]
                         .only_output
-                        .as_ref()
-                        .is_none_or(|id| *id == output.id)
+                        .as_deref()
+                        .is_none_or(|id| Some(id) == pass.output_id)
                 })
+                .filter_map(|i| picture(i).map(|bg| (i, bg)))
         };
 
-        // Per-layer uniforms for this output (staged; applied at submit).
-        for i in visible() {
+        // Per-layer uniforms for this target (staged; applied at submit).
+        for (i, _) in visible() {
             let t = &show.layers[i].transform;
             let sampling = contents[i].sampling();
             let u = SceneUniform {
@@ -901,44 +1041,31 @@ impl Gpu {
                 param: sampling.param,
             };
             self.queue
-                .write_buffer(&out.layer_uniforms[i], 0, bytemuck::bytes_of(&u));
+                .write_buffer(&pass.uniforms[i], 0, bytemuck::bytes_of(&u));
         }
 
-        // --- scene pass ---
-        {
-            // Clear color is premultiplied like everything else in the slice.
-            let [r, g, b, a] = show.canvas.background.map(f64::from);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &out.scene_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: r * a,
-                            g: g * a,
-                            b: b * a,
-                            a,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.scene_pipeline);
-            pass.set_vertex_buffer(0, self.quad_vbo.slice(..));
-            pass.set_index_buffer(self.quad_ibo.slice(..), wgpu::IndexFormat::Uint16);
-            for i in visible() {
-                pass.set_bind_group(0, &out.layer_uniform_bgs[i], &[]);
-                pass.set_bind_group(1, contents[i].bind_group(), &[]);
-                pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..1);
-            }
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: pass.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(pass.clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(&self.scene_pipeline);
+        rp.set_vertex_buffer(0, self.quad_vbo.slice(..));
+        rp.set_index_buffer(self.quad_ibo.slice(..), wgpu::IndexFormat::Uint16);
+        for (i, bg) in visible() {
+            rp.set_bind_group(0, &pass.uniform_bgs[i], &[]);
+            rp.set_bind_group(1, bg, &[]);
+            rp.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..1);
         }
-
-        // --- warp + blend pass ---
-        self.encode_warp(encoder, frame_view, out);
     }
 
     /// The final pass of an output: its rendered canvas slice, through the
@@ -1364,6 +1491,35 @@ impl OutputGpu {
     }
 }
 
+/// Where a scene pass draws: an output's canvas slice or a virtual
+/// display's picture.
+struct ScenePass<'a> {
+    view: &'a wgpu::TextureView,
+    uniforms: &'a [wgpu::Buffer],
+    uniform_bgs: &'a [wgpu::BindGroup],
+    /// The canvas area it shows.
+    area: Rect,
+    /// The output, for layers meant for one output only; `None` for a
+    /// virtual display.
+    output_id: Option<&'a str>,
+    clear: wgpu::Color,
+}
+
+/// A virtual display on one card (see [`crate::virtuals`]).
+pub struct VirtualGpu {
+    pub id: String,
+    /// The resolution asked for (the texture may be smaller on a card with
+    /// a lower limit). With `id`, what decides whether it can be kept when
+    /// the show changes.
+    pub size: (u32, u32),
+    _tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// The picture as scene-shader group(1), for the layers that show it.
+    bind_group: wgpu::BindGroup,
+    layer_uniforms: Vec<wgpu::Buffer>,
+    layer_uniform_bgs: Vec<wgpu::BindGroup>,
+}
+
 struct OutputResources {
     rotated: bool,
     _scene_tex: wgpu::Texture,
@@ -1491,8 +1647,23 @@ mod tests {
         let view = target.create_view(&Default::default());
         // Every layer at show time 0, as on a single main timeline.
         let times = vec![Some(0.0); show.layers.len()];
-        gpu.encode_output(
-            &mut enc, &view, &res, output, show, &times, contents, &order,
+        // The virtual displays this output needs, as the app plans them.
+        let virtuals: Vec<_> = show
+            .virtuals
+            .iter()
+            .map(|v| gpu.build_virtual(v, show.layers.len()))
+            .collect();
+        let live = |i: usize| show.layers[i].timing.visible_at(0.0);
+        let plan = crate::virtuals::plan(show, live, &[output.canvas_rect]);
+        gpu.encode_frame(
+            &mut enc,
+            &[(&res, output, &view)],
+            show,
+            &times,
+            contents,
+            &order,
+            &virtuals,
+            &plan,
         );
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -1763,6 +1934,65 @@ mod tests {
         }
         // A real ramp, not a hard cut.
         assert!((0.2..0.8).contains(&a[row + 112][0]));
+    }
+
+    /// A show with one 64×64 output at the canvas origin over a blue stage,
+    /// virtual display `v` capturing canvas x 1000..1064 at 32×32, and
+    /// `layers` (JSON).
+    fn virtual_show(layers: serde_json::Value) -> Show {
+        let json = serde_json::json!({
+            "canvas": { "width": 64, "height": 64, "background": [0, 0, 1, 1] },
+            "outputs": [ { "id": "o", "canvas_rect": { "x": 0, "y": 0, "w": 64, "h": 64 } } ],
+            "virtuals": [ { "id": "v", "canvas_rect": { "x": 1000, "y": 0, "w": 64, "h": 64 },
+                            "width": 32, "height": 32 } ],
+            "layers": layers
+        });
+        Show::from_json(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn a_virtual_display_shows_its_canvas_area_where_a_cue_puts_it() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        // Red over the left half of v's area; a cue showing v covers the
+        // whole output. Seen on the output: red on the left, and on the
+        // right the stage's blue through v's transparent picture.
+        let show = virtual_show(serde_json::json!([
+            { "id": "red", "source": { "type": "color", "rgba": [1, 0, 0, 1] },
+              "transform": { "position": [1016, 32], "size": [32, 64] } },
+            { "id": "shows-v", "source": { "type": "virtual", "id": "v" },
+              "transform": { "position": [32, 32], "size": [64, 64] } }
+        ]));
+        let px = render_offscreen(&gpu, &show, 0, 64, 64);
+        let (left, right) = (px[32 * 64 + 10], px[32 * 64 + 54]);
+        assert!(
+            left[0] > 0.99 && left[1] < 0.01 && left[2] < 0.01,
+            "left: {left:?}"
+        );
+        assert!(right[0] < 0.01 && right[2] > 0.99, "right: {right:?}");
+    }
+
+    #[test]
+    fn virtual_displays_chain_and_loops_are_cut() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        // v shows itself (a cue in its own area) and a green square; the
+        // output shows v. The loop is cut — no feedback, and no GPU
+        // validation error from sampling the picture being rendered — and
+        // the green arrives.
+        let show = virtual_show(serde_json::json!([
+            { "id": "green", "source": { "type": "color", "rgba": [0, 1, 0, 1] },
+              "transform": { "position": [1016, 16], "size": [32, 32] } },
+            { "id": "loop", "source": { "type": "virtual", "id": "v" },
+              "transform": { "position": [1032, 32], "size": [64, 64] } },
+            { "id": "shows-v", "source": { "type": "virtual", "id": "v" },
+              "transform": { "position": [32, 32], "size": [64, 64] } }
+        ]));
+        let px = render_offscreen(&gpu, &show, 0, 64, 64);
+        let (green, rest) = (px[16 * 64 + 16], px[48 * 64 + 48]);
+        assert!(green[1] > 0.99 && green[0] < 0.01, "green: {green:?}");
+        assert!(
+            rest[2] > 0.99 && rest[1] < 0.01,
+            "stage shows through: {rest:?}"
+        );
     }
 
     #[test]

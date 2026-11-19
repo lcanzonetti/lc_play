@@ -101,7 +101,7 @@ const S = {
   deferredShow: false,  // a show arrived during a drag: apply it when the drag ends
   user: loadUser(),     // { name, color }: who this is, for the other users
   others: new Map(),    // node id → presence of the other Producers' users
-  sel: null,            // { type: 'cue'|'display'|'control'|'track'|'task', id }; several
+  sel: null,            // { type: 'cue'|'display'|'virtual'|'control'|'track'|'task', id }; several
                         // cues: { type: 'cue', id, ids } (id = the one clicked last, also in ids)
   tl: MAIN,             // the timeline open in the Timeline window
   transports: {},       // timeline id → transport states known, oldest first (≤ 2)
@@ -151,6 +151,15 @@ function normalize(doc) {
   st.width ??= 1920; st.height ??= 1080;
   st.background ??= [0, 0, 0, 1];
   st.displays ??= [];
+  // Virtual displays: canvas areas captured at a resolution, shown by cues
+  // whose source is { type: 'virtual', virtual: id } (see lc-proto show.rs).
+  st.virtuals ??= [];
+  for (const v of st.virtuals) {
+    v.id ||= uid();
+    v.name ??= '';
+    v.canvas_rect = Object.assign({ x: 0, y: 0, w: 1920, h: 1080 }, v.canvas_rect);
+    v.width ??= 1920; v.height ??= 1080;
+  }
   for (const d of st.displays) {
     d.id ||= uid();
     d.name ??= ''; d.runner ??= '';
@@ -220,6 +229,10 @@ function findControl(id) {
   return null;
 }
 const findDisplay = (id) => S.doc.stage.displays.find((d) => d.id === id) || null;
+const findVirtual = (id) => S.doc.stage.virtuals.find((v) => v.id === id) || null;
+/** Every cue (of every timeline) that shows virtual display `id`. */
+const cuesShowing = (id) => tlIds().flatMap((tl) => tlObj(tl).tracks.flatMap((t) => t.cues))
+  .filter((c) => c.source.type === 'virtual' && c.source.virtual === id);
 const assetOf = (cue) => (cue.source.type === 'asset' ? S.doc.assets.find((a) => a.id === cue.source.asset) : null);
 /** Ids of the selected cues: none, one, or several (box selection or
  *  Shift/Ctrl-click in the timeline). */
@@ -243,7 +256,7 @@ function cueSelection(ids, primary) {
 function selectionExists() {
   if (!S.sel) return true;
   const { type, id } = S.sel;
-  return !!({ cue: findCue, display: findDisplay, control: findControl, track: findTrack, task: (i) => tlObj(i) }[type]?.(id));
+  return !!({ cue: findCue, display: findDisplay, virtual: findVirtual, control: findControl, track: findTrack, task: (i) => tlObj(i) }[type]?.(id));
 }
 /** Drop from the selection what no longer exists (deleted here, by undo, or
  *  by another user): a multiple cue selection keeps the cues that are left. */
@@ -437,7 +450,7 @@ function markOthers() {
 // are still on their way applied on top.
 
 /** Lists whose elements are addressed by id (as in edit.rs). */
-const KEYED = new Set(['tracks', 'cues', 'displays', 'tasks', 'control_cues', 'assets']);
+const KEYED = new Set(['tracks', 'cues', 'displays', 'virtuals', 'tasks', 'control_cues', 'assets']);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const keyedList = (list) => list.every((e) => isObj(e) && typeof e.id === 'string' && e.id);
@@ -887,6 +900,10 @@ async function deleteSelection() {
   const cueIds = selCueIds();
   // A whole timeline is too much to lose to a stray Delete key.
   if (type === 'task' && !(await ask(`Delete the task "${tlName(id)}" with everything on it?`))) return;
+  // A cue cannot show a virtual display that is gone (the Director would
+  // refuse the show): its cues go with it, after asking.
+  const showing = type === 'virtual' ? cuesShowing(id).length : 0;
+  if (showing && !(await ask(`${showing} cue${showing > 1 ? 's show' : ' shows'} this virtual display. Delete ${showing > 1 ? 'them' : 'it'} too?`))) return;
   edit(() => {
     if (type === 'cue') for (const cid of cueIds) { const hit = findCue(cid); if (hit) hit.track.cues.splice(hit.ci, 1); }
     else if (type === 'control') { const hit = findControl(id); if (hit) hit.list.splice(hit.i, 1); }
@@ -898,6 +915,10 @@ async function deleteSelection() {
       for (const tl of tlIds()) { const o = tlObj(tl); o.control_cues = o.control_cues.filter((cc) => cc.target !== id); }
     }
     else if (type === 'display') S.doc.stage.displays = S.doc.stage.displays.filter((d) => d.id !== id);
+    else if (type === 'virtual') {
+      for (const tl of tlIds()) for (const t of tlObj(tl).tracks) t.cues = t.cues.filter((c) => !(c.source.type === 'virtual' && c.source.virtual === id));
+      S.doc.stage.virtuals = S.doc.stage.virtuals.filter((v) => v.id !== id);
+    }
     S.sel = null;
   });
 }
@@ -959,6 +980,25 @@ function addAssetCue(item, tl, ti, t) {
   // Upsert before the cue is added: validation requires the asset to exist.
   S.doc.assets = S.doc.assets.filter((a) => a.id !== item.id).concat(entry);
   addCue(cue, tl, ti, t);
+}
+
+/** A cue showing virtual display `v`, at the open timeline's playhead, on
+ *  track `ti` (the top one by default): at the virtual display's resolution
+ *  (as in WATCHOUT), made smaller only if it would not fit the displays. */
+function addVirtualCue(v, tl = S.tl, ti = 0, t = showSeconds(tl)) {
+  addCue({ name: v.name || 'Virtual', source: { type: 'virtual', virtual: v.id }, duration_s: 10, ...fitRect(v.width, v.height, false) }, tl, ti, t);
+}
+
+/** A new virtual display: over the first display's area (or the canvas
+ *  origin), at that area's size in pixels. */
+function addVirtual() {
+  const st = S.doc.stage, n = st.virtuals.length + 1;
+  const r = st.displays[0]?.canvas_rect || { x: 0, y: 0, w: 1920, h: 1080 };
+  edit(() => {
+    const v = { id: uid(), name: `Virtual ${n}`, canvas_rect: { ...r }, width: Math.round(r.w), height: Math.round(r.h) };
+    st.virtuals.push(v);
+    S.sel = { type: 'virtual', id: v.id };
+  });
 }
 
 function addTask() {
@@ -1347,19 +1387,19 @@ function cuePicture(cue, track, t, tl, onAir) {
 
 /** The stage's sketch of a sync test pattern (the Runners draw the real
  *  one): its frame number at timeline time `t`, as the Runner computes it. */
-function drawSyncTest(cue, t) {
+function drawSyncTest(g, cue, t) {
   const fps = cue.source.fps || 60;
   const frame = Math.floor(Math.max(0, cue.in_s + t - cue.start_s) * fps + 1e-6);
   const flash = frame % Math.max(1, Math.round(fps)) === 0;
-  ctx.fillStyle = flash ? '#fff' : '#000';
-  ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
-  ctx.fillStyle = flash ? '#000' : '#fff';
-  ctx.font = `bold ${Math.max(8, cue.h / 4)}px ui-monospace, monospace`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(String(frame), 0, 0);
-  ctx.font = `${Math.max(6, cue.h / 14)}px system-ui, sans-serif`;
-  ctx.fillText('SYNC TEST', 0, -cue.h / 3);
+  g.fillStyle = flash ? '#fff' : '#000';
+  g.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+  g.fillStyle = flash ? '#000' : '#fff';
+  g.font = `bold ${Math.max(8, cue.h / 4)}px ui-monospace, monospace`;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(String(frame), 0, 0);
+  g.font = `${Math.max(6, cue.h / 14)}px system-ui, sans-serif`;
+  g.fillText('SYNC TEST', 0, -cue.h / 3);
 }
 
 /** When a cue starting at `startS` went on air under transport `tr`, at
@@ -1388,7 +1428,7 @@ function onAirSince(tr, startS, now) {
 const stage = $('#stage');
 const ctx = stage.getContext('2d');
 let view = { k: 1, ox: 0, oy: 0 };  // canvas px → screen px: s = c·k + o
-let displayTabs = [];               // screen rects of display name tabs, for hit-testing
+let displayTabs = [];               // screen rects of display (and virtual display) name tabs, for hit-testing
 let drag = null;                    // the stage drag in progress
 const HANDLE = 5;                   // half-size of a resize handle, screen px
 
@@ -1437,56 +1477,8 @@ function drawStage() {
   ctx.translate(view.ox, view.oy);
   ctx.scale(k, k);
 
-  // Back to front: the main timeline first, then the tasks (the first task
-  // is front-most); within a timeline the last track is at the back.
-  const sel = selectedCue(), sels = new Set(selectedCues());
-  for (const tl of tlIds().reverse()) {
-    const t = showSeconds(tl), active = isActive(tl);
-    for (const track of [...tlObj(tl).tracks].reverse()) {
-      for (const cue of track.cues) {
-        const onAir = active && t >= cue.start_s && t < cue.start_s + cue.duration_s;
-        // Selected cues are always shown (ghosted when not on air), so they
-        // can be positioned without scrubbing to them first.
-        if (!onAir) S.onsets.delete(cue.id); // on air again later: afresh
-        const others = othersOn('cue', cue.id);
-        if (!onAir && !sels.has(cue) && !others.length) continue;
-        const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
-                   * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
-        ctx.save();
-        ctx.translate(cue.x + cue.w / 2, cue.y + cue.h / 2);
-        ctx.rotate((cue.rotation * Math.PI) / 180);
-        ctx.globalAlpha = onAir ? cue.opacity * fade : 0.3;
-        const picture = cue.source.type === 'asset' ? cuePicture(cue, track, onAir ? t : cue.start_s, tl, onAir) : null;
-        if (picture) ctx.drawImage(picture, -cue.w / 2, -cue.h / 2, cue.w, cue.h);
-        else if (cue.source.type === 'sync_test') drawSyncTest(cue, onAir ? t : cue.start_s);
-        else {
-          ctx.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
-          ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
-        }
-        if (sels.has(cue)) {
-          ctx.globalAlpha = 1;
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 2 / k;
-          ctx.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
-        }
-        // Another user's selection: their colour, their name; dashed while
-        // they are dragging it.
-        others.forEach((o, i) => {
-          ctx.globalAlpha = 1;
-          ctx.strokeStyle = o.color;
-          ctx.lineWidth = 2 / k;
-          ctx.setLineDash(o.dragging ? [6 / k, 4 / k] : []);
-          const pad = (3 + 3 * i) / k;
-          ctx.strokeRect(-cue.w / 2 - pad, -cue.h / 2 - pad, cue.w + 2 * pad, cue.h + 2 * pad);
-          ctx.setLineDash([]);
-          ctx.font = `${12 / k}px system-ui, sans-serif`;
-          ctx.fillStyle = o.color;
-          ctx.fillText(o.name, -cue.w / 2, -cue.h / 2 - pad - 4 / k - i * 14 / k);
-        });
-        ctx.restore();
-      }
-    }
-  }
+  virtualPictures.clear(); // drawn afresh this frame, when first needed
+  drawCues(ctx, k);
   ctx.restore();
 
   // Displays: outlines and name tabs, drawn in screen space so line widths
@@ -1521,12 +1513,144 @@ function drawStage() {
     });
   }
 
+  // Virtual displays: dashed green outlines, with a tab (name, resolution)
+  // to select and move them by, like a display's.
+  for (const v of st.virtuals) {
+    const r = v.canvas_rect;
+    const x = view.ox + r.x * k, y = view.oy + r.y * k;
+    const selected = S.sel?.type === 'virtual' && S.sel.id === v.id;
+    const colour = selected ? '#fff' : '#3ddc97';
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = selected ? 2 : 1;
+    ctx.setLineDash([3, 3]);
+    ctx.strokeRect(x + 0.5, y + 0.5, r.w * k, r.h * k);
+    ctx.setLineDash([]);
+    const label = `⧉ ${v.name || 'virtual'} · ${v.width}×${v.height}`;
+    const tw = ctx.measureText(label).width + 10;
+    ctx.fillStyle = colour;
+    ctx.fillRect(x, y + r.h * k, tw, 16); // below the area: a display's tab may be above it
+    ctx.fillStyle = '#06121f';
+    ctx.fillText(label, x + 5, y + r.h * k + 12);
+    displayTabs.push({ id: v.id, kind: 'virtual', x, y: y + r.h * k, w: tw, h: 16 });
+    othersOn('virtual', v.id).forEach((o, i) => {
+      const pad = 3 + 3 * i;
+      ctx.strokeStyle = o.color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x - pad, y - pad, r.w * k + 2 * pad, r.h * k + 2 * pad);
+    });
+  }
+
   // Resize handles of the selected cue (only unrotated: resizing a rotated
   // box by its corners needs more maths than a first version deserves).
+  const sel = selectedCue();
   if (sel && !sel.rotation) {
     ctx.fillStyle = '#fff';
     for (const [hx, hy] of cueCorners(sel)) ctx.fillRect(hx - HANDLE, hy - HANDLE, HANDLE * 2, HANDLE * 2);
   }
+}
+
+/** Draw the cues of every timeline, back to front, on `g`, which is set up
+ *  in canvas coordinates (`k` screen px per canvas px). The main timeline
+ *  first, then the tasks (the first task is front-most); within a timeline
+ *  the last track is at the back.
+ *
+ *  On the stage (`visiting` null) selected cues are also shown when off
+ *  air, and selections are outlined. Into a virtual display's picture
+ *  (`visiting`: the virtual displays being drawn, innermost last), only the
+ *  cues on air in its `area`, as a Runner draws them. */
+function drawCues(g, k, { area = null, visiting = null } = {}) {
+  const onStage = !visiting;
+  const sels = new Set(onStage ? selectedCues() : []);
+  for (const tl of tlIds().reverse()) {
+    const t = showSeconds(tl), active = isActive(tl);
+    for (const track of [...tlObj(tl).tracks].reverse()) {
+      for (const cue of track.cues) {
+        const onAir = active && t >= cue.start_s && t < cue.start_s + cue.duration_s;
+        // Selected cues are always shown (ghosted when not on air), so they
+        // can be positioned without scrubbing to them first.
+        if (onStage && !onAir) S.onsets.delete(cue.id); // on air again later: afresh
+        const others = onStage ? othersOn('cue', cue.id) : [];
+        if (!onAir && !sels.has(cue) && !others.length) continue;
+        if (area && !cueReaches(cue, area)) continue;
+        // In a virtual display's picture, a cue showing a virtual display
+        // being drawn is left out (a loop; the Runners do the same).
+        const picture = cue.source.type === 'asset' ? cuePicture(cue, track, onAir ? t : cue.start_s, tl, onAir)
+          : cue.source.type === 'virtual' ? virtualPicture(cue.source.virtual, visiting) : null;
+        if (!onStage && cue.source.type === 'virtual' && !picture) continue;
+        const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
+                   * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
+        g.save();
+        g.translate(cue.x + cue.w / 2, cue.y + cue.h / 2);
+        g.rotate((cue.rotation * Math.PI) / 180);
+        g.globalAlpha = onAir ? cue.opacity * fade : 0.3;
+        if (picture) g.drawImage(picture, -cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        else if (cue.source.type === 'sync_test') drawSyncTest(g, cue, onAir ? t : cue.start_s);
+        else {
+          g.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
+          g.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        }
+        if (sels.has(cue)) {
+          g.globalAlpha = 1;
+          g.strokeStyle = '#fff';
+          g.lineWidth = 2 / k;
+          g.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
+        }
+        // Another user's selection: their colour, their name; dashed while
+        // they are dragging it.
+        others.forEach((o, i) => {
+          g.globalAlpha = 1;
+          g.strokeStyle = o.color;
+          g.lineWidth = 2 / k;
+          g.setLineDash(o.dragging ? [6 / k, 4 / k] : []);
+          const pad = (3 + 3 * i) / k;
+          g.strokeRect(-cue.w / 2 - pad, -cue.h / 2 - pad, cue.w + 2 * pad, cue.h + 2 * pad);
+          g.setLineDash([]);
+          g.font = `${12 / k}px system-ui, sans-serif`;
+          g.fillStyle = o.color;
+          g.fillText(o.name, -cue.w / 2, -cue.h / 2 - pad - 4 / k - i * 14 / k);
+        });
+        g.restore();
+      }
+    }
+  }
+}
+
+/** Whether a cue may cover part of rect `r` (taken as a circle as wide as
+ *  its diagonal around its centre, which covers any rotation — the Runner's
+ *  rule too). */
+function cueReaches(c, r) {
+  const reach = Math.hypot(c.w, c.h), cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+  return cx + reach >= r.x && cx - reach <= r.x + r.w && cy + reach >= r.y && cy - reach <= r.y + r.h;
+}
+
+// Virtual displays in the stage preview: each is drawn, when a cue on the
+// stage first needs it in a frame, into a canvas of its own (at most
+// VIRTUAL_PREVIEW px wide or high: a sketch, the Runners render the real
+// picture at its resolution), transparent where nothing is on air.
+const VIRTUAL_PREVIEW = 640;
+const virtualCanvases = new Map(); // virtual id → <canvas>, reused
+const virtualPictures = new Map(); // virtual id → <canvas> drawn this frame
+
+/** The picture of virtual display `id` this frame, or null if it is one of
+ *  those being drawn (`visiting`): a loop. */
+function virtualPicture(id, visiting) {
+  if (visiting?.includes(id)) return null;
+  if (virtualPictures.has(id)) return virtualPictures.get(id);
+  const v = findVirtual(id);
+  if (!v) return null;
+  const scale = Math.min(1, VIRTUAL_PREVIEW / v.width, VIRTUAL_PREVIEW / v.height);
+  const w = Math.max(1, Math.round(v.width * scale)), h = Math.max(1, Math.round(v.height * scale));
+  let c = virtualCanvases.get(id);
+  if (!c) { c = document.createElement('canvas'); virtualCanvases.set(id, c); }
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const g = c.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const r = v.canvas_rect, kx = w / r.w, ky = h / r.h;
+  g.setTransform(kx, 0, 0, ky, -r.x * kx, -r.y * ky);
+  drawCues(g, Math.min(kx, ky), { area: r, visiting: [...(visiting || []), id] });
+  virtualPictures.set(id, c);
+  return c;
 }
 
 /** Screen positions of a cue's corners: TL, TR, BR, BL. */
@@ -1568,8 +1692,9 @@ stage.addEventListener('mousedown', (e) => {
   //    clicking inside one still reaches the cues it shows.)
   const tab = displayTabs.find((t) => sx >= t.x && sx <= t.x + t.w && sy >= t.y && sy <= t.y + t.h);
   if (tab) {
-    const d = findDisplay(tab.id);
-    select({ type: 'display', id: d.id });
+    // A display or a virtual display: both are moved by their canvas_rect.
+    const d = tab.kind === 'virtual' ? findVirtual(tab.id) : findDisplay(tab.id);
+    select({ type: tab.kind === 'virtual' ? 'virtual' : 'display', id: d.id });
     drag = { ...start, kind: 'display', target: d, orig: { ...d.canvas_rect } };
     return;
   }
@@ -1750,8 +1875,11 @@ function renderTimeline() {
       ondrop: (e) => {
         e.preventDefault();
         lane.classList.remove('drop');
+        const at = (e.clientX - lane.getBoundingClientRect().left) / pps;
         const item = S.library?.find((i) => i.id === e.dataTransfer.getData('text/lcplay-asset'));
-        if (item) addAssetCue(item, S.tl, ti, (e.clientX - lane.getBoundingClientRect().left) / pps);
+        if (item) addAssetCue(item, S.tl, ti, at);
+        const v = findVirtual(e.dataTransfer.getData('text/lcplay-virtual'));
+        if (v) addVirtualCue(v, S.tl, ti, at);
       },
     });
     for (const cue of track.cues) {
@@ -1759,7 +1887,8 @@ function renderTimeline() {
       lane.append(el('div', {
         class: `cue ${cue.source.type}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
-      }, cue.name || ({ color: 'colour', sync_test: 'sync test' }[cue.source.type] || 'cue'),
+      }, cue.name || (cue.source.type === 'virtual' ? findVirtual(cue.source.virtual)?.name : null)
+        || ({ color: 'colour', sync_test: 'sync test', virtual: 'virtual' }[cue.source.type] || 'cue'),
         el('div', { class: 'h l' }), el('div', { class: 'h r' })));
     }
     const selected = S.sel?.type === 'track' && S.sel.id === track.id;
@@ -2607,15 +2736,24 @@ function renderInspector() {
       field('Opacity (%)', c, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
     );
     if (c.source.type === 'color') box.append(colorField('Colour', c.source, 'rgba'));
+    if (c.source.type === 'virtual') {
+      box.append(
+        el('h4', {}, 'Source'),
+        choice('Virtual display', c.source, 'virtual', S.doc.stage.virtuals.map((v) => [v.id, v.name || v.id])),
+        note('Live: what the virtual display captures, on this frame. In point, loop and free run do not apply.'));
+    }
     if (c.source.type === 'sync_test') {
       box.append(
         field('Frame rate', c.source, 'fps', { min: 1 }),
         note('Drawn by each Runner: the frame number (digits and binary blocks), a marker stepping one place per frame, and a white flash on the first frame of every second. Film two outputs, or two machines, with a fast camera: any difference in the numbers is the offset in frames. Use the displays\' refresh rate as frame rate.'));
     }
-    const mw = asset?.width || extent().w, mh = asset?.height || extent().h;
+    // A picture's own size: the asset's, or the virtual display's resolution.
+    const vd = c.source.type === 'virtual' ? findVirtual(c.source.virtual) : null;
+    const own = asset?.width ? [asset.width, asset.height] : vd ? [vd.width, vd.height] : null;
+    const mw = own?.[0] || extent().w, mh = own?.[1] || extent().h;
     box.append(el('div', { class: 'btns' },
       el('button', { onclick: () => edit(() => Object.assign(c, fitRect(mw, mh, true))) }, 'Fit to stage'),
-      asset?.width ? el('button', { onclick: () => edit(() => Object.assign(c, { w: asset.width, h: asset.height })) }, 'Original size') : null,
+      own ? el('button', { onclick: () => edit(() => Object.assign(c, { w: own[0], h: own[1] })) }, 'Original size') : null,
       el('button', { onclick: () => seek(c.start_s, findCue(c.id).tl) }, 'Go to cue'),
       el('button', { class: 'danger', onclick: deleteSelection }, 'Delete')));
     return;
@@ -2656,6 +2794,26 @@ function renderInspector() {
       field('Length (s)', task, 'duration_s', { min: 1 }),
       note(`An auxiliary timeline with its own transport. It is off stage until played, and is drawn in front of the main timeline. Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
       deleteButton('Delete task'));
+    return;
+  }
+
+  if (type === 'virtual') {
+    const v = findVirtual(S.sel.id), shownBy = cuesShowing(v.id).length;
+    const px = { min: 1, set: (n) => clamp(Math.round(n), 1, 16384) };
+    box.append(
+      el('h3', {}, 'Virtual display'),
+      field('Name', v, 'name', { type: 'text' }),
+      note('A camera on the canvas: what is on air in its area, rendered at its resolution into a picture that cues can show — scaled, moved, rotated, faded, on any display or inside another virtual display. Not sent to any screen itself.'),
+      el('h4', {}, 'Area of the canvas it captures'),
+      pair('X / Y', v.canvas_rect, 'x', 'y'),
+      pair('W / H', v.canvas_rect, 'w', 'h', { min: 1 }),
+      el('h4', {}, 'Resolution (pixels)'),
+      pair('W / H', v, 'width', 'height', px),
+      el('div', { class: 'btns' },
+        el('button', { title: 'One pixel of the picture per canvas pixel', onclick: () => edit(() => { v.width = clamp(Math.round(v.canvas_rect.w), 1, 16384); v.height = clamp(Math.round(v.canvas_rect.h), 1, 16384); }) }, 'Resolution = area'),
+        el('button', { title: 'A cue showing this virtual display, at the playhead of the open timeline (or drag it from the Show inspector onto a track)', onclick: () => addVirtualCue(v) }, '+ Cue showing it')),
+      note(`Shown by ${shownBy} cue${shownBy === 1 ? '' : 's'}. It captures over a transparent background, so a cue showing it keeps what is behind it wherever nothing is on air. A cue that would show it inside its own picture (directly or through other virtual displays) is left out of that picture: no feedback.`),
+      deleteButton('Delete virtual display'));
     return;
   }
 
@@ -2706,6 +2864,18 @@ function renderInspector() {
   box.append(el('div', { class: 'btns' },
     el('button', { onclick: () => addDisplay(''), title: 'A new display, to the right of the others' }, '+ Display'),
     el('button', { onclick: arrangeSideBySide, title: 'Line the displays up left to right (content stays where it is on the canvas)' }, 'Side by side')));
+  box.append(el('h4', {}, 'Virtual displays'));
+  for (const v of st.virtuals) {
+    box.append(el('div', {
+      class: 'list-item', draggable: 'true', title: 'Click to edit; drag onto a track for a cue showing it',
+      onclick: () => select({ type: 'virtual', id: v.id }),
+      ondragstart: (e) => e.dataTransfer.setData('text/lcplay-virtual', v.id),
+    },
+    el('span', {}, `⧉ ${v.name || 'virtual'}`),
+    el('span', { class: 'dim' }, `${v.width}×${v.height}`)));
+  }
+  box.append(el('div', { class: 'btns' },
+    el('button', { onclick: addVirtual, title: 'A camera on part of the canvas whose picture cues can show' }, '+ Virtual display')));
 }
 
 // ───────────────────────────── top bar ─────────────────────────────

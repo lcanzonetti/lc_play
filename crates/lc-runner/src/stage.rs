@@ -11,7 +11,8 @@
 //!   over this Runner's displays: the renderer clips, and a cue may be moved
 //!   onto this Runner's part of the canvas at any moment;
 //! * asset references become local file paths via the [`AssetCache`], or a
-//!   placeholder while the file is still on its way.
+//!   placeholder while the file is still on its way;
+//! * every virtual display is kept (any cue on any display may show one).
 
 use std::sync::Arc;
 
@@ -19,8 +20,8 @@ use lc_proto::show::{AssetKind, CueSource, ShowDocument, TestPatternKind};
 
 use crate::assets::AssetCache;
 use crate::show::{
-    Blend, Canvas, Layer, Output, Playback, Rect, Show, Source, Timing, Transform, Warp,
-    WindowPlacement,
+    Blend, Canvas, Layer, Output, Playback, Rect, Show, Source, Timing, Transform, Virtual, Warp,
+    WindowPlacement, MAX_OUTPUT_PIXELS,
 };
 
 pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) -> Show {
@@ -73,6 +74,37 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
         })
         .collect();
 
+    // Virtual displays: the same checks, for the same reason.
+    let virtuals: Vec<Virtual> = doc
+        .stage
+        .virtuals
+        .iter()
+        .filter(|v| {
+            let r = v.canvas_rect;
+            let ok = !v.id.is_empty()
+                && [r.x, r.y, r.w, r.h].iter().all(|n| n.is_finite())
+                && r.w > 0.0
+                && r.h > 0.0
+                && (1..=MAX_OUTPUT_PIXELS).contains(&v.width)
+                && (1..=MAX_OUTPUT_PIXELS).contains(&v.height);
+            if !ok {
+                tracing::error!("ignoring virtual display '{}': invalid geometry", v.id);
+            }
+            ok
+        })
+        .map(|v| Virtual {
+            id: v.id.clone(),
+            canvas_rect: Rect {
+                x: v.canvas_rect.x,
+                y: v.canvas_rect.y,
+                w: v.canvas_rect.w,
+                h: v.canvas_rect.h,
+            },
+            width: v.width,
+            height: v.height,
+        })
+        .collect();
+
     // Every timeline contributes layers: the main one, then each task. A
     // task's layers carry its id, so the renderer evaluates them against
     // that task's own transport (and skips them while it is off stage).
@@ -95,6 +127,19 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
                 let source = match &cue.source {
                     CueSource::Color { rgba } => Source::Color { rgba: *rgba },
                     CueSource::SyncTest { fps } => Source::SyncTest { fps: *fps },
+                    CueSource::Virtual { virtual_id } => {
+                        if virtuals.iter().any(|v| v.id == *virtual_id) {
+                            Source::Virtual {
+                                id: virtual_id.clone(),
+                            }
+                        } else {
+                            Source::Missing {
+                                reason: format!(
+                                    "virtual display '{virtual_id}' is not in the show"
+                                ),
+                            }
+                        }
+                    }
                     CueSource::Asset { asset } => match doc.asset(asset) {
                         None => Source::Missing {
                             reason: format!("asset '{asset}' is not in the show"),
@@ -189,6 +234,7 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
             background: doc.stage.background,
         },
         outputs,
+        virtuals,
         layers,
         // Unused under a Director: the transport comes from the cluster.
         playback: Playback::default(),
@@ -311,5 +357,31 @@ mod tests {
         assert!(
             matches!(&show.layers[2].source, Source::Missing { reason } if reason.contains("not in the show"))
         );
+    }
+
+    #[test]
+    fn virtual_displays_reach_every_runner_with_the_cues_that_show_them() {
+        let d: ShowDocument = serde_json::from_value(serde_json::json!({
+            "stage": { "virtuals": [
+                { "id": "v", "canvas_rect": { "x": 5000, "y": 0, "w": 960, "h": 540 }, "width": 1920, "height": 1080 },
+                { "id": "bad", "canvas_rect": { "w": 0, "h": 540 } }
+            ] },
+            "tracks": [ { "cues": [
+                { "id": "shows-v", "source": { "type": "virtual", "virtual": "v" } },
+                { "id": "shows-bad", "source": { "type": "virtual", "virtual": "bad" } }
+            ] } ]
+        }))
+        .unwrap();
+        // Any Runner: a virtual display belongs to no display or Runner.
+        let show = build(&d, "anyone", &cache());
+        assert_eq!(show.virtuals.len(), 1, "the invalid one is dropped");
+        assert_eq!(show.virtuals[0].id, "v");
+        assert_eq!(
+            (show.virtuals[0].width, show.virtuals[0].height),
+            (1920, 1080)
+        );
+        assert_eq!(show.virtuals[0].canvas_rect.x, 5000.0);
+        assert!(matches!(&show.layers[0].source, Source::Virtual { id } if id == "v"));
+        assert!(matches!(&show.layers[1].source, Source::Missing { .. }));
     }
 }

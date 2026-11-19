@@ -27,7 +27,7 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
 | Part | State |
 |---|---|
 | Director: cluster clock, transport per timeline, control cues, show distribution, persistence, restart adoption, OSC input | implemented, tested |
-| Runner: renders the Director's show live (edits appear while playing), images, colours, video (HAP decoded by the GPU; other codecs hardware-decoded through ffmpeg), fades, warp, edge blend, auxiliary timelines, free-running cues, local asset cache, holdover | implemented, tested |
+| Runner: renders the Director's show live (edits appear while playing), images, colours, video (HAP decoded by the GPU; other codecs hardware-decoded through ffmpeg), fades, warp, edge blend, auxiliary timelines, free-running cues, virtual displays, local asset cache, holdover | implemented, tested |
 | Frame sync on frame-locked hardware: frames rendered for the refresh they appear on, a cluster-wide refresh grid, NVIDIA present barrier, one GPU device per graphics card, per-output sync health, sync test pattern | implemented, **not yet run on real hardware** (see below) |
 | Runner management: restart, quit, standby, reboot / power off the computer (opt-in), Wake-on-LAN, remote log, live output pictures, remote desktop | implemented |
 | Asset Manager: upload, list, thumbnails, metadata, HTTP Range delivery | implemented |
@@ -116,11 +116,11 @@ and resets them. The layout is remembered.
 
 | Window | What it is for |
 |---|---|
-| Stage | The canvas — unbounded, the whole window — with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it; wheel to zoom, drag the background to pan, double-click to fit the displays. Untick **live video** to show video cues as still thumbnails: the Producer's computer then decodes no video (remembered on that computer; Runners are not affected). |
+| Stage | The canvas — unbounded, the whole window — with its displays and the content on air, live. Drag cues to place them; click a display's name tab to select it; wheel to zoom, drag the background to pan, double-click to fit the displays. Virtual displays are dashed green areas with their tab below (drag the tab to move one). Untick **live video** to show video cues as still thumbnails: the Producer's computer then decodes no video (remembered on that computer; Runners are not affected). |
 | Timeline | One timeline at a time; the tabs switch between **Main** and the tasks. Tracks are layers: the top track is in front, and **+ Track** adds a new one on top. Drag cues, trim their ends, drag on the ruler to scrub. Drag a box over empty track space to select several cues (Shift/Ctrl adds to the selection; Shift/Ctrl-click a cue adds or removes it); dragging any of them moves, trims or lengthens them all. **+ Control cue** adds a pause / play / stop / jump at the playhead. A video cue's **Free run** box (inspector) keeps it playing while its timeline is paused; it holds its last frame unless **Loop** is on. |
 | Tasks | The auxiliary timelines: independent timelines with their own play / pause / stop, drawn in front of the main one. |
 | Runners | Each Runner: health, GPU, monitors, the displays it drives (fullscreen, monitor), and **Reload outputs**. |
-| Inspector | Properties of whatever is selected; with nothing selected, the show and stage. A typed value applies on **Enter** (or on leaving the field). With several cues selected it edits them together: a value entered is set on all of them (start, duration, fades, in point, loop, free run, position, size, rotation, opacity); fields where they differ show *mixed*. |
+| Inspector | Properties of whatever is selected; with nothing selected, the show and stage, with **+ Virtual display**: a camera on an area of the canvas, captured at a resolution you set, whose picture cues can show — on any display, scaled, rotated or faded, or inside another virtual display (**+ Cue showing it**, or drag it from the list onto a track). It captures over a transparent background; a loop (a virtual display shown inside its own area) is cut, not fed back. A typed value applies on **Enter** (or on leaving the field). With several cues selected it edits them together: a value entered is set on all of them (start, duration, fades, in point, loop, free run, position, size, rotation, opacity); fields where they differ show *mixed*. |
 | Assets | Media on the Asset Manager. |
 
 **Several people at once.** Anyone who can reach the Producer's address

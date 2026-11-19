@@ -264,6 +264,7 @@ pub fn cache_key(layer: &Layer) -> String {
         Source::Video { path } => format!("video:{}:{path}:{}", layer.id, file_version(path)),
         Source::Live { kind } => format!("live:{kind}"),
         Source::Missing { reason } => format!("missing:{reason}"),
+        Source::Virtual { id } => format!("virtual:{id}"),
     }
 }
 
@@ -313,6 +314,9 @@ pub fn build(layer: &Layer, factory: &TextureFactory) -> anyhow::Result<Box<dyn 
             tracing::debug!(layer = %layer.id, "{reason}; showing placeholder");
             Ok(placeholder(factory))
         }
+        // Drawn from the virtual display's own picture, which the renderer
+        // binds in place of this (empty) content; see `crate::virtuals`.
+        Source::Virtual { .. } => Ok(Box::new(factory.transparent())),
         Source::Live { kind } => {
             tracing::warn!("live source '{kind}' not yet implemented; showing placeholder");
             Ok(placeholder(factory))
