@@ -233,3 +233,5 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 #users .user { border: 1px solid var(--c); color: var(--c); border-radius: 10px; padding: 1px 8px; font-size: 12px; white-space: nowrap; }
 #users .user.me { background: var(--c); color: #06121f; cursor: pointer; }
 .together { border-left: 3px solid var(--c); padding: 4px 8px; margin-bottom: 8px; font-size: 12px; background: rgba(255, 255, 255, 0.04); }
+/* box selection being dragged over the timeline's tracks */
+#tl-box { position: absolute; z-index: 5; pointer-events: none; border: 1px solid #4ea1ff; background: rgba(78, 161, 255, .12); }

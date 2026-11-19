@@ -101,7 +101,8 @@ const S = {
   deferredShow: false,  // a show arrived during a drag: apply it when the drag ends
   user: loadUser(),     // { name, color }: who this is, for the other users
   others: new Map(),    // node id → presence of the other Producers' users
-  sel: null,            // { type: 'cue'|'display'|'control'|'track'|'task', id }
+  sel: null,            // { type: 'cue'|'display'|'control'|'track'|'task', id }; several
+                        // cues: { type: 'cue', id, ids } (id = the one clicked last, also in ids)
   tl: MAIN,             // the timeline open in the Timeline window
   transports: {},       // timeline id → transport states known, oldest first (≤ 2)
   frameRate: { num: 60, den: 1 },
@@ -220,13 +221,35 @@ function findControl(id) {
 }
 const findDisplay = (id) => S.doc.stage.displays.find((d) => d.id === id) || null;
 const assetOf = (cue) => (cue.source.type === 'asset' ? S.doc.assets.find((a) => a.id === cue.source.asset) : null);
-const selectedCue = () => (S.sel?.type === 'cue' ? findCue(S.sel.id)?.cue : null) || null;
+/** Ids of the selected cues: none, one, or several (box selection or
+ *  Shift/Ctrl-click in the timeline). */
+const selCueIds = () => (S.sel?.type !== 'cue' ? [] : S.sel.ids?.length ? S.sel.ids : [S.sel.id]);
+const isCueSelected = (id) => selCueIds().includes(id);
+/** The selected cues themselves (those that still exist). */
+const selectedCues = () => selCueIds().map(findCue).filter(Boolean).map((h) => h.cue);
+/** The selected cue when exactly one is selected: the stage's resize
+ *  handles and the single-cue inspector work on it. */
+const selectedCue = () => (selCueIds().length === 1 ? findCue(S.sel.id)?.cue : null) || null;
+/** A cue selection from a list of ids: null, a plain one-cue selection, or a
+ *  multiple one whose primary cue is `primary` (when it is in the list). */
+function cueSelection(ids, primary) {
+  ids = [...new Set(ids)];
+  if (!ids.length) return null;
+  const id = ids.includes(primary) ? primary : ids[ids.length - 1];
+  return ids.length === 1 ? { type: 'cue', id } : { type: 'cue', id, ids };
+}
 
 /** Does the current selection still exist? */
 function selectionExists() {
   if (!S.sel) return true;
   const { type, id } = S.sel;
   return !!({ cue: findCue, display: findDisplay, control: findControl, track: findTrack, task: (i) => tlObj(i) }[type]?.(id));
+}
+/** Drop from the selection what no longer exists (deleted here, by undo, or
+ *  by another user): a multiple cue selection keeps the cues that are left. */
+function pruneSelection() {
+  if (S.sel?.type === 'cue' && S.sel.ids) S.sel = cueSelection(S.sel.ids.filter((id) => findCue(id)), S.sel.id);
+  if (!selectionExists()) S.sel = null;
 }
 
 // ───────────────────────────── window manager ─────────────────────────────
@@ -356,9 +379,11 @@ function sendPresence() {
 /** A colour from another user, safe to put in a style attribute. */
 const safeColor = (c) => (/^#[0-9a-fA-F]{3,8}$/.test(c || '') ? c : '#888888');
 
-/** Other users who have `sel` (or the object `type`/`id`) selected. */
+/** Other users who have the object `type`/`id` selected (alone, or as one
+ *  of several cues). */
 function othersOn(type, id) {
-  return [...S.others.values()].filter((o) => o.selection?.type === type && o.selection?.id === id);
+  return [...S.others.values()].filter((o) => o.selection?.type === type
+    && (o.selection.id === id || (Array.isArray(o.selection.ids) && o.selection.ids.includes(id))));
 }
 
 function renderUsers() {
@@ -766,7 +791,7 @@ function record(before) {
 
 function afterChange(inspector = true) {
   if (!tlObj(S.tl)) S.tl = MAIN;      // the open timeline was deleted
-  if (!selectionExists()) S.sel = null;
+  pruneSelection();
   renderTimeline(); renderTasks(); renderRunners(true);
   if (inspector) renderInspector();
   scheduleSend();
@@ -824,7 +849,7 @@ function stepHistory(from, to) {
 function refreshAll() {
   if (!S.doc) return;
   if (!tlObj(S.tl)) S.tl = MAIN;
-  if (!selectionExists()) S.sel = null;
+  pruneSelection();
   renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
 }
 
@@ -838,10 +863,11 @@ function select(sel) {
 async function deleteSelection() {
   if (!S.sel) return;
   const { type, id } = S.sel;
+  const cueIds = selCueIds();
   // A whole timeline is too much to lose to a stray Delete key.
   if (type === 'task' && !(await ask(`Delete the task "${tlName(id)}" with everything on it?`))) return;
   edit(() => {
-    if (type === 'cue') { const hit = findCue(id); if (hit) hit.track.cues.splice(hit.ci, 1); }
+    if (type === 'cue') for (const cid of cueIds) { const hit = findCue(cid); if (hit) hit.track.cues.splice(hit.ci, 1); }
     else if (type === 'control') { const hit = findControl(id); if (hit) hit.list.splice(hit.i, 1); }
     else if (type === 'track') { const hit = findTrack(id); if (hit) tlObj(hit.tl).tracks.splice(hit.ti, 1); }
     else if (type === 'task') {
@@ -1392,17 +1418,17 @@ function drawStage() {
 
   // Back to front: the main timeline first, then the tasks (the first task
   // is front-most); within a timeline the last track is at the back.
-  const sel = selectedCue();
+  const sel = selectedCue(), sels = new Set(selectedCues());
   for (const tl of tlIds().reverse()) {
     const t = showSeconds(tl), active = isActive(tl);
     for (const track of [...tlObj(tl).tracks].reverse()) {
       for (const cue of track.cues) {
         const onAir = active && t >= cue.start_s && t < cue.start_s + cue.duration_s;
-        // The selected cue is always shown (ghosted when not on air), so it
-        // can be positioned without scrubbing to it first.
+        // Selected cues are always shown (ghosted when not on air), so they
+        // can be positioned without scrubbing to them first.
         if (!onAir) S.onsets.delete(cue.id); // on air again later: afresh
         const others = othersOn('cue', cue.id);
-        if (!onAir && cue !== sel && !others.length) continue;
+        if (!onAir && !sels.has(cue) && !others.length) continue;
         const fade = clamp(cue.fade_in_s > 0 ? (t - cue.start_s) / cue.fade_in_s : 1, 0, 1)
                    * clamp(cue.fade_out_s > 0 ? (cue.start_s + cue.duration_s - t) / cue.fade_out_s : 1, 0, 1);
         ctx.save();
@@ -1416,7 +1442,7 @@ function drawStage() {
           ctx.fillStyle = cue.source.type === 'color' ? rgbaCss(cue.source.rgba) : '#444';
           ctx.fillRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
         }
-        if (cue === sel) {
+        if (sels.has(cue)) {
           ctx.globalAlpha = 1;
           ctx.strokeStyle = '#fff';
           ctx.lineWidth = 2 / k;
@@ -1512,7 +1538,7 @@ stage.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
 
   // 1. A resize handle of the selected cue?
-  const sel = selectedCue();
+  const sel = selectedCue(), sels = new Set(selectedCues());
   if (sel && !sel.rotation) {
     const corner = cueCorners(sel).findIndex(([hx, hy]) => Math.abs(hx - sx) <= HANDLE + 2 && Math.abs(hy - sy) <= HANDLE + 2);
     if (corner >= 0) { drag = { ...start, kind: 'resize', corner, target: sel, orig: { ...sel } }; return; }
@@ -1531,7 +1557,7 @@ stage.addEventListener('mousedown', (e) => {
     const t = showSeconds(tl), active = isActive(tl);
     for (const track of tlObj(tl).tracks) {
       for (const cue of [...track.cues].reverse()) {
-        const visible = (active && t >= cue.start_s && t < cue.start_s + cue.duration_s) || cue === sel;
+        const visible = (active && t >= cue.start_s && t < cue.start_s + cue.duration_s) || sels.has(cue);
         if (visible && cueContains(cue, cx, cy)) {
           if (S.tl !== tl) S.tl = tl; // open the timeline the cue is on
           select({ type: 'cue', id: cue.id });
@@ -1708,7 +1734,7 @@ function renderTimeline() {
       },
     });
     for (const cue of track.cues) {
-      const selected = S.sel?.type === 'cue' && S.sel.id === cue.id;
+      const selected = isCueSelected(cue.id);
       lane.append(el('div', {
         class: `cue ${cue.source.type}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
@@ -1725,15 +1751,48 @@ function renderTimeline() {
 
 // One mousedown handler for all cues (they are rebuilt constantly, so
 // per-element listeners would be lost mid-drag).
+//
+// Selecting several cues:
+//   - drag a box on an empty part of the tracks: the cues it touches;
+//   - Shift- or Ctrl-click a cue: add it to the selection, or take it out;
+//   - Shift- or Ctrl-drag a box: add the cues it touches.
+// Dragging any selected cue (or one of its ends) moves (trims, lengthens)
+// all of them by the same amount; a plain click on one of them, without
+// moving, selects that cue alone.
 $('#tracks').addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  const additive = e.shiftKey || e.ctrlKey || e.metaKey;
   const node = e.target.closest('.cue');
-  if (!node) { if (e.target.classList.contains('lane')) select(null); return; }
+  if (!node) {
+    if (e.target.classList.contains('lane')) {
+      // Box selection. A plain click on an empty lane still deselects (on
+      // mouseup, when the pointer has not moved).
+      tlDrag = { kind: 'box', mx: e.clientX, my: e.clientY, additive, base: additive ? selCueIds() : [], moved: false, key: '', undone: false };
+      e.preventDefault();
+    }
+    return;
+  }
   const hit = findCue(node.dataset.id);
   if (!hit) return;
-  const handle = e.target.classList.contains('h') ? (e.target.classList.contains('l') ? 'trim' : 'length') : 'move';
-  select({ type: 'cue', id: hit.cue.id });
-  tlDrag = { kind: handle, id: hit.cue.id, mx: e.clientX, orig: { ...hit.cue }, undone: false };
   e.preventDefault();
+  const id = hit.cue.id;
+  if (additive) {
+    // Toggle this cue in (or out of) the cue selection. No drag.
+    const ids = selCueIds();
+    select(cueSelection(ids.includes(id) ? ids.filter((i) => i !== id) : [...ids, id], id));
+    return;
+  }
+  const handle = e.target.classList.contains('h') ? (e.target.classList.contains('l') ? 'trim' : 'length') : 'move';
+  // Pressing on a cue of a multiple selection keeps the selection (so the
+  // whole group can be dragged); otherwise this cue alone is selected.
+  const ids = isCueSelected(id) ? selCueIds() : [id];
+  select(cueSelection(ids, id));
+  const orig = new Map();
+  for (const cid of ids) {
+    const h = findCue(cid);
+    if (h) orig.set(cid, { start_s: h.cue.start_s, duration_s: h.cue.duration_s, in_s: h.cue.in_s, ti: h.ti, tl: h.tl });
+  }
+  tlDrag = { kind: handle, id, ids: [...orig.keys()], mx: e.clientX, orig, narrow: ids.length > 1, undone: false };
 });
 $('#cuelane').addEventListener('mousedown', (e) => {
   const node = e.target.closest('.ctl');
@@ -1749,41 +1808,83 @@ function timelineDragMove(e) {
   const dt = (e.clientX - tlDrag.mx) / S.pxPerSec, o = tlDrag.orig;
   const takeUndo = () => { if (!tlDrag.undone) { tlDrag.before = clone(S.doc); tlDrag.undone = true; sendPresence(); } };
 
+  if (tlDrag.kind === 'box') return boxSelectMove(e);
   if (tlDrag.kind === 'control') {
     const hit = findControl(tlDrag.id);
     if (!hit) return;
     takeUndo();
     hit.cc.at_s = round2(clamp(o.at_s + dt, 0, tlObj(hit.tl).duration_s));
   } else {
-    const hit = findCue(tlDrag.id);
-    if (!hit) return;
+    // Every cue of the selection gets the same change. `tlDrag.orig` holds
+    // each cue's values from the moment the drag started.
+    const hits = tlDrag.ids.map(findCue).filter(Boolean);
+    const lead = findCue(tlDrag.id);
+    if (!lead || !hits.length) return;
     takeUndo();
-    const c = hit.cue, obj = tlObj(hit.tl);
+    const origOf = (h) => tlDrag.orig.get(h.cue.id);
     if (tlDrag.kind === 'move') {
-      c.start_s = round2(Math.max(0, o.start_s + dt));
-      // Dragging up/down moves the cue to the track under the pointer.
+      // The group moves as a block: it stops when its earliest cue reaches 0
+      // (clamping each cue on its own would squash their spacing).
+      const d = Math.max(dt, -Math.min(...hits.map((h) => origOf(h).start_s)));
+      for (const h of hits) h.cue.start_s = round2(Math.max(0, origOf(h).start_s + d));
+      // Dragging up/down moves the cues by as many tracks as the pointer
+      // has moved from the cue it holds — only if every cue on that
+      // timeline still lands on a track.
       const lane = document.elementFromPoint(e.clientX, e.clientY)?.closest('#tracks .lane');
-      const ti = lane ? Number(lane.dataset.ti) : hit.ti;
-      if (ti !== hit.ti && obj.tracks[ti]) {
-        hit.track.cues.splice(hit.ci, 1);
-        obj.tracks[ti].cues.push(c);
+      const step = lane && lead.tl === S.tl ? Number(lane.dataset.ti) - origOf(lead).ti : null;
+      const movable = hits.filter((h) => h.tl === lead.tl);
+      const tracks = tlObj(lead.tl).tracks;
+      if (step != null && movable.every((h) => tracks[origOf(h).ti + step])) {
+        for (const h of movable) {
+          const target = tracks[origOf(h).ti + step];
+          const now = findCue(h.cue.id); // indices change as cues move
+          if (now.track !== target) { now.track.cues.splice(now.ci, 1); target.cues.push(now.cue); }
+        }
       }
     } else if (tlDrag.kind === 'length') {
-      c.duration_s = round2(Math.max(0.1, o.duration_s + dt));
+      for (const h of hits) h.cue.duration_s = round2(Math.max(0.1, origOf(h).duration_s + dt));
     } else {
       // Trim the start: the end stays where it is, and a video's in-point
       // moves with it so the picture at any given time does not change.
-      const d = clamp(dt, -o.start_s, o.duration_s - 0.1);
-      c.start_s = round2(o.start_s + d);
-      c.duration_s = round2(o.duration_s - d);
-      if (assetOf(c)?.kind === 'video') c.in_s = round2(Math.max(0, o.in_s + d));
+      for (const h of hits) {
+        const o1 = origOf(h), c = h.cue;
+        const d = clamp(dt, -o1.start_s, o1.duration_s - 0.1);
+        c.start_s = round2(o1.start_s + d);
+        c.duration_s = round2(o1.duration_s - d);
+        if (assetOf(c)?.kind === 'video') c.in_s = round2(Math.max(0, o1.in_s + d));
+      }
     }
-    const grown = Math.max(obj.duration_s, Math.ceil(c.start_s + c.duration_s));
-    if (grown !== obj.duration_s) { obj.duration_s = grown; syncLoop(); }
+    // A cue that now ends after its timeline makes the timeline longer.
+    for (const h of hits) {
+      const obj = tlObj(h.tl), grown = Math.max(obj.duration_s, Math.ceil(h.cue.start_s + h.cue.duration_s));
+      if (grown !== obj.duration_s) { obj.duration_s = grown; if (h.tl === MAIN) syncLoop(); }
+    }
   }
   renderTimeline();
   renderInspector();
   scheduleSend();
+}
+
+/** Box selection in progress: draw the box, and select the cues it touches
+ *  (plus, with Shift/Ctrl, those that were selected before). */
+function boxSelectMove(e) {
+  const d = tlDrag;
+  if (!d.moved && Math.abs(e.clientX - d.mx) + Math.abs(e.clientY - d.my) < 4) return; // still a click
+  d.moved = true;
+  const x0 = Math.min(d.mx, e.clientX), x1 = Math.max(d.mx, e.clientX);
+  const y0 = Math.min(d.my, e.clientY), y1 = Math.max(d.my, e.clientY);
+  const body = $('#tl-body'), at = body.getBoundingClientRect();
+  let box = $('#tl-box');
+  if (!box) { box = el('div', { id: 'tl-box' }); body.append(box); }
+  Object.assign(box.style, { left: `${x0 - at.left}px`, top: `${y0 - at.top}px`, width: `${x1 - x0}px`, height: `${y1 - y0}px` });
+  const hits = [...document.querySelectorAll('#tracks .cue')].filter((n) => {
+    const r = n.getBoundingClientRect();
+    return r.right > x0 && r.left < x1 && r.bottom > y0 && r.top < y1;
+  }).map((n) => n.dataset.id);
+  const ids = [...new Set([...d.base, ...hits])];
+  // Re-render (and tell the other users) only when the set changes.
+  const key = ids.join();
+  if (key !== d.key) { d.key = key; select(cueSelection(ids, S.sel?.id)); }
 }
 
 // Scrubbing: press or drag on the ruler to move the open timeline's playhead.
@@ -1812,6 +1913,12 @@ window.addEventListener('mouseup', (e) => {
   }
   if (winDrag) saveLayout();
   if (scrubbing) { lastScrub = 0; scrub(e); }
+  if (tlDrag?.kind === 'box') {
+    $('#tl-box')?.remove();
+    if (!tlDrag.moved && !tlDrag.additive) select(null); // a plain click on an empty lane
+  } else if (tlDrag?.narrow && !tlDrag.undone) {
+    select({ type: 'cue', id: tlDrag.id }); // clicked one cue of several, without moving it
+  }
   const finished = drag?.undone ? drag : tlDrag?.undone ? tlDrag : null;
   if (finished) { record(finished.before); sendDoc(); } // final position, immediately
   winDrag = drag = tlDrag = null;
@@ -1822,7 +1929,9 @@ window.addEventListener('mouseup', (e) => {
 
 $('#tl-play').onclick = () => command({ type: currentTransport(S.tl)?.playing ? 'pause' : 'play' }, S.tl);
 $('#tl-stop').onclick = () => command({ type: 'stop' }, S.tl);
-$('#btn-track').onclick = () => edit(() => { const o = tlObj(S.tl); o.tracks.push({ id: uid(), name: `Track ${o.tracks.length + 1}`, cues: [] }); });
+// A new track goes on top: the first track is the front-most layer, so a
+// new one covers what is already there (as a new layer does in a stack).
+$('#btn-track').onclick = () => edit(() => { const o = tlObj(S.tl); o.tracks.unshift({ id: uid(), name: `Track ${o.tracks.length + 1}`, cues: [] }); });
 $('#btn-control').onclick = () => edit(() => {
   const cc = { id: uid(), name: '', at_s: round2(showSeconds(S.tl)), action: 'pause', target: '', to_s: 0 };
   tlObj(S.tl).control_cues.push(cc);
@@ -2230,15 +2339,46 @@ function arrangeSideBySide() {
 // Properties of whatever is selected — a cue, a control cue, a track, a
 // task, a display — or, with nothing selected, of the show itself.
 
-/** A labelled input bound to obj[key]. Changes are committed on Enter/blur
- *  (not per keystroke), each as one undo step. */
+/** Call `commit` when a typed value is entered: on Enter, and on leaving
+ *  the field (the 'change' event), but only once per value — browsers also
+ *  fire 'change' on Enter, and leaving the field after Enter must not make a
+ *  second undo step. Enter keeps the cursor in the field with its text
+ *  selected, so the next value can be typed straight away. `commit` may
+ *  rewrite the field (a refused value goes back); that is the new baseline.
+ *  (Checkboxes, colours and dropdowns commit on 'change' directly.) */
+function onCommit(input, commit) {
+  let last = input.value;
+  const fire = () => {
+    if (input.value === last) return;
+    commit();
+    last = input.value;
+  };
+  input.addEventListener('change', fire);
+  input.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    fire();
+    input.select();
+  });
+}
+
+/** Parse what a field holds: a number (or null when empty) for number
+ *  fields, the text otherwise. */
+const fieldValue = (input, type) => (type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value);
+
+/** A labelled input bound to obj[key]. Changes are committed on Enter or on
+ *  leaving the field (not per keystroke), each as one undo step. */
 function field(label, obj, key, opts = {}) {
   const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, after, optional = false } = opts;
   const input = el('input', { type, step, min });
-  if (type === 'checkbox') input.checked = !!obj[key];
-  else input.value = get(obj[key]) ?? '';
-  input.addEventListener('change', () => {
-    let v = type === 'checkbox' ? input.checked : type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value;
+  if (type === 'checkbox') {
+    input.checked = !!obj[key];
+    input.addEventListener('change', () => edit(() => { obj[key] = set(input.checked); after?.(); }, { inspector: false }));
+    return el('div', { class: 'row' }, el('label', {}, label), input);
+  }
+  input.value = get(obj[key]) ?? '';
+  onCommit(input, () => {
+    const v = fieldValue(input, type);
     // A number field that is emptied, or holds something unusable, goes back
     // to its value: writing "no value" into the show would make the Director
     // refuse every edit from then on. Only fields that are genuinely
@@ -2248,6 +2388,48 @@ function field(label, obj, key, opts = {}) {
     edit(() => { obj[key] = set(v); after?.(); }, { inspector: false });
   });
   return el('div', { class: 'row' }, el('label', {}, label), input);
+}
+
+/** A labelled input bound to `key` of several objects at once (the cues of a
+ *  multiple selection). `objs()` finds them afresh when a value is entered.
+ *  Where they all hold the same value it is shown; otherwise the field is
+ *  empty ("mixed"; a checkbox shows a dash) and leaving it so changes
+ *  nothing. A value entered is set on all of them, as one undo step. */
+function multiField(label, objs, key, opts = {}) {
+  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v } = opts;
+  // The value they share, or `mixed` (asked afresh: after Enter the field
+  // stays open while the values change underneath).
+  const mixed = Symbol('mixed');
+  const common = () => {
+    const values = objs().map((o) => o[key]);
+    return values.every((v) => JSON.stringify(v) === JSON.stringify(values[0])) ? values[0] : mixed;
+  };
+  const input = el('input', { type, step, min });
+  if (type === 'checkbox') {
+    const v = common();
+    input.checked = v !== mixed && !!v;
+    input.indeterminate = v === mixed;
+    input.addEventListener('change', () => edit(() => { for (const o of objs()) o[key] = set(input.checked); }, { inspector: false }));
+    return el('div', { class: 'row' }, el('label', {}, label), input);
+  }
+  const shown = () => { const v = common(); return v === mixed ? '' : get(v) ?? ''; };
+  input.value = shown();
+  if (common() === mixed) input.placeholder = 'mixed';
+  onCommit(input, () => {
+    const v = fieldValue(input, type);
+    // Empty: leave every cue as it is. Unusable: go back.
+    if (v == null) { input.value = shown(); return; }
+    if (type === 'number' && (Number.isNaN(v) || (min != null && v < min))) { input.value = shown(); return; }
+    edit(() => { for (const o of objs()) o[key] = set(v); }, { inspector: false });
+  });
+  return el('div', { class: 'row' }, el('label', {}, label), input);
+}
+
+/** Two multiFields on one row (x/y, w/h). */
+function multiPair(label, objs, a, b, opts = {}) {
+  const row = el('div', { class: 'row two' }, el('label', {}, label));
+  for (const key of [a, b]) row.append(multiField('', objs, key, opts).lastChild);
+  return row;
 }
 
 /** Two numbers on one row (x/y, w/h). */
@@ -2262,7 +2444,7 @@ function optionalPair(label, obj, key, min) {
   const row = el('div', { class: 'row two' }, el('label', {}, label));
   const inputs = [0, 1].map((i) => el('input', { type: 'number', step: 1, min, placeholder: 'auto', value: obj[key]?.[i] ?? '' }));
   for (const input of inputs) {
-    input.addEventListener('change', () => {
+    onCommit(input, () => {
       const vals = inputs.map((n) => (n.value === '' ? null : Number(n.value)));
       edit(() => (obj[key] = vals.every((v) => v != null) ? vals : null), { inspector: false });
     });
@@ -2335,6 +2517,37 @@ function renderInspector() {
   }
   const sec = { step: 0.1, min: 0 };
   const type = S.sel?.type;
+
+  if (type === 'cue' && selCueIds().length > 1) {
+    // Several cues: the properties they can share. A value entered here is
+    // set on all of them.
+    const cues = selectedCues, videos = () => selectedCues().filter((c) => assetOf(c)?.kind === 'video');
+    const n = cues().length, nv = videos().length;
+    box.append(
+      el('h3', {}, `${n} cues`),
+      note('A value entered here is set on every selected cue. An empty field (mixed) means the cues differ: leave it empty to keep their own values. Shift- or Ctrl-click a cue in the timeline to add or remove it.'),
+      el('h4', {}, 'Time'),
+      multiField('Start (s)', cues, 'start_s', sec),
+      multiField('Duration (s)', cues, 'duration_s', { step: 0.1, min: 0.1 }),
+      multiField('Fade in (s)', cues, 'fade_in_s', sec),
+      multiField('Fade out (s)', cues, 'fade_out_s', sec),
+    );
+    if (nv) {
+      box.append(
+        el('h4', {}, nv === n ? 'Video' : `Video (the ${nv} video cues)`),
+        multiField('In point (s)', videos, 'in_s', sec),
+        multiField('Loop video', videos, 'loop', { type: 'checkbox' }),
+        multiField('Free run', videos, 'free_run', { type: 'checkbox' }));
+    }
+    box.append(
+      el('h4', {}, 'Position on stage'),
+      multiPair('X / Y', cues, 'x', 'y'),
+      multiPair('W / H', cues, 'w', 'h', { min: 1 }),
+      multiField('Rotation (°)', cues, 'rotation'),
+      multiField('Opacity (%)', cues, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
+      el('div', { class: 'btns' }, el('button', { class: 'danger', onclick: deleteSelection }, `Delete ${n} cues`)));
+    return;
+  }
 
   if (type === 'cue') {
     const { cue: c, track } = findCue(S.sel.id), asset = assetOf(c);
