@@ -159,6 +159,7 @@ function normalize(doc) {
     v.name ??= '';
     v.canvas_rect = Object.assign({ x: 0, y: 0, w: 1920, h: 1080 }, v.canvas_rect);
     v.width ??= 1920; v.height ??= 1080;
+    v.keep_aspect ??= false;
   }
   for (const d of st.displays) {
     d.id ||= uid();
@@ -190,7 +191,7 @@ function normalize(doc) {
         Object.assign(c, Object.assign({
           name: '', source: { type: 'color', rgba: [0.5, 0.5, 0.5, 1] },
           start_s: 0, duration_s: 10, in_s: 0, loop: false, free_run: false,
-          x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0,
+          x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0, keep_aspect: false,
         }, c));
       }
     }
@@ -1805,7 +1806,7 @@ function stageDragMove(e) {
     // Resize: the dragged corner follows the pointer, the opposite one stays.
     const left = drag.corner === 0 || drag.corner === 3, top = drag.corner < 2;
     let w = Math.max(8, o.w + (left ? -dx : dx)), h = Math.max(8, o.h + (top ? -dy : dy));
-    if (e.shiftKey) { // keep the aspect ratio
+    if (e.shiftKey || c.keep_aspect) { // keep the aspect ratio (Shift, or the cue's own setting)
       const k = Math.max(w / o.w, h / o.h);
       w = o.w * k; h = o.h * k;
     }
@@ -1830,7 +1831,9 @@ let tlDrag = null;  // the timeline drag in progress
 function renderTabs() {
   const tabs = $('#tl-tabs');
   tabs.replaceChildren();
-  for (const id of [MAIN, ...S.doc.tasks.map((t) => t.id)]) {
+  // The stacking of the Tasks window, read left to right from the back:
+  // Main (always the lowest) on the left, the front-most task on the right.
+  for (const id of [MAIN, ...S.doc.tasks.map((t) => t.id).reverse()]) {
     const tr = currentTransport(id);
     const state = id === MAIN ? null : !tr?.active ? '' : tr.playing ? 'ok' : 'warn';
     tabs.append(el('button', { class: `tab${id === S.tl ? ' on' : ''}`, onclick: () => { S.tl = id; refreshAll(); } },
@@ -2690,8 +2693,11 @@ function arrangeSideBySide() {
  *  Enter also moves to the next typed field of the same panel, with its
  *  text selected, so several values can be typed in a row (Shift+Enter: the
  *  previous one). On the last field the cursor stays, its text selected. */
-function onCommit(input, commit) {
+function onCommit(input, commit, { step = null } = {}) {
   let last = input.value;
+  // The field was rewritten from the show (e.g. H after W, aspect kept):
+  // that is the new baseline, so typing the old value again counts.
+  input.rebase = () => { last = input.value; };
   const fire = () => {
     if (input.value === last) return;
     commit();
@@ -2699,10 +2705,19 @@ function onCommit(input, commit) {
   };
   input.addEventListener('change', fire);
   input.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
-    e.preventDefault();
-    fire();
-    focusNextField(input, e.shiftKey ? -1 : 1);
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      fire();
+      focusNextField(input, e.shiftKey ? -1 : 1);
+    } else if (step && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      // A number field: the arrows step its value (Shift: ten steps), at
+      // once — as typing "+step" and Enter would, but staying in the field.
+      e.preventDefault();
+      const d = step * (e.shiftKey ? 10 : 1) * (e.key === 'ArrowUp' ? 1 : -1);
+      input.value = `+${d}`;
+      fire();
+      input.select();
+    }
   });
 }
 
@@ -2720,31 +2735,92 @@ function focusNextField(input, step) {
   next.select();
 }
 
-/** Parse what a field holds: a number (or null when empty) for number
- *  fields, the text otherwise. */
-const fieldValue = (input, type) => (type === 'number' ? (input.value === '' ? null : Number(input.value)) : input.value);
+/** Evaluate what was typed in a number field: a number, or arithmetic
+ *  with + - * / and parentheses ("1920/2", "(1080 - 40) / 2", "3*1.5").
+ *  A comma is a decimal point. Starting with +, * or / it applies to
+ *  `current`, the field's value: "*2" doubles it, "/3" divides it, "+10"
+ *  adds 10, "+-10" takes 10 off (a leading "-" is a negative number).
+ *  Returns null for an empty field, NaN for anything else it cannot read
+ *  (or a relative entry with no current value). Rounded to 6 decimals, so
+ *  0.1+0.2 is 0.3. No eval: a small parser of its own. */
+function evalNumber(text, current) {
+  let src = String(text).trim().replace(/,/g, '.');
+  if (src === '') return null;
+  if (/^[+*/]/.test(src)) {
+    if (typeof current !== 'number' || !Number.isFinite(current)) return NaN;
+    src = `(${current})${src}`;
+  }
+  const tokens = src.match(/(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?|\S/gi) || [];
+  let i = 0;
+  const peek = () => tokens[i];
+  // expr := term (('+' | '-') term)* ; term := factor (('*' | '/') factor)* ;
+  // factor := ('+' | '-') factor | number | '(' expr ')'
+  const expr = () => {
+    let v = term();
+    while (peek() === '+' || peek() === '-') v = tokens[i++] === '+' ? v + term() : v - term();
+    return v;
+  };
+  const term = () => {
+    let v = factor();
+    while (peek() === '*' || peek() === '/') v = tokens[i++] === '*' ? v * factor() : v / factor();
+    return v;
+  };
+  const factor = () => {
+    const t = tokens[i++];
+    if (t === '-') return -factor();
+    if (t === '+') return factor();
+    if (t === '(') { const v = expr(); return tokens[i++] === ')' ? v : NaN; }
+    return t !== undefined && /^[\d.]/.test(t) ? Number(t) : NaN;
+  };
+  const v = expr();
+  if (i !== tokens.length || !Number.isFinite(v)) return NaN;
+  return Math.round(v * 1e6) / 1e6;
+}
+
+/** A field's value as text: numbers without float noise. */
+const fmtValue = (v) => (typeof v === 'number' ? String(Math.round(v * 1e6) / 1e6) : v ?? '');
+
+/** An input for a number. A text field, not type=number, so that
+ *  arithmetic can be typed in it (see `evalNumber`); the arrow keys step it. */
+const numberInput = (attrs = {}) => el('input', { type: 'text', inputmode: 'decimal', class: 'num', spellcheck: 'false', autocomplete: 'off', ...attrs });
 
 /** A labelled input bound to obj[key]. Changes are committed on Enter or on
- *  leaving the field (not per keystroke), each as one undo step. */
+ *  leaving the field (not per keystroke), each as one undo step. A number
+ *  field takes arithmetic (see `evalNumber`).
+ *
+ *  `linked` (for W/H pairs): { key, when(obj), fit(raw), refresh() } — while
+ *  `when(obj)` holds, changing this value scales obj[key of the other] in
+ *  proportion (keeping the aspect ratio), through `fit`. */
 function field(label, obj, key, opts = {}) {
-  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, after, optional = false } = opts;
-  const input = el('input', { type, step, min });
+  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, after, optional = false, linked } = opts;
   if (type === 'checkbox') {
+    const input = el('input', { type });
     input.checked = !!obj[key];
     input.addEventListener('change', () => edit(() => { obj[key] = set(input.checked); after?.(); }, { inspector: false }));
     return el('div', { class: 'row' }, el('label', {}, label), input);
   }
-  input.value = get(obj[key]) ?? '';
+  const input = type === 'number' ? numberInput() : el('input', { type });
+  const show = () => { input.value = fmtValue(get(obj[key])); input.rebase?.(); };
+  input.refresh = show;
+  show();
   onCommit(input, () => {
-    const v = fieldValue(input, type);
+    if (type !== 'number') { edit(() => { obj[key] = set(input.value); after?.(); }, { inspector: false }); return; }
+    const v = evalNumber(input.value, get(obj[key]));
     // A number field that is emptied, or holds something unusable, goes back
     // to its value: writing "no value" into the show would make the Director
     // refuse every edit from then on. Only fields that are genuinely
     // optional (the monitor number) may be cleared.
     const unusable = v == null ? !optional : Number.isNaN(v) || (min != null && v < min);
-    if (type === 'number' && unusable) { input.value = get(obj[key]) ?? ''; return; }
-    edit(() => { obj[key] = set(v); after?.(); }, { inspector: false });
-  });
+    if (unusable) { show(); return; }
+    edit(() => {
+      const old = obj[key];
+      obj[key] = set(v);
+      if (linked?.when(obj) && old > 0 && obj[key] > 0) obj[linked.key] = linked.fit((obj[linked.key] * obj[key]) / old);
+      after?.();
+    }, { inspector: false });
+    show(); // the result, not the expression
+    linked?.refresh();
+  }, { step: type === 'number' ? step : null });
   return el('div', { class: 'row' }, el('label', {}, label), input);
 }
 
@@ -2752,9 +2828,11 @@ function field(label, obj, key, opts = {}) {
  *  multiple selection). `objs()` finds them afresh when a value is entered.
  *  Where they all hold the same value it is shown; otherwise the field is
  *  empty ("mixed"; a checkbox shows a dash) and leaving it so changes
- *  nothing. A value entered is set on all of them, as one undo step. */
+ *  nothing. A value entered is set on all of them, as one undo step; an
+ *  entry relative to the value ("*2", "+10") applies to each one's own.
+ *  `linked`: as for `field`, per object. */
 function multiField(label, objs, key, opts = {}) {
-  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v } = opts;
+  const { type = 'number', step = 1, min, get = (v) => v, set = (v) => v, linked } = opts;
   // The value they share, or `mixed` (asked afresh: after Enter the field
   // stays open while the values change underneath).
   const mixed = Symbol('mixed');
@@ -2762,50 +2840,76 @@ function multiField(label, objs, key, opts = {}) {
     const values = objs().map((o) => o[key]);
     return values.every((v) => JSON.stringify(v) === JSON.stringify(values[0])) ? values[0] : mixed;
   };
-  const input = el('input', { type, step, min });
   if (type === 'checkbox') {
+    const input = el('input', { type });
     const v = common();
     input.checked = v !== mixed && !!v;
     input.indeterminate = v === mixed;
     input.addEventListener('change', () => edit(() => { for (const o of objs()) o[key] = set(input.checked); }, { inspector: false }));
     return el('div', { class: 'row' }, el('label', {}, label), input);
   }
-  const shown = () => { const v = common(); return v === mixed ? '' : get(v) ?? ''; };
-  input.value = shown();
+  const input = type === 'number' ? numberInput() : el('input', { type });
+  const shown = () => { const v = common(); return v === mixed ? '' : fmtValue(get(v)); };
+  input.refresh = () => { input.value = shown(); input.rebase?.(); };
+  input.refresh();
   if (common() === mixed) input.placeholder = 'mixed';
   onCommit(input, () => {
-    const v = fieldValue(input, type);
-    // Empty: leave every cue as it is. Unusable: go back.
-    if (v == null) { input.value = shown(); return; }
-    if (type === 'number' && (Number.isNaN(v) || (min != null && v < min))) { input.value = shown(); return; }
-    edit(() => { for (const o of objs()) o[key] = set(v); }, { inspector: false });
-  });
+    // Empty: leave every cue as it is.
+    if (input.value.trim() === '') { input.refresh(); return; }
+    const list = objs();
+    if (type !== 'number') { edit(() => { for (const o of list) o[key] = set(input.value); }, { inspector: false }); return; }
+    // Each one's own result (they differ for "*2"); one unusable: go back.
+    const results = list.map((o) => evalNumber(input.value, get(o[key])));
+    if (results.some((v) => v == null || Number.isNaN(v) || (min != null && v < min))) { input.refresh(); return; }
+    edit(() => list.forEach((o, i) => {
+      const old = o[key];
+      o[key] = set(results[i]);
+      if (linked?.when(o) && old > 0 && o[key] > 0) o[linked.key] = linked.fit((o[linked.key] * o[key]) / old);
+    }), { inspector: false });
+    input.refresh();
+    linked?.refresh();
+  }, { step: type === 'number' ? step : null });
   return el('div', { class: 'row' }, el('label', {}, label), input);
 }
 
+/** Two fields on one row (x/y, w/h), built by `make` (`field` or
+ *  `multiField`). `keepAspect(obj)`: while it holds, changing one of the two
+ *  scales the other in proportion (whole pixels, at least 1). */
+function twoFields(make, label, target, a, b, opts) {
+  const { keepAspect, ...rest } = opts;
+  const row = el('div', { class: 'row two' }, el('label', {}, label));
+  const inputs = {};
+  for (const key of [a, b]) {
+    const other = key === a ? b : a;
+    const linked = keepAspect && {
+      key: other, when: keepAspect,
+      fit: (raw) => (rest.set || ((x) => x))(Math.max(1, Math.round(raw))),
+      refresh: () => inputs[other].refresh(),
+    };
+    inputs[key] = make('', target, key, { ...rest, linked }).lastChild;
+    row.append(inputs[key]);
+  }
+  return row;
+}
 /** Two multiFields on one row (x/y, w/h). */
-function multiPair(label, objs, a, b, opts = {}) {
-  const row = el('div', { class: 'row two' }, el('label', {}, label));
-  for (const key of [a, b]) row.append(multiField('', objs, key, opts).lastChild);
-  return row;
-}
-
+const multiPair = (label, objs, a, b, opts = {}) => twoFields(multiField, label, objs, a, b, opts);
 /** Two numbers on one row (x/y, w/h). */
-function pair(label, obj, a, b, opts = {}) {
-  const row = el('div', { class: 'row two' }, el('label', {}, label));
-  for (const key of [a, b]) row.append(field('', obj, key, opts).lastChild);
-  return row;
-}
+const pair = (label, obj, a, b, opts = {}) => twoFields(field, label, obj, a, b, opts);
 
 /** An optional [a, b] array property (window position/size): empty = unset. */
 function optionalPair(label, obj, key, min) {
   const row = el('div', { class: 'row two' }, el('label', {}, label));
-  const inputs = [0, 1].map((i) => el('input', { type: 'number', step: 1, min, placeholder: 'auto', value: obj[key]?.[i] ?? '' }));
+  const inputs = [0, 1].map(() => numberInput({ placeholder: 'auto' }));
+  const show = () => inputs.forEach((n, i) => { n.value = fmtValue(obj[key]?.[i]); n.rebase?.(); });
+  show();
   for (const input of inputs) {
     onCommit(input, () => {
-      const vals = inputs.map((n) => (n.value === '' ? null : Number(n.value)));
+      const vals = inputs.map((n, i) => evalNumber(n.value, obj[key]?.[i]));
+      if (vals.some((v) => Number.isNaN(v) || (v != null && min != null && v < min))) { show(); return; }
       edit(() => (obj[key] = vals.every((v) => v != null) ? vals : null), { inspector: false });
-    });
+      // Leave a half-filled pair as typed: the other value may come next.
+      if (vals.every((v) => v != null)) show();
+    }, { step: 1 });
     row.append(input);
   }
   return row;
@@ -2900,7 +3004,8 @@ function renderInspector() {
     box.append(
       el('h4', {}, 'Position on stage'),
       multiPair('X / Y', cues, 'x', 'y'),
-      multiPair('W / H', cues, 'w', 'h', { min: 1 }),
+      multiPair('W / H', cues, 'w', 'h', { min: 1, keepAspect: (o) => !!o.keep_aspect }),
+      multiField('Keep aspect ratio', cues, 'keep_aspect', { type: 'checkbox' }),
       multiField('Rotation (°)', cues, 'rotation'),
       multiField('Opacity (%)', cues, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
       el('div', { class: 'btns' }, el('button', { class: 'danger', onclick: deleteSelection }, `Delete ${n} cues`)));
@@ -2928,7 +3033,8 @@ function renderInspector() {
     box.append(
       el('h4', {}, 'Position on stage'),
       pair('X / Y', c, 'x', 'y'),
-      pair('W / H', c, 'w', 'h', { min: 1 }),
+      pair('W / H', c, 'w', 'h', { min: 1, keepAspect: (o) => !!o.keep_aspect }),
+      field('Keep aspect ratio', c, 'keep_aspect', { type: 'checkbox' }),
       field('Rotation (°)', c, 'rotation'),
       field('Opacity (%)', c, 'opacity', { min: 0, get: (v) => Math.round(v * 100), set: (v) => clamp(v / 100, 0, 1) }),
     );
@@ -3003,9 +3109,10 @@ function renderInspector() {
       note('A camera on the canvas: what is on air in its area, rendered at its resolution into a picture that cues can show — scaled, moved, rotated, faded, on any display or inside another virtual display. Not sent to any screen itself.'),
       el('h4', {}, 'Area of the canvas it captures'),
       pair('X / Y', v.canvas_rect, 'x', 'y'),
-      pair('W / H', v.canvas_rect, 'w', 'h', { min: 1 }),
+      pair('W / H', v.canvas_rect, 'w', 'h', { min: 1, keepAspect: () => !!v.keep_aspect }),
       el('h4', {}, 'Resolution (pixels)'),
-      pair('W / H', v, 'width', 'height', px),
+      pair('W / H', v, 'width', 'height', { ...px, keepAspect: () => !!v.keep_aspect }),
+      field('Keep aspect ratio', v, 'keep_aspect', { type: 'checkbox' }),
       el('div', { class: 'btns' },
         el('button', { title: 'One pixel of the picture per canvas pixel', onclick: () => edit(() => { v.width = clamp(Math.round(v.canvas_rect.w), 1, 16384); v.height = clamp(Math.round(v.canvas_rect.h), 1, 16384); }) }, 'Resolution = area'),
         el('button', { title: 'A cue showing this virtual display, at the playhead of the open timeline (or drag it from the Show inspector onto a track)', onclick: () => addVirtualCue(v) }, '+ Cue showing it')),

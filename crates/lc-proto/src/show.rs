@@ -192,6 +192,9 @@ pub struct VirtualDisplay {
     /// Resolution of the captured picture, in pixels.
     pub width: u32,
     pub height: u32,
+    /// Authoring only (Runners ignore it): the Producer keeps the area's,
+    /// and the resolution's, width : height when one of them is changed.
+    pub keep_aspect: bool,
 }
 
 impl Default for VirtualDisplay {
@@ -207,6 +210,7 @@ impl Default for VirtualDisplay {
             },
             width: 1920,
             height: 1080,
+            keep_aspect: false,
         }
     }
 }
@@ -394,6 +398,9 @@ pub struct Cue {
     pub opacity: f32,
     pub fade_in_s: f64,
     pub fade_out_s: f64,
+    /// Authoring only (Runners ignore it): the Producer keeps `w : h` when
+    /// one of them is changed, in the inspector or on the stage.
+    pub keep_aspect: bool,
 }
 
 impl Default for Cue {
@@ -415,6 +422,7 @@ impl Default for Cue {
             opacity: 1.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
+            keep_aspect: false,
         }
     }
 }

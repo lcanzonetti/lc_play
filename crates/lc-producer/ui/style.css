@@ -242,3 +242,4 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 .task.main { cursor: default; font-size: 12px; }
 .task.main:hover { background: none; }
 .task[draggable=true] { cursor: grab; }
+.num { font-variant-numeric: tabular-nums; } /* number fields (text inputs: arithmetic can be typed) */

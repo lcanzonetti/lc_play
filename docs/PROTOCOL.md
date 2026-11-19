@@ -281,7 +281,7 @@ broadcasts them back. Other tools may ignore it.
     "virtuals": [
       { "id": "v1", "name": "LED feed",
         "canvas_rect": { "x": 4000, "y": 0, "w": 960, "h": 540 },
-        "width": 1920, "height": 1080 }
+        "width": 1920, "height": 1080, "keep_aspect": true }
     ]
   },
   "assets": [
@@ -303,7 +303,8 @@ broadcasts them back. Other tools may ignore it.
         "source": { "type": "asset", "asset": "636c6970" },
         "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false, "free_run": false,
         "x": 0, "y": 0, "w": 1920, "h": 1080,
-        "rotation": 0, "opacity": 1, "fade_in_s": 1, "fade_out_s": 1 }
+        "rotation": 0, "opacity": 1, "fade_in_s": 1, "fade_out_s": 1,
+        "keep_aspect": false }
     ] }
   ]
 }
@@ -331,6 +332,8 @@ broadcasts them back. Other tools may ignore it.
   of the loop is left out: no feedback, no picture from an earlier frame.
   Runners older than this field refuse a show with a `virtual` source.
 * The first track is in front.
+* `keep_aspect` (cues, virtual displays) is for the Producer only: it keeps
+  width : height when one is changed. Runners ignore it.
 * `runner` is a Runner's `--name`; empty means any Runner.
 * A display's `test_pattern` (optional): `{ "kind": "lines" | "counter",
   "fps": 60 }` — drawn by its Runner over the content, on that display only,
