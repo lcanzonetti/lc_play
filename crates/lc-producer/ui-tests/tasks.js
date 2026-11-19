@@ -111,6 +111,39 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   await p.keyboard.press('Control+c');
   assert((await p.evaluate(() => JSON.stringify(clipboard))) === before, 'Ctrl+C in a text field leaves the cue clipboard alone');
 
+  // ── A stopped task is off stage; clicking its ruler brings it back,
+  //    paused on that frame: its cue is shown (on the stage, and inside a
+  //    virtual display capturing it).
+  await p.evaluate(() => {
+    edit(() => { S.doc = defaultDoc(); S.sel = null; S.tl = MAIN; });
+    S.replaceNext = true; sendDoc();
+    addTask();
+    addCue({ name: 'blue', source: { type: 'color', rgba: [0, 0, 1, 1] }, duration_s: 4, x: 3000, y: 0, w: 100, h: 100 }, S.tl, 0, 2);
+    addVirtual();
+    const v = S.doc.stage.virtuals[0];
+    edit(() => { v.canvas_rect = { x: 3000, y: 0, w: 100, h: 100 }; v.width = 100; v.height = 100; });
+    addVirtualCue(v, MAIN, 0, 0);
+    S.tl = S.doc.tasks[0].id; select(null);
+    seek(0); // the main timeline (left at 10 s above): its cue on air
+  });
+  await p.waitForTimeout(500);
+  const taskId = await p.evaluate(() => S.tl);
+  assert(!(await p.evaluate((id) => isActive(id), taskId)), 'a task never played is off stage');
+  const ruler = await (await p.$('#ruler')).boundingBox();
+  await p.mouse.click(ruler.x + 3 * 40 + 1, ruler.y + 5); // 3 s
+  await p.waitForTimeout(400);
+  const tr = await p.evaluate((id) => currentTransport(id), taskId);
+  assert(tr?.active && !tr.playing, `clicking the ruler brings it on stage, paused (${JSON.stringify(tr && { active: tr.active, playing: tr.playing })})`);
+  assert(Math.abs((await p.evaluate((id) => showSeconds(id), taskId)) - 3) < 0.05, 'at the clicked time');
+  const vid = await p.evaluate(() => S.doc.stage.virtuals[0].id);
+  const blue = await p.evaluate((id) => [...virtualCanvases.get(id).getContext('2d').getImageData(50, 50, 1, 1).data], vid);
+  assert(blue[2] > 250 && blue[3] === 255, `the cue under the playhead is shown, also inside the virtual display (${blue})`);
+  await p.click('#tl-stop');
+  await p.waitForTimeout(400);
+  assert(!(await p.evaluate((id) => isActive(id), taskId)), 'Stop takes it off stage again');
+  const gone = await p.evaluate((id) => [...virtualCanvases.get(id).getContext('2d').getImageData(50, 50, 1, 1).data], vid);
+  assert(gone[3] === 0, 'and the virtual display no longer shows it');
+
   if (process.argv[2]) await p.screenshot({ path: process.argv[2] });
   assert(!errs.length, `no page errors ${errs.join(' | ')}`);
   await b.close();

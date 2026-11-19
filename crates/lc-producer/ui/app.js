@@ -2158,7 +2158,7 @@ function renderTasks() {
       el('span', { class: 'state dim mono', dataset: { tl: task.id } }, taskStateText(task.id)),
       el('button', { class: 'small', title: 'Play', onclick: () => command({ type: 'play' }, task.id) }, '▶'),
       el('button', { class: 'small', title: 'Pause', onclick: () => command({ type: 'pause' }, task.id) }, '⏸'),
-      el('button', { class: 'small', title: 'Stop (take off stage)', onclick: () => command({ type: 'stop' }, task.id) }, '⏹'));
+      el('button', { class: 'small', title: 'Stop (take off stage; click its ruler to bring it back, paused)', onclick: () => command({ type: 'stop' }, task.id) }, '⏹'));
   }
   box.append(el('div', { class: 'task main dim', title: 'The main timeline is always behind the tasks' }, el('span', { class: 'name' }, 'Main timeline (always at the back)')));
 }
@@ -3095,7 +3095,7 @@ function renderInspector() {
       el('h3', {}, 'Task'),
       field('Name', task, 'name', { type: 'text' }),
       field('Length (s)', task, 'duration_s', { min: 1 }),
-      note(`An auxiliary timeline with its own transport. It is off stage until played, and is drawn in front of the main timeline; among the tasks, the order in the Tasks window is the stacking (the top one in front — drag to reorder; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste a task). Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
+      note(`An auxiliary timeline with its own transport. It is off stage until played — or positioned: clicking or dragging on its ruler brings it on stage, paused on that frame — and is drawn in front of the main timeline; among the tasks, the order in the Tasks window is the stacking (the top one in front — drag to reorder; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste a task). Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
       deleteButton('Delete task'));
     return;
   }

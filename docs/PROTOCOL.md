@@ -72,7 +72,7 @@ Commands:
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
 | `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP, to the address and `launcher_port` that Runner last reported, default 7406); its supervisor, waiting since the Runner was closed, starts it |
-| `seek` | `show_ns ≥ 0` | jump; play state unchanged |
+| `seek` | `show_ns ≥ 0` | jump; play state unchanged; a stopped task comes back on stage, paused there (a control cue's *jump* does not do that) |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
 | `load_show` | `document` (JSON object), optional `tag` | new show revision, distributed to Runners; replaces the show for everyone |

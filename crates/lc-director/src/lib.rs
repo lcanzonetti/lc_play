@@ -1079,8 +1079,10 @@ impl Core {
                     ControlAction::Stop => TransportChange::Stop {
                         deactivate: target.is_some(),
                     },
+                    // A jump moves the playhead but does not bring a stopped
+                    // task on stage (an operator's seek does).
                     ControlAction::Jump => {
-                        TransportChange::Seek((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
+                        TransportChange::Jump((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
                     }
                 };
                 self.apply(&mut st, target, change, at);

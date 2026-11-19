@@ -421,7 +421,9 @@ The document is defined in `lc-proto/src/show.rs` (wire form in
 
 Each timeline has its own `TransportState`; everything in section 3 applies
 to each independently, on the one shared cluster clock. A task is *inactive*
-(off stage) until played and after being stopped; the Runner evaluates each
+(off stage) until played or positioned, and after being stopped: a `seek`
+(the operator clicking its ruler) brings it on stage, paused on that frame;
+a control cue's jump only moves it (`TransportChange::Jump`). The Runner evaluates each
 layer against the transport of the timeline it belongs to and draws tasks in
 front of the main timeline.
 

@@ -391,6 +391,21 @@ async fn auxiliary_timelines_have_their_own_transport() {
     assert!(!status.tasks["intro"].active);
     assert_eq!(status.tasks["intro"].show_time_at(status.cluster_ns), 0);
 
+    // Positioning a stopped task brings it back on stage, paused there.
+    core.command_on(
+        Command::Seek {
+            show_ns: 2 * NANOS_PER_SEC,
+        },
+        Some("intro"),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = core.status();
+    let intro = status.tasks["intro"];
+    assert!(intro.active && !intro.playing, "on stage, paused");
+    assert_eq!(intro.show_time_at(status.cluster_ns), 2 * NANOS_PER_SEC);
+    core.command_on(Command::Stop, Some("intro")).unwrap();
+
     // …whereas stopping the main timeline only rewinds it.
     core.command(Command::Seek {
         show_ns: 5 * NANOS_PER_SEC,

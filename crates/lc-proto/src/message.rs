@@ -95,7 +95,8 @@ pub enum Command {
     /// Main timeline: pause and return to the start. Auxiliary timeline:
     /// take it off stage (it renders nothing until played again).
     Stop,
-    /// Jump to an absolute show time; keeps the play/pause state.
+    /// Go to an absolute show time; keeps the play/pause state. A stopped
+    /// auxiliary timeline comes back on stage, paused at that time.
     Seek {
         show_ns: i64,
     },
