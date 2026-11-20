@@ -359,7 +359,14 @@ presentation (no statistics, no barrier), `LCPLAY_PRESENT_BARRIER=0` keeps
 the own swap chain without the barrier, `LCPLAY_FRAME_LATENCY=1..3` (default
 2) sets how many frames are queued ahead of the display.
 
-The render loop runs at multimedia priority (MMCSS "Playback") and decoding
+With several graphics cards, each output is rendered by the card its
+monitor is connected to, each card on a render thread of its own, and every
+card shows the same frame of a layer that spans them (see
+`docs/ARCHITECTURE.md` §5). An output's sync line then also shows `split N`
+if a card could not show the frame decided for that refresh.
+`LCPLAY_CARD_THREADS=0` renders every card in turn on one thread.
+
+The render loops run at multimedia priority (MMCSS "Playback") and decoding
 below normal, so a busy CPU delays a video layer rather than every output.
 The Runner also opts out of Windows power throttling: otherwise Windows
 lowers a program's CPU speed (and, on CPUs with efficiency cores, moves it

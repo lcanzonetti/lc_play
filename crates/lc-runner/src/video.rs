@@ -364,7 +364,11 @@ pub struct VideoContent {
     standby: Option<Decoder>,
     /// Frame currently in the texture.
     shown: Option<i64>,
-    /// The frame last asked for (by `update`).
+    /// A decoded frame taken from the decoder but held back: it is newer
+    /// than the frame another card decided on (see [`Content::follow`]).
+    /// Comes before anything still in the decoder.
+    pending: Option<(i64, Vec<u8>)>,
+    /// The frame last due (by the clock).
     last_want: Option<i64>,
     /// When a decoder was last started; limits how often that happens.
     last_start: Option<std::time::Instant>,
@@ -449,6 +453,7 @@ impl VideoContent {
             decoder: None,
             standby: None,
             shown: None,
+            pending: None,
             last_want: None,
             last_start: None,
             failed: false,
@@ -517,32 +522,41 @@ impl VideoContent {
     }
 }
 
-impl Content for VideoContent {
-    fn update(&mut self, t: f64, gpu: &TextureFactory) {
+impl VideoContent {
+    /// Bring the texture to frame `target`. `due` is the frame the clock
+    /// asks for (what lateness is measured against). `exact`: `target` was
+    /// decided by another card ([`Content::follow`]) — never show a frame
+    /// newer than it, and do not restart the decoder to go back a little.
+    fn advance(&mut self, due: i64, target: i64, exact: bool, gpu: &TextureFactory) {
         if self.failed {
             return;
         }
-        let want = media_frame(&self.timing, self.info.fps(), self.info.frames, t);
-        self.last_want = Some(want);
-        if self.shown == Some(want) {
+        self.last_want = Some(due);
+        if self.shown == Some(target) {
             return;
         }
         let fps = self.info.fps();
 
         // Is the running decoder still useful? It only moves forward, so it
         // is not if the wanted frame is behind it, or so far ahead that
-        // decoding up to it would take longer than starting over.
-        let usable = self
-            .decoder
-            .as_ref()
-            .is_some_and(|d| want >= d.next_frame && want < d.next_frame + (2.0 * fps) as i64);
+        // decoding up to it would take longer than starting over. A frame
+        // held back counts as not yet taken.
+        let reach = |d: &Decoder, pending: &Option<(i64, Vec<u8>)>| {
+            pending.as_ref().map_or(d.next_frame, |(index, _)| *index)
+        };
+        let window = (2.0 * fps) as i64;
+        let usable = self.decoder.as_ref().is_some_and(|d| {
+            let first = reach(d, &self.pending);
+            target < d.next_frame + window
+                && (target >= first || (exact && target >= first - window))
+        });
         if !usable {
             // The common backwards jump is a loop wrapping; the standby
             // decoder was started for exactly that.
             let standby_fits = self
                 .standby
                 .as_ref()
-                .is_some_and(|d| want >= d.next_frame && want < d.next_frame + fps as i64);
+                .is_some_and(|d| target >= d.next_frame && target < d.next_frame + fps as i64);
             // Starting ffmpeg costs on the order of 100 ms. If the wanted
             // frame keeps landing outside the decoder's reach — reverse
             // playback, where every frame is "behind", or fast scrubbing —
@@ -555,18 +569,20 @@ impl Content for VideoContent {
                 .is_some_and(|t| t.elapsed() < MIN_RESTART_INTERVAL);
             if standby_fits {
                 self.decoder = self.standby.take();
+                self.pending = None;
             } else if self.decoder.is_some() && too_soon {
                 return;
             } else {
                 self.standby = None;
-                self.decoder = self.start_decoder(want);
+                self.pending = None;
+                self.decoder = self.start_decoder(target);
             }
         }
 
         // Approaching the loop point: get the next pass ready.
         if self.timing.media_loop && self.standby.is_none() {
             if let Some(total) = self.info.frames {
-                if total - want <= fps as i64 && total - self.first_frame() > (2.0 * fps) as i64 {
+                if total - target <= fps as i64 && total - self.first_frame() > (2.0 * fps) as i64 {
                     self.standby = self.start_decoder(self.first_frame());
                 }
             }
@@ -585,11 +601,17 @@ impl Content for VideoContent {
             return;
         };
         let mut chosen: Option<(i64, Vec<u8>)> = None;
-        while let Some((index, frame)) = decoder.try_next() {
+        let mut next = self.pending.take();
+        while let Some((index, frame)) = next.take().or_else(|| decoder.try_next()) {
+            if exact && index > target {
+                // Newer than what the other card shows: keep it for later.
+                self.pending = Some((index, frame));
+                break;
+            }
             if let Some((_, older)) = chosen.replace((index, frame)) {
                 decoder.give_back(older);
             }
-            if index >= want {
+            if index >= target {
                 break;
             }
         }
@@ -602,11 +624,32 @@ impl Content for VideoContent {
         }
     }
 
+    fn due(&self, t: f64) -> i64 {
+        media_frame(&self.timing, self.info.fps(), self.info.frames, t)
+    }
+}
+
+impl Content for VideoContent {
+    fn update(&mut self, t: f64, gpu: &TextureFactory) {
+        let due = self.due(t);
+        self.advance(due, due, false, gpu);
+    }
+
+    fn follow(&mut self, t: f64, frame: i64, gpu: &TextureFactory) {
+        let due = self.due(t);
+        self.advance(due, frame, true, gpu);
+    }
+
+    fn shown_frame(&self) -> Option<i64> {
+        self.shown
+    }
+
     fn idle(&mut self) {
         // Dropping a decoder kills its ffmpeg. `shown` is kept: the texture
         // still holds that frame, and the next `update` restarts from there.
         self.decoder = None;
         self.standby = None;
+        self.pending = None;
     }
 
     fn retime(&mut self, timing: &Timing) {
@@ -729,6 +772,69 @@ mod tests {
         let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0).unwrap();
         let (_, frame) = d.next_blocking().unwrap();
         assert!((233..=237).contains(&frame[0]), "Y of white = {}", frame[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Call `step` until `done` says so (decoding runs on other threads),
+    /// for at most five seconds.
+    fn until(mut step: impl FnMut(), done: impl Fn() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            step();
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_follower_shows_the_decided_frame_not_a_newer_one() {
+        let dir = std::env::temp_dir().join(format!("lcplay-follow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(path) = make_clip(&dir) else {
+            eprintln!("SKIPPED: ffmpeg not available");
+            return;
+        };
+        let Some(gpu) = crate::render::Gpu::headless() else {
+            eprintln!("skipping GPU test: no adapter (install mesa-vulkan-drivers)");
+            return;
+        };
+        let info = VideoInfo::probe(&path).unwrap();
+        let timing = Timing {
+            start: 0.0,
+            ..Default::default()
+        };
+        let factory = gpu.factory();
+        let mut video = VideoContent::new(&path, info, &timing, &factory);
+
+        // Another card decided on frame 3 while the clock says 5: frame 3 it
+        // is, and the decoder's newer frames are held back.
+        let shown = std::cell::Cell::new(None);
+        let mut follow = |t: f64, frame: i64| {
+            video.follow(t, frame, &factory);
+            shown.set(video.shown_frame());
+            assert!(
+                shown.get().is_none_or(|s| s <= frame),
+                "showed {shown:?} past {frame}"
+            );
+        };
+        assert!(until(|| follow(0.55, 3), || shown.get() == Some(3)));
+        // Some more refreshes on the same decision: it stays.
+        for _ in 0..20 {
+            follow(0.55, 3);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(shown.get(), Some(3));
+        // The next decision: the frame held back is used, no restart.
+        assert!(until(|| follow(0.65, 4), || shown.get() == Some(4)));
+        // Deciding again by itself, it catches up with the clock.
+        let video = std::cell::RefCell::new(video);
+        assert!(until(
+            || video.borrow_mut().update(0.75, &factory),
+            || video.borrow().shown_frame() == Some(7)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

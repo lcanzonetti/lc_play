@@ -2386,7 +2386,7 @@ function renderRunners(force = false) {
     names.map((n) => {
       const { node, h, machine, online } = runnerInfo(n);
       return [n, online, node?.addr, node?.frame_error, h?.sync.locked, Math.round(h?.fps || 0), h?.monitors, h?.gpu, h?.outputs, h?.standby, machine,
-        (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000),
+        (h?.output_health || []).map((o) => [o.presenter, o.barrier, o.missed, o.late_decodes, o.split_frames, o.latency_frames, o.grid_offset_ns == null ? null : Math.round(o.grid_offset_ns / 100000),
           o.refresh_hz == null ? null : Math.round(o.refresh_hz * 10), o.frame_counter == null]),
         (h?.downloads || []).map((d) => [d.name, d.total ? Math.floor((d.done / d.total) * 200) : Math.round(d.done / 1e7), !!d.error, d.retry_in_s]),
         S.status?.grid_source === node?.node_id];
@@ -2543,9 +2543,11 @@ function outputSyncRows(h, node) {
       o.latency_frames != null ? `${o.latency_frames} frame(s) ahead` : null,
       `missed ${o.missed}`,
       `late ${o.late_decodes}`,
+      // Only Runners with several cards can split a frame between them.
+      o.split_frames ? `split ${o.split_frames}` : null,
       o.frame_counter != null ? `counter ${o.frame_counter}` : null,
     ];
-    const bad = o.missed > 0 || o.late_decodes > 0;
+    const bad = o.missed > 0 || o.late_decodes > 0 || o.split_frames > 0;
     rows.push(el('span', {}, `Sync ${o.id}`), el('span', { class: bad ? 'warn-text' : null, title: 'Frames presented: ' + o.presents }, parts.filter(Boolean).join(' · ')));
   }
   if (isRef) rows.push(el('span', {}, 'Grid'), el('span', {}, 'This Runner\'s refresh is the reference for the cluster\'s refresh grid.'));

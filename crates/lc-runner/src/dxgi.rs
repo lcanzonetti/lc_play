@@ -119,6 +119,15 @@ pub struct SwapChain {
     broken: bool,
 }
 
+// SAFETY: a swap chain is owned by one card and used by whichever thread
+// holds that card's lock — its render thread, or the window thread between
+// two frames — never by two at once. What it holds may be used from any
+// thread: D3D12 and DXGI objects are free-threaded, and the event handles
+// (the frame-latency waitable, the barrier event) are process-wide kernel
+// handles that any thread can wait on and close. Only `HANDLE` (a raw
+// pointer) keeps the compiler from seeing that.
+unsafe impl Send for SwapChain {}
+
 impl SwapChain {
     /// Create the swap chain for `hwnd` on wgpu's device. `format` is the
     /// format wgpu renders in (an sRGB view of the swap chain's buffers).

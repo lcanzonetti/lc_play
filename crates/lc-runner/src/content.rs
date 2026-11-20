@@ -67,12 +67,31 @@ impl Default for Sampling {
 }
 
 /// Anything that can supply a texture to the scene pipeline for a given time.
-pub trait Content {
+///
+/// `Send`: each card's contents live with that card's render thread.
+pub trait Content: Send {
     /// Advance to time `t` (seconds on the layer's timeline, or cluster time
     /// for a free-running layer), uploading a new frame if the source is
     /// dynamic, and finishing any loading that has completed. Must return
     /// quickly: it runs once per layer per rendered frame.
     fn update(&mut self, _t: f64, _gpu: &TextureFactory) {}
+
+    /// Like [`update`](Self::update), but show media frame `frame` rather
+    /// than the one due at `t`: another card has already shown that frame
+    /// for the refresh being rendered (see [`crate::plan`]), and both cards
+    /// must show the same. A frame newer than `frame` is held back; if
+    /// `frame` itself is not available the content shows what it can and
+    /// [`shown_frame`](Self::shown_frame) tells. Content without frames
+    /// ignores it.
+    fn follow(&mut self, t: f64, _frame: i64, gpu: &TextureFactory) {
+        self.update(t, gpu);
+    }
+
+    /// The media frame in the textures, for content made of frames (video);
+    /// `None` for anything else, or before the first frame.
+    fn shown_frame(&self) -> Option<i64> {
+        None
+    }
 
     /// The layer's timing changed (it was moved on the timeline) while its
     /// source stayed the same. Dynamic content adopts the new timing instead

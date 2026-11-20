@@ -256,7 +256,7 @@ pub struct HapContent {
     mapped: MappedSlots,
     /// Frame now in the texture.
     shown: Option<i64>,
-    /// Last frame asked for, to tell the direction of playback.
+    /// Last frame due, to tell the direction of playback.
     last_want: Option<i64>,
     step: i64,
 }
@@ -603,10 +603,17 @@ fn worker(
     }
 }
 
-impl Content for HapContent {
-    fn update(&mut self, t: f64, gpu: &TextureFactory) {
+impl HapContent {
+    fn due(&self, t: f64) -> i64 {
         let total = Some(self.track.frames.len() as i64);
-        let want = media_frame(&self.timing, self.track.fps(), total, t);
+        media_frame(&self.timing, self.track.fps(), total, t)
+    }
+
+    /// Bring the texture to frame `want` (the one due, or the one another
+    /// card decided on: [`Content::follow`]); `due` is the frame the clock
+    /// asks for. HAP shows exactly the frame asked for or holds the last
+    /// one, so following needs nothing more than asking for that frame.
+    fn advance(&mut self, due: i64, want: i64, gpu: &TextureFactory) {
         if let Some(last) = self.last_want {
             // The stride of playback, in frames per rendered frame: 1 at
             // normal speed, 2 at double speed (or with a 60 fps clip on a
@@ -614,9 +621,9 @@ impl Content for HapContent {
             // the frames decoded are the ones that will be wanted. A jump of
             // more than half the loop is a loop wrapping round, not a change
             // of direction: the stride is kept.
-            self.step = next_stride(self.step, last, want, self.loop_span());
+            self.step = next_stride(self.step, last, due, self.loop_span());
         }
-        self.last_want = Some(want);
+        self.last_want = Some(due);
         self.start_workers(gpu);
         self.reclaim_uploads(gpu);
 
@@ -690,6 +697,22 @@ impl Content for HapContent {
         });
         self.in_flight.push((slot, batch));
         self.shown = Some(index);
+    }
+}
+
+impl Content for HapContent {
+    fn update(&mut self, t: f64, gpu: &TextureFactory) {
+        let due = self.due(t);
+        self.advance(due, due, gpu);
+    }
+
+    fn follow(&mut self, t: f64, frame: i64, gpu: &TextureFactory) {
+        let due = self.due(t);
+        self.advance(due, frame, gpu);
+    }
+
+    fn shown_frame(&self) -> Option<i64> {
+        self.shown
     }
 
     fn idle(&mut self) {
@@ -834,6 +857,25 @@ impl Content for LazyVideo {
         }
         if let Some(inner) = self.inner() {
             inner.update(t, gpu);
+        }
+    }
+
+    fn follow(&mut self, t: f64, frame: i64, gpu: &TextureFactory) {
+        if matches!(self.state, State::Loading(_)) {
+            // Still being examined: the plain update finishes that.
+            self.update(t, gpu);
+            return;
+        }
+        if let Some(inner) = self.inner() {
+            inner.follow(t, frame, gpu);
+        }
+    }
+
+    fn shown_frame(&self) -> Option<i64> {
+        match &self.state {
+            State::Hap(c) => c.shown_frame(),
+            State::Ffmpeg(c) => c.shown_frame(),
+            _ => None,
         }
     }
 

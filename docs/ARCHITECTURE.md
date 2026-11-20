@@ -361,6 +361,39 @@ measured, rather than evaluate a transport against the wrong clock.
 A stand-alone Runner (no `--director`) uses the same playhead with the local
 clock as cluster clock and the keyboard as transport.
 
+### Several graphics cards
+
+Each output is rendered by the card its monitor is connected to (Windows,
+D3D12), and each card has a render thread of its own (`card.rs`): a card
+never waits for another card's refresh, uploads or encoding. The window
+thread keeps the windows, the show and the operator's requests, and changes
+a card only while holding that card's lock, between two of its frames.
+`LCPLAY_CARD_THREADS=0` renders every card in turn on the window thread, as
+before.
+
+What a frame shows is decided **once per machine** (`plan.rs`): each card
+maps the refresh it renders for to a plan key — the Director's grid instant
+when frame-locked, otherwise the nearest refresh of the machine's reference
+output (the first output of the lowest-numbered card) if the card refreshes
+at the same rate — and the first card to need that key builds the plan (show
+position, each layer's time and media time, free-run on-air instants) from
+one clock reading; the others reuse it. A plan also records, per layer, the
+video frame the first card showed: a card rendering the same refresh later
+shows that frame (`Content::follow`), so when a decoder is late every card
+holds the same older frame instead of splitting the picture at the boundary
+between the cards. A card that cannot show the decided frame counts a
+`split` frame on the outputs concerned (output health, Producer).
+
+Without frame lock, the cards' scanouts are not aligned: each card shows the
+plan of the reference refresh nearest to its own, up to half a refresh away.
+Only frame lock (NVIDIA RTX PRO Sync / Quadro Sync) aligns the scanouts
+themselves. `LCPLAY_SPLIT_CARDS=1` opens one device per output even on one
+card: a test aid that runs the multi-card code on any machine.
+
+Decoding is still per card (a layer spanning two cards is decoded on each,
+on the card ffmpeg picks, see `MULTI_GPU.md`); a decode pool shared by the
+cards is the next phase.
+
 ## 6. Code structure
 
 ```
@@ -371,7 +404,7 @@ crates/
   lc-net        control-channel client (WebSocket)
   lc-director   Core (state + command logic) · server (WS/HTTP) · store (persistence)
   lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
-                renderer (app, render, content, video, show, virtuals)
+                renderer (app, card, plan, render, content, video, show, virtuals)
   lc-assets     media HTTP server (library, Range streaming, upload, thumbnails,
                 optimisation jobs)
   lc-hap        HAP frames (decode, encode, re-chunk) and QuickTime read/write

@@ -43,6 +43,9 @@ snap = "1.1.2"
 netdev = "0.36"
 gethostname = "1.1.0"
 base64 = "0.23.1"
+# Each card's state behind a lock its render thread hands over fairly
+# (`unlock_fair`), so the window thread is never starved of it.
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 
 [dev-dependencies]
 # Integration tests run a real Director in-process next to several agents.

@@ -26,6 +26,24 @@ pub struct Show {
     pub playback: Playback,
 }
 
+impl Show {
+    /// A show with nothing in it: what a clustered Runner renders (i.e. no
+    /// windows at all) until the Director has sent one.
+    pub fn empty() -> Show {
+        Show {
+            canvas: Canvas {
+                width: 1.0,
+                height: 1.0,
+                background: [0.0, 0.0, 0.0, 1.0],
+            },
+            outputs: Vec::new(),
+            virtuals: Vec::new(),
+            layers: Vec::new(),
+            playback: Playback::default(),
+        }
+    }
+}
+
 /// A virtual display: the region of the canvas it captures, and the
 /// resolution of the picture it captures it into.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

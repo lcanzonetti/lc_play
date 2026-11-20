@@ -214,6 +214,12 @@ pub struct OutputHealth {
     /// than the one due, because the decoder was late.
     #[serde(default)]
     pub late_decodes: u64,
+    /// Frames in which a layer on this output showed a different frame
+    /// than another card of the same Runner showed for the same refresh
+    /// (this card's decoder did not have the frame decided on). Always 0
+    /// with a single card.
+    #[serde(default)]
+    pub split_frames: u64,
     /// How many refreshes after the one it starts rendering in a frame
     /// reaches the screen (measured; `dxgi` only).
     #[serde(default)]

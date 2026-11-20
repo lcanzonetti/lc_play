@@ -23,6 +23,7 @@
 pub mod agent;
 pub mod app;
 pub mod assets;
+pub mod card;
 pub mod content;
 #[cfg(windows)]
 pub mod dxgi;
@@ -35,6 +36,7 @@ pub mod machine;
 pub use lc_hap::mov;
 #[cfg(windows)]
 pub mod nvapi;
+pub mod plan;
 pub mod playhead;
 pub mod priority;
 pub mod render;

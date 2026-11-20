@@ -150,6 +150,10 @@ renders each output on its own GPU (cause 3):
 - Content that is decoded on the CPU (HAP) is uploaded once per GPU. This
   costs PCIe bandwidth but no latency.
 - Content decoded in hardware is decoded on each GPU that shows it.
+  **[Not what the code does]**: every decoder runs on the adapter ffmpeg
+  picks by default (`-hwaccel auto` with no device); see `MULTI_GPU.md`.
+  Each card renders on its own thread, from one frame plan per machine
+  (`ARCHITECTURE.md` §5).
 - NVIDIA Mosaic, where the driver presents several GPUs as one display,
   remains an alternative that needs no per-GPU code.
 

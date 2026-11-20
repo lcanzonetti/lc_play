@@ -332,3 +332,23 @@ The real throughput ceiling after that is the **CPU/PCIe round trip** of every d
 - Microsoft Learn: [IDXGIFactory1::EnumAdapters1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgifactory1-enumadapters1) (2024-02-22); [EnumAdapterByGpuPreference](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-idxgifactory6-enumadapterbygpupreference) (2024-02-22); [Cross-adapter resources](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/rendering-on-a-discrete-gpu-using-cross-adapter-resources) (2025-03-25).
 - NVIDIA: [NVDEC Application Note 13.1](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/nvdec-application-note/index.html); [CUDA environment variables](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html); RTX PRO 6000 Blackwell datasheet. These came from search excerpts; direct fetch was blocked.
 - Repository docs: `docs/ARCHITECTURE.md` (open items, the "only Linux has been run" status), `docs/PLAYBACK_PLAN.md` §2 and §3.4.
+
+---
+
+## Status (2026-11-20)
+
+Phase 1 (sync) is implemented on the long-lived branch (not on `main`):
+
+- **Machine frame plan** (`crates/lc-runner/src/plan.rs`): one plan per
+  refresh for every card — the Director's grid instant when frame-locked,
+  otherwise the reference output's nearest refresh at the same rate.
+- **One late-frame decision** per layer and refresh: the first card's frame
+  stands; followers show it (`Content::follow`), and failures are counted
+  as `split_frames` in `OutputHealth` (Producer: `split N`).
+- **Render thread per card** (`crates/lc-runner/src/card.rs`), with
+  `LCPLAY_CARD_THREADS=0` to go back to one loop, and `LCPLAY_SPLIT_CARDS=1`
+  to run the multi-card path on one card for testing.
+
+Tested on Linux (lavapipe, Xvfb, two devices on one adapter). **Not yet run
+on Windows/D3D12 or on two physical cards.**
+

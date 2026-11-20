@@ -1,10 +1,16 @@
 //! The windowing + event-loop layer (winit 0.30 `ApplicationHandler`).
 //!
-//! It creates one window per output, brings up the GPU, loads each layer's
-//! content, then drives a continuous frame loop. Each
-//! frame samples the [`Playhead`] **once** and renders every output from that
-//! single timestamp in one GPU submission, so outputs never disagree about
-//! show time. Pacing comes from vsync (FIFO present).
+//! It creates one window per output and brings up a [`Card`] for each
+//! graphics card that drives one — the card the output's monitor is
+//! connected to. Each card renders its outputs on its own thread (see
+//! [`crate::card`]); every frame of every card is rendered from the
+//! machine's frame plan for its refresh ([`crate::plan`]), so outputs never
+//! disagree about show time, nor — when a decoder is late — about which
+//! frame of a layer to show. Pacing comes from vsync.
+//!
+//! This thread (the window thread) keeps the windows, the show and the
+//! operator's requests; it changes a card only while holding that card's
+//! lock, between two of the card's frames.
 //!
 //! The playhead is the only link to the rest of the cluster: stand-alone it
 //! runs on the local clock, under a Director it follows cluster time — the
@@ -20,13 +26,14 @@
 //! ↓/↑ = seek ±30s. Esc = quit.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -34,14 +41,12 @@ use lc_proto::{RunnerAction, NANOS_PER_SEC};
 use lc_time::TransportChange;
 
 use crate::assets::AssetCache;
-use crate::content::{self, Content};
-use crate::frametime::{FrameTimer, Phase};
+use crate::card::{self, Card, CardGuard, CardHandle, Scene, Shared};
+use crate::plan::Planner;
 use crate::playhead::Playhead;
-use crate::playhead::Position;
-use crate::render::{Capture, Gpu, OutputGpu, VirtualGpu};
-use crate::show::{Canvas, Output, Playback, Rect, Show, Source};
+use crate::render::{Capture, Gpu};
+use crate::show::{Output, Show};
 use crate::stage;
-use crate::virtuals::{self, overlaps};
 
 /// The cluster time at which a cue starting at `start_s` went on air under
 /// transport `state`, as seen at cluster time `now`.
@@ -86,9 +91,6 @@ pub fn on_air_since(state: &lc_proto::TransportState, start_s: f64, now: i64) ->
 /// Width of the output pictures sent to the operator, in pixels.
 const PREVIEW_WIDTH: u32 = 480;
 
-/// How long before a layer appears its content starts preparing (seconds).
-const PREROLL_S: f64 = 1.0;
-
 /// Where the show being rendered comes from.
 pub enum ShowSource {
     /// A show file given on the command line. Never changes.
@@ -101,15 +103,11 @@ pub enum ShowSource {
     },
 }
 
+/// A window, and the card that renders it.
 struct RenderWindow {
-    /// Before `window`: fields drop in order, and the swap chain must be
-    /// released before its window is destroyed.
-    gpu: OutputGpu,
     window: Arc<Window>,
-    /// Index into `App::gpus`: the card this output is rendered by.
-    gpu_idx: usize,
-    /// Index into `show.outputs`.
-    output_idx: usize,
+    /// Index into `App::cards`.
+    card: usize,
     /// The output as it was last applied to this window.
     output: Output,
 }
@@ -117,27 +115,21 @@ struct RenderWindow {
 pub struct App {
     source: ShowSource,
     /// The show as the renderer sees it (empty until a cluster show arrives).
-    show: Show,
-    playhead: Arc<Playhead>,
-    /// One device per graphics card that drives an output.
-    gpus: Vec<Gpu>,
-    /// Per card, one entry per layer, parallel to `show.layers`…
-    contents: Vec<Vec<Box<dyn Content>>>,
-    /// …and the identity of each, for reuse when the show is edited.
-    content_keys: Vec<Vec<String>>,
-    /// Per card, one entry per virtual display, parallel to `show.virtuals`.
-    virtuals: Vec<Vec<VirtualGpu>>,
+    show: Arc<Show>,
+    /// The playhead, the frame planner, and the flags the cards set.
+    shared: Arc<Shared>,
+    /// One per graphics card that drives an output (see [`crate::card`]).
+    cards: Vec<CardHandle>,
+    /// The cards' render threads (none with `LCPLAY_CARD_THREADS=0`).
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// Whether cards render on threads of their own, or in turn on this one.
+    threaded: bool,
     /// When output health was last handed to the agent.
     health_at: Instant,
     windows: Vec<RenderWindow>,
     /// The outputs the current windows were built for.
     window_outputs: Vec<Output>,
     by_id: HashMap<WindowId, usize>,
-    /// Layer indices sorted back-to-front by z.
-    draw_order: Vec<usize>,
-    stats: FrameStats,
-    /// Where each frame's time goes; slow frames are logged.
-    timing: FrameTimer,
     /// Cluster only: (show id, asset-cache generation) of what is applied.
     applied: Option<(String, u64)>,
     started: bool,
@@ -145,9 +137,6 @@ pub struct App {
     reloads_done: u64,
     /// Outputs closed on the operator's request.
     standby: bool,
-    /// Free-running layers on air: layer id → the cluster time they went on
-    /// air (their media runs from there).
-    onsets: HashMap<String, i64>,
     /// Output pictures on their way back from the GPU.
     captures: Vec<Capture>,
     /// How the process should end when the event loop stops: 0 to quit,
@@ -155,95 +144,88 @@ pub struct App {
     pub exit_code: i32,
 }
 
-/// How the frame timing log names layer `index`: its id, and the file it
-/// shows, if any.
-fn layer_label(show: &Show, index: usize) -> String {
-    let Some(layer) = show.layers.get(index) else {
-        return format!("layer #{index}");
-    };
-    match &layer.source {
-        Source::Video { path } | Source::Image { path } => {
-            let file = std::path::Path::new(path)
-                .file_name()
-                .map_or_else(|| path.clone(), |f| f.to_string_lossy().into_owned());
-            format!("'{}' ({file})", layer.id)
-        }
-        _ => format!("'{}'", layer.id),
-    }
-}
-
-/// Logs the frame rate every few seconds so a show's performance is visible.
-struct FrameStats {
-    frames: u32,
-    since: Instant,
-}
-
-impl FrameStats {
-    const PERIOD: Duration = Duration::from_secs(5);
-
-    /// Count a frame; every `PERIOD` return the measured frame rate.
-    fn tick(&mut self) -> Option<f64> {
-        self.frames += 1;
-        let elapsed = self.since.elapsed();
-        if elapsed < Self::PERIOD {
-            return None;
-        }
-        let fps = self.frames as f64 / elapsed.as_secs_f64();
-        self.frames = 0;
-        self.since = Instant::now();
-        Some(fps)
-    }
-}
-
-/// A show with nothing in it: what a clustered Runner renders (i.e. no
-/// windows at all) until the Director has sent one.
-fn empty_show() -> Show {
-    Show {
-        canvas: Canvas {
-            width: 1.0,
-            height: 1.0,
-            background: [0.0, 0.0, 0.0, 1.0],
-        },
-        outputs: Vec::new(),
-        virtuals: Vec::new(),
-        layers: Vec::new(),
-        playback: Playback::default(),
-    }
+/// One device per output, even for outputs on the same card
+/// (`LCPLAY_SPLIT_CARDS=1`): a test aid that runs the code for several
+/// cards on a machine with one, e.g. a Linux box with a software
+/// rasterizer.
+fn split_cards() -> bool {
+    std::env::var("LCPLAY_SPLIT_CARDS").is_ok_and(|v| v == "1")
 }
 
 impl App {
     pub fn new(source: ShowSource, playhead: Arc<Playhead>) -> Self {
+        let threaded = card::threads_enabled();
+        if !threaded {
+            tracing::info!("cards render in turn on one thread (LCPLAY_CARD_THREADS=0)");
+        }
         App {
             source,
-            show: empty_show(),
-            playhead,
-            gpus: Vec::new(),
-            contents: Vec::new(),
-            content_keys: Vec::new(),
-            virtuals: Vec::new(),
+            show: Arc::new(Show::empty()),
+            shared: Arc::new(Shared {
+                playhead,
+                planner: Planner::default(),
+                stop: AtomicBool::new(false),
+                fatal: AtomicBool::new(false),
+            }),
+            cards: Vec::new(),
+            threads: Vec::new(),
+            threaded,
             health_at: Instant::now(),
             windows: Vec::new(),
             window_outputs: Vec::new(),
             by_id: HashMap::new(),
-            draw_order: Vec::new(),
-            stats: FrameStats {
-                frames: 0,
-                since: Instant::now(),
-            },
-            timing: FrameTimer::from_env(),
             applied: None,
             started: false,
             reloads_done: 0,
             standby: false,
-            onsets: HashMap::new(),
             captures: Vec::new(),
             exit_code: 0,
         }
     }
 
+    fn playhead(&self) -> &Arc<Playhead> {
+        &self.shared.playhead
+    }
+
+    /// Take every card's lock, in order (waiting at most for each card's
+    /// frame in progress).
+    fn lock_all(&self) -> Vec<CardGuard> {
+        self.cards.iter().map(|c| c.lock_arc()).collect()
+    }
+
+    /// Start a render thread for each card that has none yet.
+    fn start_threads(&mut self) {
+        if !self.threaded {
+            return;
+        }
+        while self.threads.len() < self.cards.len() {
+            let card = self.cards[self.threads.len()].clone();
+            match card::spawn(card, self.shared.clone()) {
+                Ok(thread) => self.threads.push(thread),
+                Err(e) => {
+                    tracing::error!(
+                        "cannot start a render thread ({e}); rendering every card on one thread"
+                    );
+                    self.stop_threads();
+                    self.threaded = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// End the render threads.
+    fn stop_threads(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+        self.shared.stop.store(false, Ordering::Relaxed);
+    }
+
     /// Carry out the operator's requests queued by the agent.
     fn handle_requests(&mut self, event_loop: &ActiveEventLoop) {
-        for action in self.playhead.take_requests() {
+        for action in self.playhead().take_requests() {
             match action {
                 RunnerAction::Quit => {
                     tracing::info!("quitting on the operator's request");
@@ -263,37 +245,41 @@ impl App {
                 RunnerAction::Standby if !self.standby => {
                     tracing::info!("standby: closing the outputs");
                     self.standby = true;
-                    self.playhead.set_standby(true);
-                    self.windows.clear();
-                    self.by_id.clear();
-                    self.window_outputs.clear();
-                    self.playhead.update_hardware(|h| h.outputs = 0);
+                    self.playhead().set_standby(true);
+                    self.close_outputs();
+                    self.playhead().update_hardware(|h| h.outputs = 0);
                 }
                 RunnerAction::Resume if self.standby => {
                     tracing::info!("resuming: opening the outputs");
                     self.standby = false;
-                    self.playhead.set_standby(false);
-                    let show = std::mem::replace(&mut self.show, empty_show());
+                    self.playhead().set_standby(false);
+                    let show = self.show.clone();
                     self.apply_show(event_loop, show);
                 }
                 RunnerAction::SendPreview => {
-                    self.timing.note("preview requested");
+                    let mut guards = self.lock_all();
+                    if let Some(g) = guards.first_mut() {
+                        g.timing.note("preview requested");
+                    }
                     self.captures = self
                         .windows
                         .iter()
-                        .map(|rw| {
+                        .filter_map(|rw| {
                             let name = if rw.output.name.is_empty() {
                                 &rw.output.id
                             } else {
                                 &rw.output.name
                             };
-                            self.gpus[rw.gpu_idx].capture_output(&rw.gpu, name, PREVIEW_WIDTH)
+                            let card = &guards[rw.card];
+                            let out = card.output(&rw.output.id)?;
+                            Some(card.gpu.capture_output(&out.gpu, name, PREVIEW_WIDTH))
                         })
                         .collect();
+                    drop(guards);
                     if self.captures.is_empty() {
                         // Nothing to show: answer anyway, so the operator
                         // sees that there are no outputs.
-                        self.playhead.put_previews(Vec::new());
+                        self.playhead().put_previews(Vec::new());
                     }
                 }
                 _ => {}
@@ -302,13 +288,25 @@ impl App {
         self.finish_captures();
     }
 
+    /// Close every window. Each card lets go of its outputs first, so the
+    /// swap chains are released before their windows are destroyed (here,
+    /// on the window thread).
+    fn close_outputs(&mut self) {
+        for mut g in self.lock_all() {
+            g.outputs.clear();
+        }
+        self.windows.clear();
+        self.by_id.clear();
+        self.window_outputs.clear();
+    }
+
     /// Hand finished output pictures to the agent (encoded off this thread).
     fn finish_captures(&mut self) {
         if self.captures.is_empty() {
             return;
         }
-        for gpu in &self.gpus {
-            gpu.poll();
+        for g in self.lock_all() {
+            g.gpu.poll();
         }
         let all_done = self.captures.iter().all(|c| c.take_ready());
         let too_old = self
@@ -318,7 +316,6 @@ impl App {
         if !all_done && !too_old {
             return;
         }
-        self.timing.note("preview read back");
         let pictures: Vec<(String, u32, u32, Vec<u8>)> = self
             .captures
             .drain(..)
@@ -327,7 +324,7 @@ impl App {
                     .map(|rgba| (c.name.clone(), c.width, c.height, rgba))
             })
             .collect();
-        let playhead = self.playhead.clone();
+        let playhead = self.playhead().clone();
         std::thread::spawn(move || {
             let outputs = pictures
                 .into_iter()
@@ -361,24 +358,21 @@ impl App {
     /// the current show — what restarting the Runner would do, without
     /// losing the cluster connection or the clock lock.
     fn reload_if_requested(&mut self, event_loop: &ActiveEventLoop) {
-        let requested = self.playhead.reload_requests();
+        let requested = self.playhead().reload_requests();
         if requested == self.reloads_done {
             return;
         }
         self.reloads_done = requested;
         tracing::info!("reloading outputs");
-        self.timing.note("outputs reloaded");
-        // Per card: the cards stay (`gpus`), so their lists must too —
-        // emptied, not removed, or the rebuild below would index past them.
-        self.contents.iter_mut().for_each(Vec::clear);
-        self.content_keys.iter_mut().for_each(Vec::clear);
-        self.virtuals.iter_mut().for_each(Vec::clear);
-        self.windows.clear();
-        self.by_id.clear();
-        self.window_outputs.clear();
+        // The cards stay; what they hold goes.
+        for mut g in self.lock_all() {
+            g.timing.note("outputs reloaded");
+            g.clear();
+        }
+        self.close_outputs();
         match &self.source {
             ShowSource::Local(show) => {
-                let show = show.clone();
+                let show = Arc::new(show.clone());
                 self.apply_show(event_loop, show);
             }
             // Forget what was applied: the next look at the Director's show
@@ -406,7 +400,7 @@ impl App {
                 scale: m.scale_factor(),
             })
             .collect();
-        self.playhead.update_hardware(|h| h.monitors = monitors);
+        self.playhead().update_hardware(|h| h.monitors = monitors);
     }
 
     /// Cluster only: if the Director's show (or the set of downloaded
@@ -419,7 +413,7 @@ impl App {
         else {
             return;
         };
-        let Some(doc) = self.playhead.show() else {
+        let Some(doc) = self.playhead().show() else {
             return;
         };
         let version = (doc.id.clone(), assets.generation());
@@ -453,43 +447,44 @@ impl App {
             }
         }
         self.applied = Some(version);
-        self.apply_show(event_loop, show);
+        self.apply_show(event_loop, Arc::new(show));
     }
 
     /// Make `show` the one being rendered.
-    fn apply_show(&mut self, event_loop: &ActiveEventLoop, show: Show) {
-        self.timing.note("show applied");
-        // Forget the on-air instants of layers that are gone.
-        self.onsets
-            .retain(|id, _| show.layers.iter().any(|l| &l.id == id && l.timing.free_run));
+    ///
+    /// Every card's lock is held throughout: no card renders a frame of the
+    /// old show with the new plan, or the other way round.
+    fn apply_show(&mut self, event_loop: &ActiveEventLoop, show: Arc<Show>) {
+        let mut guards = self.lock_all();
+        for g in &mut guards {
+            g.timing.note("show applied");
+        }
         // Windows are expensive and visible: touch them only if the displays
         // changed. Moving a cue must not make every output blink.
         // In standby the outputs stay closed, whatever the show says.
         let wanted: &[Output] = if self.standby { &[] } else { &show.outputs };
         if wanted != self.window_outputs.as_slice() {
-            self.timing.note("windows rebuilt");
-            if let Err(e) = self.sync_windows(event_loop, wanted, show.layers.len()) {
+            for g in &mut guards {
+                g.timing.note("windows rebuilt");
+            }
+            if let Err(e) = self.sync_windows(event_loop, &mut guards, wanted, show.layers.len()) {
                 tracing::error!("cannot set up the outputs: {e:#}");
+                for g in &mut guards {
+                    g.outputs.clear();
+                }
                 self.windows.clear();
                 self.by_id.clear();
                 self.window_outputs.clear();
             }
         }
-        self.show = show;
-        self.rebuild_contents();
-
-        let layers = &self.show.layers;
-        self.draw_order = (0..layers.len()).collect();
-        self.draw_order.sort_by(|&a, &b| {
-            layers[a]
-                .transform
-                .z
-                .partial_cmp(&layers[b].transform.z)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for rw in &mut self.windows {
-            self.gpus[rw.gpu_idx].set_layer_count(&mut rw.gpu, layers.len());
+        let generation = self.shared.planner.set_show(show.clone());
+        let scene = Arc::new(Scene::new(show.clone(), generation));
+        for g in &mut guards {
+            g.set_scene(scene.clone());
         }
+        drop(guards);
+        self.show = show;
+        self.start_threads();
     }
 
     /// Bring the windows in line with the outputs of `show`.
@@ -504,6 +499,7 @@ impl App {
     fn sync_windows(
         &mut self,
         event_loop: &ActiveEventLoop,
+        guards: &mut Vec<CardGuard>,
         outputs: &[Output],
         layer_count: usize,
     ) -> anyhow::Result<()> {
@@ -515,7 +511,7 @@ impl App {
         self.by_id.clear();
         self.window_outputs.clear();
 
-        for (idx, output) in outputs.iter().enumerate() {
+        for output in outputs {
             let rw = match existing.remove(&output.id) {
                 Some(mut rw) => {
                     // A windowed display without an explicit size is as big
@@ -530,89 +526,68 @@ impl App {
                         apply_placement(&rw.window, output, event_loop);
                     }
                     // Moved to a monitor on another card: render it there.
-                    if moved && self.gpus.len() > 1 {
+                    if moved && guards.len() > 1 {
                         let wanted = monitor_adapter(&rw.window)
-                            .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)));
-                        if let Some(g) = wanted.filter(|&g| g != rw.gpu_idx) {
-                            let RenderWindow { gpu, window, .. } = rw;
-                            drop(gpu); // one swap chain per window: old one first
-                            let out_gpu =
-                                self.gpus[g].build_output(window.clone(), output, layer_count)?;
-                            tracing::info!(display = %output.id, gpu = %self.gpus[g].adapter_info(), "output moved to another card");
-                            rw = RenderWindow {
-                                gpu: out_gpu,
-                                window,
-                                gpu_idx: g,
-                                output_idx: idx,
-                                output: output.clone(),
-                            };
+                            .and_then(|l| guards.iter().position(|g| g.gpu.luid() == Some(l)));
+                        if let Some(g) = wanted.filter(|&g| g != rw.card) {
+                            // One swap chain per window: the old one first.
+                            guards[rw.card].remove_output(&output.id);
+                            guards[g].add_output(rw.window.clone(), output, layer_count)?;
+                            tracing::info!(display = %output.id, gpu = %guards[g].gpu.adapter_info(), "output moved to another card");
+                            rw.card = g;
                         }
                     }
                     if rw.output.name != output.name {
                         rw.window.set_title(&window_title(output));
                     }
-                    let geometry_changed = rw.output.warp != output.warp
-                        || rw.output.blend != output.blend
-                        || rw.output.rotation_degrees != output.rotation_degrees;
-                    if geometry_changed {
-                        self.gpus[rw.gpu_idx].update_output(&mut rw.gpu, output);
-                    }
+                    guards[rw.card].update_output(&output.id, output);
                     rw.output = output.clone();
-                    rw.output_idx = idx;
                     rw
                 }
-                None => self.open_window(event_loop, output, idx, layer_count)?,
+                None => self.open_window(event_loop, guards, output, layer_count)?,
             };
             self.by_id.insert(rw.window.id(), self.windows.len());
             self.windows.push(rw);
         }
-        // What is left in `existing` belongs to removed displays: dropping it
-        // closes those windows.
-        drop(existing);
+        // What is left in `existing` belongs to removed displays: their
+        // cards let go of them, then dropping them closes the windows.
+        for (id, rw) in existing {
+            guards[rw.card].remove_output(&id);
+            drop(rw);
+        }
 
         self.window_outputs = outputs.to_vec();
-        if !self.gpus.is_empty() {
-            let names: Vec<String> = self.gpus.iter().map(|g| g.adapter_info()).collect();
+        if !guards.is_empty() {
+            let names: Vec<String> = guards.iter().map(|g| g.gpu.adapter_info()).collect();
             let outputs = self.windows.len() as u32;
-            self.playhead.update_hardware(|h| {
+            self.playhead().update_hardware(|h| {
                 h.gpu = Some(names.join(" + "));
                 h.outputs = outputs;
             });
         }
-        tracing::info!(outputs = self.windows.len(), "outputs ready");
+        tracing::info!(
+            outputs = self.windows.len(),
+            cards = guards.len(),
+            "outputs ready"
+        );
         Ok(())
     }
 
-    /// Open the window for one output, and its GPU state (bringing up the
-    /// GPU itself with the first window ever opened).
+    /// Open the window for one output, on the card its monitor is connected
+    /// to (bringing that card up the first time).
     fn open_window(
         &mut self,
         event_loop: &ActiveEventLoop,
+        guards: &mut Vec<CardGuard>,
         output: &Output,
-        idx: usize,
         layer_count: usize,
     ) -> anyhow::Result<RenderWindow> {
         let window = Arc::new(event_loop.create_window(window_attributes(output, event_loop))?);
-        let gpu_idx = self.gpu_for(&window)?;
-        let gpu = &self.gpus[gpu_idx];
-        let out_gpu = gpu.build_output(window.clone(), output, layer_count)?;
-        tracing::info!(
-            display = %output.id,
-            gpu = %gpu.adapter_info(),
-            presenter = out_gpu.presenter_name(),
-            frame_latency = crate::render::frame_latency(),
-            mode_hz = out_gpu
-                .timing
-                .clock
-                .nominal()
-                .map_or_else(|| "unknown".to_string(), |p| format!("{:.3}", 1e9 / p)),
-            "output opened"
-        );
+        let card = self.card_for(guards, &window)?;
+        guards[card].add_output(window.clone(), output, layer_count)?;
         Ok(RenderWindow {
             window,
-            gpu: out_gpu,
-            gpu_idx,
-            output_idx: idx,
+            card,
             output: output.clone(),
         })
     }
@@ -622,12 +597,24 @@ impl App {
     /// which costs a frame of latency on that output alone and keeps it out
     /// of the present barrier. Elsewhere, and on laptops whose screens hang
     /// off the integrated GPU, the one high-performance card.
-    fn gpu_for(&mut self, window: &Arc<Window>) -> anyhow::Result<usize> {
+    fn card_for(
+        &mut self,
+        guards: &mut Vec<CardGuard>,
+        window: &Arc<Window>,
+    ) -> anyhow::Result<usize> {
+        if split_cards() && !guards.is_empty() {
+            let gpu = Gpu::new(window.clone(), None)?;
+            tracing::info!(
+                "GPU: {} (one more device: LCPLAY_SPLIT_CARDS=1)",
+                gpu.adapter_info()
+            );
+            return Ok(self.add_card(guards, gpu));
+        }
         let luid = monitor_adapter(window);
-        if let Some(i) = luid.and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l))) {
+        if let Some(i) = luid.and_then(|l| guards.iter().position(|g| g.gpu.luid() == Some(l))) {
             return Ok(i);
         }
-        if !self.gpus.is_empty() {
+        if !guards.is_empty() {
             // A card of its own only if it is a dedicated D3D12 card we are
             // allowed to use; otherwise the card already rendering. (Checked
             // before building a device: that is expensive.)
@@ -642,10 +629,10 @@ impl App {
         let gpu = Gpu::new(window.clone(), luid)?;
         // The device made may be one we already have (the card asked for was
         // refused), or not identifiable: then use the existing one.
-        if !self.gpus.is_empty() {
+        if !guards.is_empty() {
             match gpu
                 .luid()
-                .and_then(|l| self.gpus.iter().position(|g| g.luid() == Some(l)))
+                .and_then(|l| guards.iter().position(|g| g.gpu.luid() == Some(l)))
             {
                 Some(i) => return Ok(i),
                 None if gpu.luid().is_none() => return Ok(0),
@@ -661,88 +648,27 @@ impl App {
                 " — no BC texture support: HAP will be decoded in software"
             }
         );
-        self.gpus.push(gpu);
-        self.contents.push(Vec::new());
-        self.content_keys.push(Vec::new());
-        self.virtuals.push(Vec::new());
-        // The new card needs the show's contents too.
-        self.rebuild_contents_on(self.gpus.len() - 1);
-        Ok(self.gpus.len() - 1)
+        Ok(self.add_card(guards, gpu))
     }
 
-    /// Load the content of every layer of `self.show`, keeping what was
-    /// already loaded for layers whose source did not change. A layer whose
-    /// source fails (missing file, oversized image, ...) gets a visible
-    /// placeholder and an error log rather than taking the whole show down.
-    fn rebuild_contents(&mut self) {
-        for g in 0..self.gpus.len() {
-            self.rebuild_contents_on(g);
-        }
-    }
-
-    /// [`rebuild_contents`](Self::rebuild_contents) for one card.
-    fn rebuild_contents_on(&mut self, g: usize) {
-        let factory = self.gpus[g].factory();
-
-        // What is loaded now, by identity.
-        let mut loaded: HashMap<String, Vec<Box<dyn Content>>> = HashMap::new();
-        let (keys, contents) = (&mut self.content_keys[g], &mut self.contents[g]);
-        for (key, content) in keys.drain(..).zip(contents.drain(..)) {
-            loaded.entry(key).or_default().push(content);
-        }
-
-        for layer in &self.show.layers {
-            let key = content::cache_key(layer);
-            let content = match loaded.get_mut(&key).and_then(Vec::pop) {
-                Some(mut kept) => {
-                    kept.retime(&layer.timing);
-                    kept
-                }
-                None => {
-                    tracing::debug!(layer = %layer.id, "loading content");
-                    self.timing.note("content loaded");
-                    content::build(layer, &factory).unwrap_or_else(|e| {
-                        tracing::error!(layer = %layer.id, "{e:#}; showing placeholder");
-                        content::placeholder(&factory)
-                    })
-                }
-            };
-            contents.push(content);
-            keys.push(key);
-        }
-        // Whatever is left in `loaded` is no longer used and is dropped here
-        // (for video that also stops its decoder).
-
-        // Virtual displays: keep the picture of one whose id and resolution
-        // did not change (a moved capture area needs nothing on the GPU).
-        let gpu = &self.gpus[g];
-        let layer_count = self.show.layers.len();
-        let mut kept: HashMap<(String, (u32, u32)), VirtualGpu> = self.virtuals[g]
-            .drain(..)
-            .map(|vg| ((vg.id.clone(), vg.size), vg))
-            .collect();
-        self.virtuals[g] = self
-            .show
-            .virtuals
-            .iter()
-            .map(|v| {
-                let mut vg = kept
-                    .remove(&(v.id.clone(), (v.width, v.height)))
-                    .unwrap_or_else(|| gpu.build_virtual(v, layer_count));
-                gpu.set_virtual_layer_count(&mut vg, layer_count);
-                vg
-            })
-            .collect();
+    /// Bring a new card into use. Its lock is added to `guards`; its render
+    /// thread starts once the show has been applied to it.
+    fn add_card(&mut self, guards: &mut Vec<CardGuard>, gpu: Gpu) -> usize {
+        let index = self.cards.len();
+        let handle: CardHandle = Arc::new(parking_lot::Mutex::new(Card::new(index, gpu)));
+        guards.push(handle.lock_arc());
+        self.cards.push(handle);
+        index
     }
 
     /// A transport key was pressed. Honoured only on a stand-alone Runner:
     /// under a Director, one node moving its own playhead would put it out
     /// of sync with every other Runner.
     fn local_transport(&mut self, change: TransportChange) {
-        if self.playhead.is_clustered() {
+        if self.playhead().is_clustered() {
             tracing::warn!("transport keys are disabled: this runner follows a Director");
         } else {
-            self.playhead.apply_local(change);
+            self.playhead().apply_local(change);
         }
     }
 
@@ -750,392 +676,61 @@ impl App {
         self.local_transport(TransportChange::SeekBy(seconds * NANOS_PER_SEC));
     }
 
-    /// Render one frame on every output, card by card. Returns whether
-    /// anything was rendered.
-    fn render_frame(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        if self.windows.is_empty() {
-            // No outputs (the show lost its displays): nothing may keep
-            // decoding in the background.
-            self.contents.iter_mut().flatten().for_each(|c| c.idle());
-            return false;
-        }
-        let mut sampled = None;
-        for g in 0..self.gpus.len() {
-            if let Some(position) = self.render_on(g, event_loop) {
-                sampled.get_or_insert(position);
-            }
-        }
-        if let Some(position) = sampled {
-            if let Some(fps) = self.stats.tick() {
-                // Reported to the Director with the next health message.
-                self.playhead.report_fps(fps as f32);
-                let slow = self
-                    .timing
-                    .summary()
-                    .map_or_else(String::new, |s| format!("; {s}"));
-                tracing::info!(
-                    "{fps:.1} fps (show time {:.1}s, frame {}){slow}",
-                    position.show_seconds(),
-                    position.frame
-                );
-            }
-        }
-        if self.health_at.elapsed() >= Duration::from_millis(500) {
-            self.health_at = Instant::now();
-            // A window can be moved to another monitor, or the mode changed:
-            // keep each clock's yardstick current. The window system can
-            // briefly not know the monitor (while a window moves): then the
-            // last known mode stands.
-            for rw in &mut self.windows {
-                if let Some(nominal) = crate::render::nominal_period(&rw.window) {
-                    rw.gpu.timing.clock.set_nominal(Some(nominal));
-                }
-            }
-            self.publish_output_health();
-        }
-        sampled.is_some()
-    }
-
-    /// The shortest refresh period among the outputs, once measured.
-    fn refresh_period(&self) -> Option<Duration> {
-        self.windows
-            .iter()
-            .filter_map(|rw| rw.gpu.timing.clock.period())
-            .filter(|ns| ns.is_finite() && *ns > 0.0)
-            .min_by(f64::total_cmp)
-            .map(|ns| Duration::from_secs_f64(ns / 1e9))
-    }
-
-    /// Render the outputs of card `g`:
-    ///
-    /// 1. wait for each output to take a frame (this is where the loop is
-    ///    paced by the displays);
-    /// 2. work out the refresh the frame will appear on — the next one plus
-    ///    the frames queued ahead of it, corrected by what the driver reports
-    ///    — and sample the show clock *for that instant*, snapped to the
-    ///    Director's refresh grid when frame-locked;
-    /// 3. update the contents of the layers this card shows, render, present.
-    fn render_on(&mut self, g: usize, event_loop: &ActiveEventLoop) -> Option<Position> {
-        let outs: Vec<usize> = (0..self.windows.len())
-            .filter(|&w| self.windows[w].gpu_idx == g)
-            .collect();
-        if outs.is_empty() {
-            self.contents[g].iter_mut().for_each(|c| c.idle());
-            return None;
-        }
-
-        let playhead = self.playhead.clone();
-        let local_now = || playhead.clock.local_now_ns();
-        let mut frames = Vec::with_capacity(outs.len());
-        let acquiring = Instant::now();
-        for &w in &outs {
-            match self.gpus[g].acquire(&mut self.windows[w].gpu, local_now) {
-                Ok(frame) => frames.push((w, frame)),
-                Err(e) => self.surface_error(g, w, e, event_loop),
-            }
-        }
-        self.timing.since(Phase::Acquire, acquiring);
-        if frames.is_empty() {
-            return None;
-        }
-
-        // The refresh each output's frame will reach, and the instant the
-        // card's picture is for (that of its first output: outputs of one
-        // card share one sample, which keeps them in lockstep).
-        let now = local_now();
-        let latency = crate::render::frame_latency() as i64;
-        // (prediction without correction, correction, time of the refresh)
-        let targets: Vec<Option<(i64, i64, i64)>> = frames
-            .iter()
-            .map(|(w, _)| {
-                let t = &self.windows[*w].gpu.timing;
-                let (next, _) = t.clock.next_after(now)?;
-                let base = next + latency - 1;
-                let correction = t.tracker.correction();
-                Some((base, correction, t.clock.time_of(base + correction)?))
-            })
-            .collect();
-        let display_local = targets[0].map_or(now, |(_, _, at)| at);
-        let was_on_grid = self.windows[frames[0].0].gpu.timing.grid_offset.is_some();
-        let (position, grid_offset) = playhead.position_for_display(display_local, was_on_grid);
-
-        let times = self.layer_times(&position);
-        // The virtual displays these outputs show: those on air now are
-        // rendered; the content of those on air or about to be is decoded
-        // (so a cue in a virtual display starts on its first frame too).
-        let areas: Vec<Rect> = outs
-            .iter()
-            .map(|&w| self.show.outputs[self.windows[w].output_idx].canvas_rect)
-            .collect();
-        let layers = &self.show.layers;
-        let on_air = |i: usize| times[i].is_some_and(|t| layers[i].timing.visible_at(t));
-        let soon = |i: usize| {
-            times[i].is_some_and(|t| {
-                let timing = &layers[i].timing;
-                timing.visible_at(t) || (0.0..=PREROLL_S).contains(&(timing.start - t))
-            })
-        };
-        let virtual_order = virtuals::plan(&self.show, on_air, &areas);
-        let virtual_areas: Vec<Rect> = virtuals::plan(&self.show, soon, &areas)
-            .into_iter()
-            .map(|v| self.show.virtuals[v].canvas_rect)
-            .collect();
-        let updating = Instant::now();
-        let late = self.update_contents(g, &outs, &virtual_areas, &position, &times);
-        self.timing.since(Phase::Update, updating);
-        if !late.is_empty() {
-            self.timing.note("late decode");
-        }
-
-        let views: Vec<_> = frames
-            .iter()
-            .map(|(w, f)| {
-                let rw = &self.windows[*w];
-                (&rw.gpu, &self.show.outputs[rw.output_idx], &f.view)
-            })
-            .collect();
-        let rendering = Instant::now();
-        self.gpus[g].render(
-            &views,
-            &self.show,
-            &times,
-            &self.contents[g],
-            &self.draw_order,
-            &self.virtuals[g],
-            &virtual_order,
-        );
-        self.timing.since(Phase::Render, rendering);
-        let presenting = Instant::now();
-        for (w, _) in &frames {
-            self.windows[*w].window.pre_present_notify();
-        }
-        for ((w, frame), target) in frames.into_iter().zip(targets) {
-            let rw = &mut self.windows[w];
-            self.gpus[g].present(&mut rw.gpu, frame, target.map(|(b, c, _)| (b, c)));
-            rw.gpu.timing.grid_offset = grid_offset;
-            if late.contains(&w) {
-                rw.gpu.timing.late_decodes += 1;
-            }
-        }
-        self.timing.since(Phase::Present, presenting);
-        Some(position)
-    }
-
-    /// Each layer's time: that of the timeline it belongs to — the main
-    /// timeline's, or its task's (`None` while that task is off stage).
-    fn layer_times(&self, position: &Position) -> Vec<Option<f64>> {
-        let now = position.show_seconds();
-        let mut task_times: HashMap<&str, Option<f64>> = HashMap::new();
-        self.show
-            .layers
-            .iter()
-            .map(|layer| match layer.timeline.as_deref() {
-                // Test patterns run on the cluster clock, whatever the
-                // transport does.
-                _ if layer.cluster_clock => {
-                    Some(position.cluster_ns.max(0) as f64 / NANOS_PER_SEC as f64)
-                }
-                None => Some(now),
-                Some(id) => *task_times
-                    .entry(id)
-                    .or_insert_with(|| self.playhead.task_seconds(id, position.cluster_ns)),
-            })
-            .collect()
-    }
-
-    /// Bring card `g`'s contents to `position`. Only layers that fall on one
-    /// of the card's outputs (`outs`), or in the area of a virtual display
-    /// they show (`virtual_areas`), are decoded; the others are idle on this
-    /// card. Returns the outputs on which a video layer was late.
-    fn update_contents(
-        &mut self,
-        g: usize,
-        outs: &[usize],
-        virtual_areas: &[Rect],
-        position: &Position,
-        times: &[Option<f64>],
-    ) -> Vec<usize> {
-        let loop_s = position
-            .transport
-            .loop_ns
-            .map(|ns| ns as f64 / NANOS_PER_SEC as f64);
-        let areas: Vec<(usize, crate::show::Rect)> = outs
-            .iter()
-            .map(|&w| (w, self.show.outputs[self.windows[w].output_idx].canvas_rect))
-            .collect();
-        let factory = self.gpus[g].factory();
-        let mut late = Vec::new();
-        let layers = self
-            .show
-            .layers
-            .iter()
-            .zip(&mut self.contents[g])
-            .zip(times);
-        // Each layer's update is timed from its start to the next one's (the
-        // loop body has several early `continue`s).
-        let mut started: Option<(usize, Instant)> = None;
-        for (i, ((layer, c), time)) in layers.enumerate() {
-            if let Some((j, at)) = started.replace((i, Instant::now())) {
-                self.timing.layer(j, at.elapsed());
-            }
-            let Some(t) = *time else {
-                c.idle(); // its timeline is off stage
-                          // Played again later, it goes on air afresh.
-                self.onsets.remove(&layer.id);
-                continue;
-            };
-            // A free-running layer is asked for media time: seconds since it
-            // went on air, at normal speed, whatever its timeline does.
-            let on_air = layer.timing.visible_at(t);
-            if layer.timing.free_run {
-                if on_air {
-                    if !self.onsets.contains_key(&layer.id) {
-                        let state = match layer.timeline.as_deref() {
-                            None => Some(position.transport),
-                            Some(id) => self.playhead.task_state(id, position.cluster_ns),
-                        };
-                        let onset = state.map_or(position.cluster_ns, |s| {
-                            on_air_since(&s, layer.timing.start, position.cluster_ns)
-                        });
-                        self.onsets.insert(layer.id.clone(), onset);
-                    }
-                } else {
-                    self.onsets.remove(&layer.id);
-                }
-            } else {
-                // Free run switched off: switched back on, it starts afresh.
-                self.onsets.remove(&layer.id);
-            }
-            let onset = self.onsets.get(&layer.id).copied();
-            let media = |timeline_t: f64| match (layer.timing.free_run, onset) {
-                (true, Some(onset)) => (position.cluster_ns - onset) as f64 / NANOS_PER_SEC as f64,
-                // About to go on air: its first frame.
-                (true, None) => 0.0,
-                (false, _) => timeline_t,
-            };
-            // Not on any of this card's outputs: another card (or Runner)
-            // shows it. Decoding it here would only cost time.
-            let here: Vec<usize> = areas
-                .iter()
-                .filter(|(_, r)| overlaps(&layer.transform, r))
-                .map(|&(w, _)| w)
-                .collect();
-            if here.is_empty() && !virtual_areas.iter().any(|r| overlaps(&layer.transform, r)) {
-                c.idle();
-                continue;
-            }
-            // Time until the layer appears, allowing for the main timeline
-            // looping back to a cue at its beginning.
-            let mut until_start = layer.timing.start - t;
-            if let (true, Some(len), None) = (until_start < 0.0, loop_s, &layer.timeline) {
-                until_start += len;
-            }
-            if on_air {
-                c.update(media(t), &factory);
-                if c.late() {
-                    late.extend(here);
-                }
-            } else if (0.0..=PREROLL_S).contains(&until_start) {
-                // About to appear: get its first frame decoded and into the
-                // texture now, so the cue starts on its first frame instead
-                // of on whatever the decoder manages a moment later.
-                c.update(media(layer.timing.start), &factory);
-            } else {
-                // Off screen: an invisible video cue must not keep a decoder
-                // (an ffmpeg process and several frames of memory) around.
-                c.idle();
-            }
-        }
-        if let Some((j, at)) = started {
-            self.timing.layer(j, at.elapsed());
-        }
-        late.sort_unstable();
-        late.dedup();
-        late
-    }
-
-    /// React to an output whose frame could not be acquired.
-    fn surface_error(
-        &mut self,
-        g: usize,
-        w: usize,
-        err: wgpu::SurfaceError,
-        event_loop: &ActiveEventLoop,
-    ) {
-        let rw = &mut self.windows[w];
-        match err {
-            wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                let size = rw.window.inner_size();
-                self.gpus[g].resize_output(&mut rw.gpu, size.width, size.height);
-            }
-            wgpu::SurfaceError::OutOfMemory => {
-                tracing::error!("GPU out of memory; exiting");
-                // Not a close: the supervisor restarts it.
-                self.exit_code = 1;
-                event_loop.exit();
-            }
-            // Typical for a minimized/occluded window; it would otherwise
-            // log at the frame rate.
-            wgpu::SurfaceError::Timeout => tracing::debug!(output = w, "surface timeout"),
-            e => tracing::warn!("surface error: {e:?}"),
-        }
-    }
-
     /// Hand each output's presentation health, and the first output's
-    /// refresh (for the Director's grid), to the agent.
+    /// refresh (for the Director's grid), to the agent. Also keeps each
+    /// output's refresh clock told the display mode's rate: a window can be
+    /// moved to another monitor, or the mode changed.
     fn publish_output_health(&self) {
-        let now = self.playhead.clock.local_now_ns();
+        let now = self.playhead().clock.local_now_ns();
+        let mut guards = self.lock_all();
+        for rw in &self.windows {
+            // The window system can briefly not know the monitor (while a
+            // window moves): then the last known mode stands.
+            if let Some(nominal) = crate::render::nominal_period(&rw.window) {
+                if let Some(o) = guards[rw.card].output_mut(&rw.output.id) {
+                    o.gpu.timing.clock.set_nominal(Some(nominal));
+                }
+            }
+        }
         let health: Vec<lc_proto::OutputHealth> = self
             .windows
             .iter()
-            .map(|rw| {
-                let t = &rw.gpu.timing;
-                let exact = rw.gpu.exact_timing();
-                lc_proto::OutputHealth {
-                    id: rw.output.id.clone(),
-                    gpu: self.gpus[rw.gpu_idx].adapter_info(),
-                    presenter: rw.gpu.presenter_name().into(),
-                    refresh_hz: t.clock.period().map(|p| 1e9 / p),
-                    presents: t.tracker.presents,
-                    missed: t.tracker.missed,
-                    late_decodes: t.late_decodes,
-                    latency_frames: exact
-                        .then(|| crate::render::frame_latency() as i64 + t.tracker.correction()),
-                    barrier: if t.barrier.is_empty() {
-                        "off"
-                    } else {
-                        t.barrier
-                    }
-                    .into(),
-                    grid_offset_ns: t.grid_offset,
-                    frame_counter: t.frame_counter,
-                }
-            })
+            .filter_map(|rw| guards[rw.card].health(&rw.output.id))
             .collect();
         let vblank = self.windows.first().and_then(|rw| {
-            let clock = &rw.gpu.timing.clock;
+            let clock = &guards[rw.card].output(&rw.output.id)?.gpu.timing.clock;
             // A young or foreign estimate would become every Runner's grid.
             if !clock.is_mature() {
                 return None;
             }
             let (_, at) = clock.last_refresh(now)?;
             let period = clock.period()?;
-            let reading = self.playhead.clock.read(at);
+            let reading = self.playhead().clock.read(at);
             reading.synced.then(|| lc_proto::VblankReport {
                 vblank_ns: reading.cluster_ns,
                 period_ps: (period * 1000.0).round() as i64,
                 exact: clock.is_exact(),
             })
         });
+        drop(guards);
         let downloads = match &self.source {
             ShowSource::Cluster { assets, .. } => assets.downloads(),
             ShowSource::Local(_) => Vec::new(),
         };
-        self.playhead.update_hardware(|h| {
+        self.playhead().update_hardware(|h| {
             h.output_health = health;
             h.vblank = vblank;
             h.downloads = downloads;
         });
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Render threads first: then every card, output and window is
+        // released here, on the window thread.
+        self.stop_threads();
+        self.close_outputs();
     }
 }
 
@@ -1246,7 +841,7 @@ impl ApplicationHandler for App {
         self.report_monitors(event_loop);
         match &self.source {
             ShowSource::Local(show) => {
-                let show = show.clone();
+                let show = Arc::new(show.clone());
                 self.apply_show(event_loop, show);
                 if self.windows.is_empty() {
                     // A local show without outputs is an error, already
@@ -1274,14 +869,16 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let rw = &mut self.windows[idx];
-                self.gpus[rw.gpu_idx].resize_output(&mut rw.gpu, size.width, size.height);
+                let rw = &self.windows[idx];
+                self.cards[rw.card]
+                    .lock()
+                    .resize(&rw.output.id, size.width, size.height);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::Space) => {
-                        let playing = self.playhead.position().transport.playing;
+                        let playing = self.playhead().position().transport.playing;
                         self.local_transport(if playing {
                             TransportChange::Pause
                         } else {
@@ -1300,43 +897,56 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.timing.begin();
-        let housekeeping = Instant::now();
         self.handle_requests(event_loop);
         self.reload_if_requested(event_loop);
         self.follow_cluster_show(event_loop);
-        self.timing.since(Phase::Housekeeping, housekeeping);
+        if self.shared.fatal.load(Ordering::Relaxed) {
+            // Not a close: the supervisor restarts it.
+            self.exit_code = 1;
+            event_loop.exit();
+            return;
+        }
+        // Downloads still progress (and are reported) without outputs.
+        if self.health_at.elapsed() >= Duration::from_millis(500) {
+            self.health_at = Instant::now();
+            self.publish_output_health();
+        }
 
         if self.windows.is_empty() {
-            self.timing.skip();
-            // Nothing may keep decoding with no output to show it on.
-            self.contents.iter_mut().flatten().for_each(|c| c.idle());
-            // Downloads still progress (and are reported) without outputs.
-            if self.health_at.elapsed() >= Duration::from_millis(500) {
-                self.health_at = Instant::now();
-                self.publish_output_health();
+            if !self.threaded {
+                // Nothing may keep decoding with no output to show it on.
+                // (Render threads see to that themselves.)
+                for mut g in self.lock_all() {
+                    g.idle();
+                }
             }
             // Nothing to draw (no show yet, or no display for this Runner):
             // wake up a few times a second to look for one, instead of
             // spinning.
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(100),
             ));
             return;
         }
-        // Frames are driven from here rather than per-window RedrawRequested so
-        // all outputs render together. FIFO present blocks on vsync, which
-        // paces the loop, so Poll does not spin the CPU.
-        if self.render_frame(event_loop) {
-            let period = self.refresh_period();
-            let show = &self.show;
-            if let Some(line) = self.timing.end(period, |i| layer_label(show, i)) {
-                tracing::warn!("{line}");
-            }
-        } else {
-            self.timing.skip();
+        if self.threaded {
+            // The cards render on their own threads; this one only keeps
+            // the windows, the show and the operator's requests going.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(10),
+            ));
+            return;
         }
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        // One thread for every card, in turn. Presenting blocks on vsync,
+        // which paces the loop, so Poll does not spin the CPU.
+        let mut rendered = false;
+        for card in &self.cards {
+            rendered |= card.lock().step(&self.shared);
+        }
+        event_loop.set_control_flow(if rendered {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10))
+        });
     }
 }
 
