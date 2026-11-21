@@ -951,6 +951,16 @@ impl Core {
         // Derive from the state that will be in force *then*, so two commands
         // issued within one lead time compose correctly.
         let base = tl.state_at(at);
+        // The operator's Pause cues a task up (on stage, at 0) only if it is
+        // stopped as the operator sees it, i.e. off stage *now*. A Pause that
+        // lands inside the lead time of a pending Stop was aimed at a task
+        // still on stage: it only stops playback, and the Stop still takes
+        // the task off stage.
+        let change = if change == TransportChange::Pause && tl.state_at(now).active {
+            TransportChange::Hold
+        } else {
+            change
+        };
         let mut next = next_state(&base, change, at);
         // Epochs must increase across *all* known states, not just from `base`.
         next.epoch = tl.latest().epoch + 1;
@@ -1075,16 +1085,17 @@ impl Core {
 
                 let change = match cue.action {
                     ControlAction::Play => TransportChange::Play,
-                    // Like a jump, a programmed pause does not bring a
-                    // stopped task on stage (an operator's pause does).
+                    // A programmed pause does not bring a stopped task on
+                    // stage (an operator's pause does).
                     ControlAction::Pause => TransportChange::Hold,
                     ControlAction::Stop => TransportChange::Stop {
                         deactivate: target.is_some(),
                     },
-                    // A jump moves the playhead but does not bring a stopped
-                    // task on stage (an operator's seek does).
+                    // A jump positions its target as the operator's seek does:
+                    // a running timeline keeps running from there, a stopped
+                    // task comes on stage, paused on that frame.
                     ControlAction::Jump => {
-                        TransportChange::Jump((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
+                        TransportChange::Seek((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
                     }
                 };
                 self.apply(&mut st, target, change, at);

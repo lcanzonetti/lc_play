@@ -76,20 +76,18 @@ pub enum TransportChange {
     Play,
     /// Pause — the operator's pause. A timeline that is off stage (a
     /// stopped task) is cued up: it comes back on stage, paused at the start
-    /// (show time zero), never where its playhead was left.
+    /// (show time zero). On stage, it holds the current frame.
     Pause,
     /// Pause without anything else — a control cue's pause: a stopped task
-    /// it targets stays off stage (as with [`Jump`](Self::Jump)).
+    /// it targets stays off stage.
     Hold,
-    /// Go to an absolute show time — the operator positioning the
-    /// playhead. Keeps play/pause; a timeline that is off stage (a stopped
-    /// task) comes back on stage, paused there, showing that frame.
+    /// Go to an absolute show time — the operator positioning the playhead,
+    /// or a control cue's jump. Keeps play/pause; a timeline that is off
+    /// stage (a stopped task) comes back on stage, paused there, showing
+    /// that frame.
     Seek(i64),
     /// Go relative to the current position, clamped at zero. Like `Seek`.
     SeekBy(i64),
-    /// Go to an absolute show time without changing anything else — a
-    /// control cue's jump: a stopped task it targets stays off stage.
-    Jump(i64),
     SetRate(i32),
     SetLoop(Option<i64>),
     /// Stop: pause at zero. With `deactivate` the timeline also goes off
@@ -144,7 +142,6 @@ pub fn next_state(
             next.anchor_show_ns = position.saturating_add(delta).max(0);
             next.active = true;
         }
-        TransportChange::Jump(show_ns) => next.anchor_show_ns = show_ns.max(0),
         TransportChange::SetRate(rate_permille) => next.rate_permille = rate_permille,
         TransportChange::SetLoop(loop_ns) => next.loop_ns = loop_ns.filter(|&l| l > 0),
     }
@@ -233,10 +230,6 @@ mod tests {
         // A playing timeline keeps playing from there.
         let moved = next_state(&playing, TransportChange::Seek(7 * S), 2 * S);
         assert!(moved.active && moved.playing);
-        // A control cue's jump moves a stopped task without showing it.
-        let jumped = next_state(&stopped, TransportChange::Jump(7 * S), 2 * S);
-        assert!(!jumped.active && !jumped.playing);
-        assert_eq!(jumped.anchor_show_ns, 7 * S);
     }
 
     #[test]
@@ -246,24 +239,23 @@ mod tests {
         let paused = next_state(&stopped, TransportChange::Pause, 5 * S);
         assert!(paused.active && !paused.playing, "on stage, paused");
         assert_eq!(paused.show_time_at(9 * S), 0, "held at the start");
-        // Never where the playhead was left (a control cue's jump moves a
-        // stopped task's playhead without bringing it on stage).
-        let jumped = next_state(&stopped, TransportChange::Jump(7 * S), 5 * S);
-        let paused = next_state(&jumped, TransportChange::Pause, 6 * S);
-        assert!(paused.active && !paused.playing);
-        assert_eq!(paused.show_time_at(9 * S), 0);
         // A task that was never started, likewise.
         let paused = next_state(&TransportState::INACTIVE, TransportChange::Pause, S);
         assert!(paused.active && !paused.playing);
         assert_eq!(paused.show_time_at(9 * S), 0);
-        // On stage, Pause holds the current frame, as before.
+        // On stage, Pause holds the current frame, as before…
         let held = next_state(&playing, TransportChange::Pause, 3 * S);
         assert!(held.active && !held.playing);
         assert_eq!(held.show_time_at(9 * S), 3 * S);
+        // …also where a seek or a control cue's jump left a task: it stays
+        // there, it does not go back to 0.
+        let sought = next_state(&stopped, TransportChange::Seek(7 * S), 5 * S);
+        let paused = next_state(&sought, TransportChange::Pause, 6 * S);
+        assert!(paused.active && !paused.playing);
+        assert_eq!(paused.show_time_at(9 * S), 7 * S);
         // A control cue's pause leaves a stopped task off stage.
-        let hold = next_state(&jumped, TransportChange::Hold, 6 * S);
+        let hold = next_state(&stopped, TransportChange::Hold, 6 * S);
         assert!(!hold.active && !hold.playing);
-        assert_eq!(hold.anchor_show_ns, 7 * S);
     }
 
     #[test]

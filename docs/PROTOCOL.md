@@ -68,12 +68,12 @@ Commands:
 | `type` | Fields | Effect |
 |---|---|---|
 | `play` | — | |
-| `pause` | — | a stopped task comes back on stage, paused at 0 (a control cue's *pause* does not do that) |
+| `pause` | — | on stage: hold the current frame; a stopped (off-stage) task comes back on stage, paused at 0 (a control cue's *pause* does not do that) |
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
 | `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP, to the address and `launcher_port` that Runner last reported, default 7406); its supervisor, waiting since the Runner was closed, starts it |
-| `seek` | `show_ns ≥ 0` | jump; play state unchanged; a stopped task comes back on stage, paused there (a control cue's *jump* does not do that) |
+| `seek` | `show_ns ≥ 0` | jump; play state unchanged; a stopped task comes back on stage, paused there (a control cue's *jump* does the same) |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
 | `load_show` | `document` (JSON object), optional `tag` | new show revision, distributed to Runners; replaces the show for everyone |
@@ -352,8 +352,9 @@ broadcasts them back. Other tools may ignore it.
   the editor) until it is stopped or a control cue acts on it.
   `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
   timeline acted on — empty for the cue's own, `"main"`, or a task id. A
-  `pause` or `jump` aimed at a stopped task leaves it off stage (the
-  operator's pause and seek bring it on). The
+  `jump` acts like `seek`: a running timeline keeps running from `to_s`, a
+  stopped task comes on stage, paused there. A `pause` aimed at a stopped
+  task leaves it off stage (the operator's pause brings it on, at 0). The
   Director schedules the resulting transport change for the exact cluster
   instant of the cue, ahead of time.
 * `free_run` on a cue (video): it plays at normal speed from the instant it
@@ -372,7 +373,7 @@ broadcasts them back. Other tools may ignore it.
 | `/lcplay/seek` | seconds | jump |
 | `/lcplay/rate` | speed (1.0 = normal) | |
 | `/lcplay/loop` | seconds, 0 = off | |
-| `/lcplay/task/<id>/play`, `/pause`, `/stop`, `/seek`, `/rate`, `/loop` | as above | the same for task `<id>` |
+| `/lcplay/task/<id>/play`, `/pause`, `/stop`, `/seek`, `/rate`, `/loop` | as above | the same for task `<id>`; `/stop` takes it off stage, `/pause` on a stopped task brings it on stage, paused at 0 |
 
 Numeric arguments may be float, double, int or long. For play/pause/stop a
 single argument of `0` is ignored (a control surface's button release).

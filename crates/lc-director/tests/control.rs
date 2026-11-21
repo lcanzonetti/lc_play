@@ -417,6 +417,19 @@ async fn auxiliary_timelines_have_their_own_transport() {
     assert_eq!(intro.show_time_at(status.cluster_ns), 0);
     core.command_on(Command::Stop, Some("intro")).unwrap();
 
+    // A Pause right behind a Stop (inside its lead time, while the task is
+    // still on stage) only pauses: the task still goes off stage, it does
+    // not come back cued up at 0.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    core.command_on(Command::Play, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(core.status().tasks["intro"].playing);
+    core.command_on(Command::Stop, Some("intro")).unwrap();
+    core.command_on(Command::Pause, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let intro = core.status().tasks["intro"];
+    assert!(!intro.active && !intro.playing, "off stage: {intro:?}");
+
     // …whereas stopping the main timeline only rewinds it.
     core.command(Command::Seek {
         show_ns: 5 * NANOS_PER_SEC,
@@ -481,6 +494,33 @@ async fn a_pause_cue_leaves_a_stopped_task_off_stage() {
         !sting.active && !sting.playing,
         "still off stage: {sting:?}"
     );
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_jump_cue_brings_a_stopped_task_on_stage_paused_there() {
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "cue", "at_s": 0.3, "action": "jump", "to_s": 7.0, "target": "sting" } ],
+        "tasks": [ { "id": "sting" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let status = core.status();
+    let sting = status.tasks["sting"];
+    assert!(
+        sting.active && !sting.playing,
+        "on stage, paused: {sting:?}"
+    );
+    assert_eq!(sting.show_time_at(status.cluster_ns), 7 * NANOS_PER_SEC);
+    // The operator's Pause now holds it there: it is not stopped.
+    core.command_on(Command::Pause, Some("sting")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = core.status();
+    let sting = status.tasks["sting"];
+    assert!(sting.active && !sting.playing);
+    assert_eq!(sting.show_time_at(status.cluster_ns), 7 * NANOS_PER_SEC);
     director.shutdown().await;
 }
 
