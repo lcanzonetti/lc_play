@@ -550,12 +550,8 @@ async fn cues_can_start_a_task_and_jump() {
 
     tokio::time::sleep(Duration::from_millis(450)).await; // ~0.9 s after play
     let status = core.status();
-    assert!(status.transport.playing);
-    assert!(
-        status.show_ns < 600_000_000,
-        "jumped back at 0.6 s; now at {} ns",
-        status.show_ns
-    );
+    assert!(!status.transport.playing, "a jump pauses");
+    assert_eq!(status.show_ns, 100_000_000, "jumped back to 0.1 s at 0.6 s");
     director.shutdown().await;
 }
 
@@ -615,24 +611,41 @@ async fn a_command_just_before_a_cue_does_not_cancel_it() {
 }
 
 #[tokio::test]
-async fn a_short_jump_back_loop_keeps_looping() {
-    // Loop the section 0.2–0.5 s: far shorter than any bookkeeping interval.
+async fn a_jump_cue_pauses_where_it_lands_and_fires_again_on_the_next_pass() {
     let director = director_with_show(serde_json::json!({
         "control_cues": [ { "id": "back", "at_s": 0.5, "action": "jump", "to_s": 0.2 } ]
     }))
     .await;
     let core = director.core();
-    core.command(Command::Play).unwrap();
-    for _ in 0..6 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+    for _ in 0..3 {
+        core.command(Command::Play).unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
         let status = core.status();
-        assert!(status.transport.playing);
-        assert!(
-            status.show_ns <= 520_000_000,
-            "escaped the loop: at {} ns",
-            status.show_ns
-        );
+        assert!(!status.transport.playing, "the jump paused the show");
+        assert_eq!(status.show_ns, 200_000_000, "on the frame it jumped to");
     }
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_jump_cue_onto_itself_lets_playback_go_on() {
+    // A jump to its own position pauses there; Play then plays on past it
+    // instead of firing it again at once.
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "hold", "at_s": 0.3, "action": "jump", "to_s": 0.3 } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let status = core.status();
+    assert!(!status.transport.playing);
+    assert_eq!(status.show_ns, 300_000_000);
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let status = core.status();
+    assert!(status.transport.playing, "played on");
+    assert!(status.show_ns > 300_000_000);
     director.shutdown().await;
 }
 

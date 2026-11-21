@@ -1052,12 +1052,16 @@ impl Core {
                 // What if playback starts exactly *on* the cue (from the top,
                 // or after a seek onto it)? It fires — "start this task with
                 // the show" is a cue at 0 — with one exception: a cue that
-                // pauses or stops its own timeline. That one has, as far as
-                // anyone can tell, just been executed (it is where a pause
-                // cue leaves the playhead), and firing it again would make
-                // it impossible to play on.
+                // pauses or stops its own timeline (a jump pauses it too).
+                // That one has, as far as anyone can tell, just been
+                // executed (it is where a pause cue, or a jump to its own
+                // position, leaves the playhead), and firing it again would
+                // make it impossible to play on.
                 let halts_itself = target == timeline
-                    && matches!(cue.action, ControlAction::Pause | ControlAction::Stop);
+                    && matches!(
+                        cue.action,
+                        ControlAction::Pause | ControlAction::Stop | ControlAction::Jump
+                    );
                 let Some((at, lap)) = cue_fire_time(&state, cue, now, !halts_itself) else {
                     continue;
                 };
@@ -1091,11 +1095,11 @@ impl Core {
                     ControlAction::Stop => TransportChange::Stop {
                         deactivate: target.is_some(),
                     },
-                    // A jump positions its target as the operator's seek does:
-                    // a running timeline keeps running from there, a stopped
-                    // task comes on stage, paused on that frame.
+                    // A jump goes to `to_s` and pauses there, on stage: a
+                    // running timeline stops on that frame, a stopped task
+                    // comes on stage, paused on it.
                     ControlAction::Jump => {
-                        TransportChange::Seek((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
+                        TransportChange::Jump((cue.to_s * NANOS_PER_SEC as f64).round() as i64)
                     }
                 };
                 self.apply(&mut st, target, change, at);
