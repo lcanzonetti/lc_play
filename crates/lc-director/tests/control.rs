@@ -449,6 +449,44 @@ async fn auxiliary_timelines_have_their_own_transport() {
 }
 
 #[tokio::test]
+async fn a_pause_right_behind_a_play_leaves_the_task_on_stage_paused_at_the_start() {
+    let director = director_with_show(serde_json::json!({
+        "tasks": [ { "id": "intro", "name": "Intro" } ]
+    }))
+    .await;
+    let core = director.core();
+
+    // The task is off stage now; a Play is pending (inside its lead time)
+    // when the operator pauses. The Pause is not turned into a hold of an
+    // on-stage task, nor does it cancel the Play's coming on stage: it lands
+    // on the pending Play and pauses it where it starts.
+    core.command_on(Command::Play, Some("intro")).unwrap();
+    core.command_on(Command::Pause, Some("intro")).unwrap();
+    assert!(
+        !core.status().tasks["intro"].active,
+        "both still pending: off stage"
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await; // past the lead time
+    let status = core.status();
+    let intro = status.tasks["intro"];
+    assert!(
+        intro.active && !intro.playing,
+        "on stage, paused: {intro:?}"
+    );
+    // At the start, give or take the moment between the two commands.
+    let at = intro.show_time_at(status.cluster_ns);
+    assert!(
+        (0..50_000_000).contains(&at),
+        "paused at the start, not at {at} ns"
+    );
+    // And it stays there.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let status = core.status();
+    assert_eq!(status.tasks["intro"].show_time_at(status.cluster_ns), at);
+    director.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_pause_cue_stops_exactly_on_the_cue() {
     let director = director_with_show(serde_json::json!({
         "control_cues": [ { "id": "hold", "at_s": 0.5, "action": "pause" } ]

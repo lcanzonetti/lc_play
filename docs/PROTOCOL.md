@@ -353,7 +353,10 @@ broadcasts them back. Other tools may ignore it.
   `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
   timeline acted on — empty for the cue's own, `"main"`, or a task id. A
   `jump` goes to `to_s` and pauses there, on stage: a running timeline stops
-  on that frame, a stopped task comes on stage, paused on it. A `pause` aimed at a stopped
+  on that frame, a stopped task comes on stage, paused on it. (Until
+  November 2026 a jump kept a running timeline running, and a jump back
+  made a section loop. Shows built that way now pause where the jump
+  lands; `set_loop` loops only the whole main timeline, from 0.) A `pause` aimed at a stopped
   task leaves it off stage (the operator's pause brings it on, at 0). The
   Director schedules the resulting transport change for the exact cluster
   instant of the cue, ahead of time.
