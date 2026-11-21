@@ -1430,6 +1430,13 @@ function onAirSince(tr, startS, now) {
 
 const stage = $('#stage');
 const ctx = stage.getContext('2d');
+/** The theme colours the stage draws with, read from style.css (the
+ *  stylesheet loads before this script), so the canvas follows the CSS. */
+const THEME = (() => {
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  return { accent: v('--accent', '#0066ff'), accentLine: v('--accent-line', '#3385ff'), onAccent: v('--on-accent', '#fff'), hi: v('--hi', '#0ff'), onHi: v('--on-hi', '#002626') };
+})();
 let view = { k: 1, ox: 0, oy: 0 };  // canvas px → screen px: s = c·k + o
 let displayTabs = [];               // screen rects of display (and virtual display) name tabs, for hit-testing
 let drag = null;                    // the stage drag in progress
@@ -1492,16 +1499,16 @@ function drawStage() {
     const r = d.canvas_rect;
     const x = view.ox + r.x * k, y = view.oy + r.y * k;
     const selected = S.sel?.type === 'display' && S.sel.id === d.id;
-    ctx.strokeStyle = selected ? '#fff' : '#4ea1ff';
+    ctx.strokeStyle = selected ? THEME.hi : THEME.accentLine;
     ctx.lineWidth = selected ? 2 : 1;
     ctx.setLineDash(selected ? [] : [6, 4]);
     ctx.strokeRect(x + 0.5, y + 0.5, r.w * k, r.h * k);
     ctx.setLineDash([]);
     const label = (d.name || 'display') + (d.runner ? ` @${d.runner}` : '') + (d.test_pattern ? ` · TEST ${d.test_pattern.fps} fps` : '');
     const tw = ctx.measureText(label).width + 10;
-    ctx.fillStyle = selected ? '#fff' : '#4ea1ff';
+    ctx.fillStyle = selected ? THEME.hi : THEME.accent;
     ctx.fillRect(x, y - 16, tw, 16);
-    ctx.fillStyle = '#06121f';
+    ctx.fillStyle = selected ? THEME.onHi : THEME.onAccent;
     ctx.fillText(label, x + 5, y - 4);
     displayTabs.push({ id: d.id, x, y: y - 16, w: tw, h: 16 });
     othersOn('display', d.id).forEach((o, i) => {
@@ -1522,7 +1529,7 @@ function drawStage() {
     const r = v.canvas_rect;
     const x = view.ox + r.x * k, y = view.oy + r.y * k;
     const selected = S.sel?.type === 'virtual' && S.sel.id === v.id;
-    const colour = selected ? '#fff' : '#3ddc97';
+    const colour = selected ? THEME.hi : '#3ddc97';
     ctx.strokeStyle = colour;
     ctx.lineWidth = selected ? 2 : 1;
     ctx.setLineDash([3, 3]);
@@ -1532,7 +1539,7 @@ function drawStage() {
     const tw = ctx.measureText(label).width + 10;
     ctx.fillStyle = colour;
     ctx.fillRect(x, y + r.h * k, tw, 16); // below the area: a display's tab may be above it
-    ctx.fillStyle = '#06121f';
+    ctx.fillStyle = THEME.onHi; // dark text: on the green tab and on the cyan one
     ctx.fillText(label, x + 5, y + r.h * k + 12);
     displayTabs.push({ id: v.id, kind: 'virtual', x, y: y + r.h * k, w: tw, h: 16 });
     othersOn('virtual', v.id).forEach((o, i) => {
@@ -1547,7 +1554,7 @@ function drawStage() {
   // box by its corners needs more maths than a first version deserves).
   const sel = selectedCue();
   if (sel && !sel.rotation) {
-    ctx.fillStyle = '#fff';
+    ctx.fillStyle = THEME.hi;
     for (const [hx, hy] of cueCorners(sel)) ctx.fillRect(hx - HANDLE, hy - HANDLE, HANDLE * 2, HANDLE * 2);
   }
 }
@@ -1594,7 +1601,7 @@ function drawCues(g, k, { area = null, visiting = null } = {}) {
         }
         if (sels.has(cue)) {
           g.globalAlpha = 1;
-          g.strokeStyle = '#fff';
+          g.strokeStyle = THEME.hi;
           g.lineWidth = 2 / k;
           g.strokeRect(-cue.w / 2, -cue.h / 2, cue.w, cue.h);
         }

@@ -1,16 +1,33 @@
 /* LC Play Producer — operator interface.
    A dark, dense layout: this runs in a control room, next to other dark
    tools, for hours. Colour is used for state (playing, selected, fault),
-   not decoration. */
+   not decoration.
+
+   Palette: "Tech Innovation" (dark gray #1e1e1e, electric blue #0066ff,
+   neon cyan #00ffff, white). Two rules keep it usable for hours:
+   - electric blue is the accent: primary actions, active tabs, displays,
+     drop targets; text on it is white (#0066ff is too dark for dark text);
+   - neon cyan only marks what is selected (cues, displays, box selection)
+     and the brand, so the one very bright colour on screen always means
+     "this is what you are acting on".
+   Body text is an off-white, not pure #fff, to limit glare in a dark room.
+   The state colours (ok / warn / bad) are not part of the theme and stay
+   as they were. The theme's font (DejaVu Sans) is not used: it does not
+   ship with Windows, and the dense layout is sized for the system font. */
 
 :root {
-  --bg: #111317;        /* desktop */
-  --panel: #1d2026;     /* window bodies */
-  --head: #262a32;      /* window title bars, inputs, buttons */
-  --line: #353a45;      /* borders */
-  --text: #d9dde4;
-  --dim: #8a92a0;
-  --accent: #4ea1ff;    /* selection, primary action */
+  --bg: #141414;        /* desktop */
+  --panel: #1e1e1e;     /* window bodies (the theme's dark gray) */
+  --head: #2a2a2a;      /* window title bars, inputs, buttons */
+  --line: #3a3a3a;      /* borders */
+  --text: #e6e6e6;
+  --dim: #8f8f8f;
+  --accent: #0066ff;    /* primary action, active tab, displays (electric blue) */
+  --on-accent: #ffffff; /* text on --accent */
+  --accent-line: #3385ff; /* thin lines in the accent (display outlines, cue borders):
+                             a lighter electric blue, as #0066ff looks dim at 1 px on black */
+  --hi: #00ffff;        /* selection highlight (neon cyan) */
+  --on-hi: #002626;     /* text on --hi */
   --ok: #3fbf7f;
   --warn: #e0a030;
   --bad: #e5534b;
@@ -29,9 +46,9 @@ button, select, input {
 }
 button { cursor: pointer; white-space: nowrap; }
 button:hover { border-color: var(--dim); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
 button.danger { color: var(--bad); }
-button.on { background: var(--accent); border-color: var(--accent); color: #06121f; }
+button.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 button.small { padding: 0 6px; }
 input[type=number], input[type=text], select.wide { width: 100%; user-select: text; }
 input[type=checkbox] { vertical-align: -2px; }
@@ -48,7 +65,7 @@ input[type=checkbox] { vertical-align: -2px; }
   padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line);
 }
 #topbar .group { display: flex; align-items: center; gap: 6px; }
-.brand { font-weight: 700; letter-spacing: .04em; }
+.brand { font-weight: 700; letter-spacing: .04em; color: var(--hi); }
 #btn-play { width: 42px; }
 #time { font: 600 20px/1 ui-monospace, Consolas, monospace; min-width: 132px; text-align: center; }
 #frame { font-family: ui-monospace, Consolas, monospace; min-width: 70px; }
@@ -78,7 +95,7 @@ input[type=checkbox] { vertical-align: -2px; }
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, .45); overflow: hidden;
 }
-.win.front { border-color: #55607a; }
+.win.front { border-color: #5c5c5c; }
 /* `.win` sets display, which would otherwise override the hidden attribute. */
 .win[hidden] { display: none; }
 .win-head {
@@ -158,19 +175,19 @@ h4 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spac
   display: flex; align-items: center; gap: 4px; padding: 0 6px;
   background: var(--panel); border-right: 1px solid var(--line); cursor: pointer;
 }
-.track-head.sel { background: #2b3550; }
+.track-head.sel { background: #0d2a5c; box-shadow: inset 3px 0 0 var(--hi); }
 .track-head .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lane { position: relative; flex: none; }
-.lane.drop { background: rgba(78, 161, 255, .12); }
+.lane.drop { background: rgba(0, 102, 255, .15); }
 .cue {
   position: absolute; top: 4px; bottom: 4px; min-width: 6px; overflow: hidden;
-  background: #3a5f8a; border: 1px solid #5d8fc7; border-radius: 3px;
+  background: #0a3f99; border: 1px solid var(--accent-line); border-radius: 3px;
   padding: 2px 6px; font-size: 11px; white-space: nowrap; cursor: grab;
 }
 .cue.color { background: #5a4a7a; border-color: #8a76b8; }
 .cue.virtual { background: #1f4d3c; border-color: #3ddc97; } /* a cue showing a virtual display */
 .cue.free { background-image: repeating-linear-gradient(135deg, transparent 0 8px, rgba(255,255,255,.08) 8px 16px); }
-.cue.sel { border-color: #fff; box-shadow: 0 0 0 1px #fff inset; }
+.cue.sel { border-color: var(--hi); box-shadow: 0 0 0 1px var(--hi) inset; }
 /* drag handles on both ends of a cue: trim start / change duration */
 .cue .h { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; }
 .cue .h.l { left: 0; } .cue .h.r { right: 0; }
@@ -225,7 +242,7 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 .dl-head { display: flex; flex-wrap: wrap; gap: 0 8px; justify-content: space-between; }
 .dl-name { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl .bar { height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.08); overflow: hidden; margin-top: 2px; }
-.dl .fill { height: 100%; background: var(--accent, #3d8bfd); transition: width 0.4s linear; }
+.dl .fill { height: 100%; background: var(--accent); transition: width 0.4s linear; }
 .dl.failed .fill { background: #e8a33d; }
 .dl.failed .dim { color: #e8a33d; }
 
@@ -235,10 +252,10 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 #users .user.me { background: var(--c); color: #06121f; cursor: pointer; }
 .together { border-left: 3px solid var(--c); padding: 4px 8px; margin-bottom: 8px; font-size: 12px; background: rgba(255, 255, 255, 0.04); }
 /* box selection being dragged over the timeline's tracks */
-#tl-box { position: absolute; z-index: 5; pointer-events: none; border: 1px solid #4ea1ff; background: rgba(78, 161, 255, .12); }
+#tl-box { position: absolute; z-index: 5; pointer-events: none; border: 1px solid var(--hi); background: rgba(0, 255, 255, .08); }
 /* Tasks window: where a dragged task will land; the main timeline row */
-.task.drop-above { box-shadow: inset 0 2px 0 #4ea1ff; }
-.task.drop-below { box-shadow: inset 0 -2px 0 #4ea1ff; }
+.task.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
+.task.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
 .task.main { cursor: default; font-size: 12px; }
 .task.main:hover { background: none; }
 .task[draggable=true] { cursor: grab; }

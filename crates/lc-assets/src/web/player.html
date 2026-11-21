@@ -5,9 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>lcmediaserver</title>
 <style>
+  /* Palette: "Tech Innovation", as in the Producer (crates/lc-producer/ui/style.css):
+     dark gray panels, electric blue for actions (white text on it), neon cyan
+     only for what is selected and the title. */
   :root {
-    --bg: #0f1115; --panel: #171a21; --border: #262b36;
-    --fg: #e7ebf0; --muted: #8b93a1; --accent: #4f8cff;
+    --bg: #141414; --panel: #1e1e1e; --border: #333333; --raised: #2a2a2a;
+    --fg: #e6e6e6; --muted: #999999; --accent: #0066ff; --hi: #00ffff;
+    color-scheme: dark; /* native controls (dropdowns, scrollbars) follow the dark theme */
   }
   * { box-sizing: border-box; }
   body {
@@ -20,13 +24,13 @@
     border-right: 1px solid var(--border); overflow-y: auto; background: var(--panel);
   }
   header { padding: 16px; border-bottom: 1px solid var(--border); }
-  header h1 { margin: 0; font-size: 16px; letter-spacing: .3px; }
+  header h1 { margin: 0; font-size: 16px; letter-spacing: .3px; color: var(--hi); }
   header p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
   .item {
     padding: 10px 16px; border-bottom: 1px solid var(--border); cursor: pointer;
   }
-  .item:hover { background: #1d222c; }
-  .item.active { background: #223052; }
+  .item:hover { background: var(--raised); }
+  .item.active { background: #0d2a5c; box-shadow: inset 3px 0 0 var(--hi); }
   .item .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .item .meta { color: var(--muted); font-size: 12px; }
   main { padding: 24px; overflow-y: auto; }
@@ -34,13 +38,13 @@
   .controls { margin: 16px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   label { color: var(--muted); font-size: 13px; }
   select, button {
-    background: #1d222c; color: var(--fg); border: 1px solid var(--border);
+    background: var(--raised); color: var(--fg); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 10px; font-size: 13px;
   }
   button { cursor: pointer; }
   button.accent { background: var(--accent); border-color: var(--accent); color: #fff; }
   .empty { color: var(--muted); padding: 40px 16px; text-align: center; }
-  code { background: #1d222c; padding: 1px 5px; border-radius: 4px; }
+  code { background: var(--raised); padding: 1px 5px; border-radius: 4px; }
 </style>
 </head>
 <body>
