@@ -144,6 +144,18 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   const gone = await p.evaluate((id) => [...virtualCanvases.get(id).getContext('2d').getImageData(50, 50, 1, 1).data], vid);
   assert(gone[3] === 0, 'and the virtual display no longer shows it');
 
+  // ── Pause on a stopped task cues it up: on stage, paused at the start,
+  //    not where its playhead was left (3 s, where its cue is on air).
+  await p.click(`#tasks .task[data-id="${taskId}"] button[title^="Pause"]`);
+  await p.waitForTimeout(400);
+  const cued = await p.evaluate((id) => currentTransport(id), taskId);
+  assert(cued?.active && !cued.playing, `Pause brings a stopped task on stage, paused (${JSON.stringify(cued && { active: cued.active, playing: cued.playing })})`);
+  assert(Math.abs(await p.evaluate((id) => showSeconds(id), taskId)) < 0.05, 'at the start');
+  const back = await p.evaluate((id) => [...virtualCanvases.get(id).getContext('2d').getImageData(50, 50, 1, 1).data], vid);
+  assert(back[3] === 0, `the frame at 0 is shown: its cue (from 2 s) is not on air yet (${back})`);
+  await p.click('#tl-stop');
+  await p.waitForTimeout(400);
+
   if (process.argv[2]) await p.screenshot({ path: process.argv[2] });
   assert(!errs.length, `no page errors ${errs.join(' | ')}`);
   await b.close();

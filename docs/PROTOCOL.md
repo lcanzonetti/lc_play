@@ -67,7 +67,8 @@ Commands:
 
 | `type` | Fields | Effect |
 |---|---|---|
-| `play`, `pause` | — | |
+| `play` | — | |
+| `pause` | — | a stopped task comes back on stage, paused at 0 (a control cue's *pause* does not do that) |
 | `stop` | — | main timeline: pause and rewind; a task: take it off stage |
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
@@ -350,7 +351,9 @@ broadcasts them back. Other tools may ignore it.
 * A task keeps running past its `duration_s` (which is the length shown in
   the editor) until it is stopped or a control cue acts on it.
   `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
-  timeline acted on — empty for the cue's own, `"main"`, or a task id. The
+  timeline acted on — empty for the cue's own, `"main"`, or a task id. A
+  `pause` or `jump` aimed at a stopped task leaves it off stage (the
+  operator's pause and seek bring it on). The
   Director schedules the resulting transport change for the exact cluster
   instant of the cue, ahead of time.
 * `free_run` on a cue (video): it plays at normal speed from the instant it

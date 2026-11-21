@@ -406,6 +406,17 @@ async fn auxiliary_timelines_have_their_own_transport() {
     assert_eq!(intro.show_time_at(status.cluster_ns), 2 * NANOS_PER_SEC);
     core.command_on(Command::Stop, Some("intro")).unwrap();
 
+    // Pausing a stopped task cues it up: on stage, paused at the start.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!core.status().tasks["intro"].active);
+    core.command_on(Command::Pause, Some("intro")).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = core.status();
+    let intro = status.tasks["intro"];
+    assert!(intro.active && !intro.playing, "on stage, paused");
+    assert_eq!(intro.show_time_at(status.cluster_ns), 0);
+    core.command_on(Command::Stop, Some("intro")).unwrap();
+
     // …whereas stopping the main timeline only rewinds it.
     core.command(Command::Seek {
         show_ns: 5 * NANOS_PER_SEC,
@@ -448,6 +459,28 @@ async fn a_pause_cue_stops_exactly_on_the_cue() {
     let status = core.status();
     assert!(status.transport.playing);
     assert!(status.show_ns > NANOS_PER_SEC / 2);
+    director.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pause_cue_leaves_a_stopped_task_off_stage() {
+    // Unlike the operator's pause, a programmed one does not bring a stopped
+    // task on stage (as a programmed jump does not).
+    let director = director_with_show(serde_json::json!({
+        "control_cues": [ { "id": "hold", "at_s": 0.3, "action": "pause", "target": "sting" } ],
+        "tasks": [ { "id": "sting" } ]
+    }))
+    .await;
+    let core = director.core();
+    core.command(Command::Play).unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let status = core.status();
+    let sting = status.tasks["sting"];
+    assert!(sting.epoch > 0, "the cue fired: {sting:?}");
+    assert!(
+        !sting.active && !sting.playing,
+        "still off stage: {sting:?}"
+    );
     director.shutdown().await;
 }
 
