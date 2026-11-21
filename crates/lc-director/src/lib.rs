@@ -1075,7 +1075,9 @@ impl Core {
 
                 let change = match cue.action {
                     ControlAction::Play => TransportChange::Play,
-                    ControlAction::Pause => TransportChange::Pause,
+                    // Like a jump, a programmed pause does not bring a
+                    // stopped task on stage (an operator's pause does).
+                    ControlAction::Pause => TransportChange::Hold,
                     ControlAction::Stop => TransportChange::Stop {
                         deactivate: target.is_some(),
                     },

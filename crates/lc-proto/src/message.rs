@@ -91,6 +91,8 @@ pub struct RunnerHello {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Play,
+    /// Pause. A stopped auxiliary timeline is cued up: it comes back on
+    /// stage, paused at the start (show time zero).
     Pause,
     /// Main timeline: pause and return to the start. Auxiliary timeline:
     /// take it off stage (it renders nothing until played again).
