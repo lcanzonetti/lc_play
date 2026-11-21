@@ -104,6 +104,30 @@ pub fn plan(show: &Show, live: impl Fn(usize) -> bool, areas: &[Rect]) -> Vec<us
     order
 }
 
+/// The virtual displays the pictures of `areas` need (as [`plan`]), each
+/// with its canvas area and the outputs (indices into `areas`) whose picture
+/// shows it, directly or through other virtual displays. A layer inside one
+/// of those areas is on those outputs as much as a layer over them: a card
+/// counts its late or split frames there.
+pub fn shown_on(
+    show: &Show,
+    live: impl Fn(usize) -> bool,
+    areas: &[Rect],
+) -> Vec<(Rect, Vec<usize>)> {
+    let mut outputs: Vec<Vec<usize>> = vec![Vec::new(); show.virtuals.len()];
+    for (w, area) in areas.iter().enumerate() {
+        for v in plan(show, &live, std::slice::from_ref(area)) {
+            outputs[v].push(w);
+        }
+    }
+    outputs
+        .into_iter()
+        .enumerate()
+        .filter(|(_, ws)| !ws.is_empty())
+        .map(|(v, ws)| (show.virtuals[v].canvas_rect, ws))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +194,38 @@ mod tests {
         // b first (without a: a is not rendered yet), then a (with b), then c
         // (without itself).
         assert_eq!(plan(&s, |_| true, &[OUT]), [1, 0, 2]);
+    }
+
+    #[test]
+    fn each_virtual_display_knows_the_outputs_it_reaches() {
+        // Output 0 shows c, whose area shows b; output 1 shows a. Nothing
+        // shows anything on output 2.
+        let s = show(&[("c", 1050.0), ("b", 450.0), ("a", 1250.0)]);
+        let second = Rect { x: 1200.0, ..OUT };
+        let third = Rect { x: 5000.0, ..OUT };
+        let reach = shown_on(&s, |_| true, &[OUT, second, third]);
+        let rect = |x: f32| Rect {
+            x,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        assert_eq!(
+            reach,
+            vec![
+                (rect(0.0), vec![1]),
+                (rect(200.0), vec![0]),
+                (rect(400.0), vec![0])
+            ],
+            "a on output 1; b (through c) and c on output 0"
+        );
+        // The same virtual display shown on two outputs reaches both.
+        let s = show(&[("a", 1050.0), ("a", 1250.0)]);
+        assert_eq!(
+            shown_on(&s, |_| true, &[OUT, second]),
+            vec![(rect(0.0), vec![0, 1])]
+        );
+        // Off air: nothing.
+        assert!(shown_on(&s, |_| false, &[OUT, second]).is_empty());
     }
 }

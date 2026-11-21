@@ -343,8 +343,10 @@ Phase 1 (sync) is implemented on the long-lived branch (not on `main`):
   refresh for every card — the Director's grid instant when frame-locked,
   otherwise the reference output's nearest refresh at the same rate.
 - **One late-frame decision** per layer and refresh: the first card's frame
-  stands; followers show it (`Content::follow`), and failures are counted
-  as `split_frames` in `OutputHealth` (Producer: `split N`).
+  stands if it is at most one frame from the one due; followers show it
+  (`Content::follow`). Any card showing another frame than one before it
+  for the same refresh is counted as `split_frames` in `OutputHealth`
+  (Producer: `split N`).
 - **Render thread per card** (`crates/lc-runner/src/card.rs`), with
   `LCPLAY_CARD_THREADS=0` to go back to one loop, and `LCPLAY_SPLIT_CARDS=1`
   to run the multi-card path on one card for testing.

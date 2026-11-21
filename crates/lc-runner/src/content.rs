@@ -81,8 +81,10 @@ pub trait Content: Send {
     /// for the refresh being rendered (see [`crate::plan`]), and both cards
     /// must show the same. A frame newer than `frame` is held back; if
     /// `frame` itself is not available the content shows what it can and
-    /// [`shown_frame`](Self::shown_frame) tells. Content without frames
-    /// ignores it.
+    /// [`shown_frame`](Self::shown_frame) tells. A decoder that has
+    /// already passed `frame` cannot go back to it without a restart, which
+    /// following does not do: it holds the frame it shows until the decision
+    /// catches up. Content without frames ignores it.
     fn follow(&mut self, t: f64, _frame: i64, gpu: &TextureFactory) {
         self.update(t, gpu);
     }
@@ -90,6 +92,12 @@ pub trait Content: Send {
     /// The media frame in the textures, for content made of frames (video);
     /// `None` for anything else, or before the first frame.
     fn shown_frame(&self) -> Option<i64> {
+        None
+    }
+
+    /// The media frame the clock asked for at the last update, for content
+    /// made of frames; `None` for anything else, or while idle.
+    fn due_frame(&self) -> Option<i64> {
         None
     }
 

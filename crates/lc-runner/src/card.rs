@@ -13,13 +13,22 @@
 //!
 //! The window thread still owns the windows and the show. It changes a card
 //! (a new show, outputs opened, moved or resized, a preview requested,
-//! health read) by taking the card's lock between two of its frames. The
-//! render thread releases the lock *fairly* after each frame
+//! health read) by taking the card's lock between two of its frames. A card
+//! holds its lock for a whole frame, including the wait for its displays
+//! (that wait cannot be split from acquiring the frame on wgpu's surfaces).
+//! The render thread releases the lock *fairly* after each frame
 //! (`unlock_fair`), handing it straight to the window thread if that is
-//! waiting, so the window thread waits at most one frame and is never
-//! starved. The window thread never waits for a card while the card could
+//! waiting: the window thread waits at most one frame of that card, does its
+//! short work, and the card takes its lock back in time for its next
+//! refresh. The window thread never waits for a card while the card could
 //! be waiting for it: a card only takes the planner's lock (and the
 //! playhead's), and those are never held while a card's lock is awaited.
+//!
+//! The window thread therefore takes **one card's lock at a time** wherever
+//! it can (health, previews). Holding card A's lock while waiting for card
+//! B's frame to end would stop A for up to a frame of B: A would miss a
+//! refresh. Only a change that every card must make at once (a new show,
+//! outputs rebuilt or closed) takes them all, and may cost a refresh.
 //!
 //! `LCPLAY_CARD_THREADS=0` drives every card from the window thread in turn,
 //! as before, with the same code ([`Card::step`]).
@@ -33,7 +42,7 @@ use winit::window::Window;
 
 use crate::content::{self, Content};
 use crate::frametime::{FrameTimer, Phase};
-use crate::plan::{FramePlan, Planner, RefreshLine, PREROLL_S};
+use crate::plan::{may_decide, FramePlan, Planner, RefreshLine, PREROLL_S};
 use crate::playhead::{Playhead, Position};
 use crate::render::{Gpu, OutputGpu, VirtualGpu};
 use crate::show::{Output, Rect, Show, Source};
@@ -98,9 +107,9 @@ pub struct CardOutput {
     pub window: Arc<Window>,
     /// The output as it was last applied.
     pub output: Output,
-    /// Frames in which a layer on this output showed a different frame
-    /// than another card showed for the same refresh (its decoder did not
-    /// have the frame decided on).
+    /// Frames in which a layer on air on this output (directly, or through
+    /// a virtual display it shows) showed a different frame than another
+    /// card showed before it for the same refresh.
     pub split_frames: u64,
 }
 
@@ -461,12 +470,9 @@ impl Card {
             })
         };
         let virtual_order = virtuals::plan(show, on_air, &areas);
-        let virtual_areas: Vec<Rect> = virtuals::plan(show, soon, &areas)
-            .into_iter()
-            .map(|v| show.virtuals[v].canvas_rect)
-            .collect();
+        let virtual_reach = virtuals::shown_on(show, soon, &areas);
         let updating = Instant::now();
-        let (late, split) = self.update_contents(show, &areas, &virtual_areas, &plan);
+        let (late, split) = self.update_contents(show, &areas, &virtual_reach, &plan);
         self.timing.since(Phase::Update, updating);
         if !late.is_empty() {
             self.timing.note("late decode");
@@ -515,18 +521,21 @@ impl Card {
 
     /// Bring this card's contents to `plan`. Only layers that fall on one
     /// of the card's outputs (`areas`, parallel to `self.outputs`), or in
-    /// the area of a virtual display they show (`virtual_areas`), are
-    /// decoded; the others are idle on this card.
+    /// the area of a virtual display those outputs show (`virtual_reach`:
+    /// each such area with the outputs it reaches), are decoded; the others
+    /// are idle on this card.
     ///
     /// A video layer shows the frame decided for the plan if another card
-    /// has already shown one ([`FramePlan::decide`]); otherwise this card
-    /// decides. Returns the outputs on which a video layer was late, and
-    /// those on which one showed another frame than the decided one.
+    /// has already decided one ([`FramePlan::decide`]); otherwise this card
+    /// updates it, and decides if the frame it shows is close enough to the
+    /// one due ([`may_decide`]). Returns the outputs on which a video layer
+    /// on air was late, and those on which one showed another frame than a
+    /// card before it did for the same plan.
     fn update_contents(
         &mut self,
         show: &Show,
         areas: &[Rect],
-        virtual_areas: &[Rect],
+        virtual_reach: &[(Rect, Vec<usize>)],
         plan: &FramePlan,
     ) -> (Vec<usize>, Vec<usize>) {
         let factory = self.gpu.factory();
@@ -547,34 +556,41 @@ impl Card {
                 c.idle();
                 continue;
             };
-            // Not on any of this card's outputs: another card (or Runner)
-            // shows it. Decoding it here would only cost time.
-            let here: Vec<usize> = areas
+            // The outputs it appears on: directly, or inside a virtual
+            // display that they show.
+            let mut here: Vec<usize> = areas
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| overlaps(&layer.transform, r))
                 .map(|(w, _)| w)
                 .collect();
-            if here.is_empty() && !virtual_areas.iter().any(|r| overlaps(&layer.transform, r)) {
+            for (r, outputs) in virtual_reach {
+                if overlaps(&layer.transform, r) {
+                    here.extend(outputs);
+                }
+            }
+            // None: another card (or Runner) shows it. Decoding it here
+            // would only cost time.
+            if here.is_empty() {
                 c.idle();
                 continue;
             }
-            match plan.decided(i) {
-                Some(frame) => {
-                    c.follow(media, frame, &factory);
-                    if c.shown_frame().is_some_and(|shown| shown != frame) {
-                        split.extend(&here);
-                    }
+            let decided = plan.decided(i);
+            match decided {
+                Some(frame) => c.follow(media, frame, &factory),
+                None => c.update(media, &factory),
+            }
+            if let Some(shown) = c.shown_frame() {
+                // A stale picture (the decoder restarting, or held back from
+                // restarting) is not imposed on the other cards: they show
+                // their own, and the next of them to update this layer
+                // decides.
+                if decided.is_none() && c.due_frame().is_some_and(|due| may_decide(shown, due)) {
+                    plan.decide(i, shown);
                 }
-                None => {
-                    c.update(media, &factory);
-                    if let Some(shown) = c.shown_frame() {
-                        // Another card may have decided meanwhile: then its
-                        // frame stands, and this one differs from it.
-                        if plan.decide(i, shown) != shown {
-                            split.extend(&here);
-                        }
-                    }
+                // Before it is on air, a frame shown is only preparation.
+                if plan.shown(i, shown) && step.on_air {
+                    split.extend(&here);
                 }
             }
             if step.on_air && c.late() {

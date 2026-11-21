@@ -715,6 +715,10 @@ impl Content for HapContent {
         self.shown
     }
 
+    fn due_frame(&self) -> Option<i64> {
+        self.last_want
+    }
+
     fn idle(&mut self) {
         self.stop_workers();
         self.last_want = None;
@@ -875,6 +879,14 @@ impl Content for LazyVideo {
         match &self.state {
             State::Hap(c) => c.shown_frame(),
             State::Ffmpeg(c) => c.shown_frame(),
+            _ => None,
+        }
+    }
+
+    fn due_frame(&self) -> Option<i64> {
+        match &self.state {
+            State::Hap(c) => c.due_frame(),
+            State::Ffmpeg(c) => c.due_frame(),
             _ => None,
         }
     }

@@ -379,10 +379,14 @@ at the same rate — and the first card to need that key builds the plan (show
 position, each layer's time and media time, free-run on-air instants) from
 one clock reading; the others reuse it. A plan also records, per layer, the
 video frame the first card showed: a card rendering the same refresh later
-shows that frame (`Content::follow`), so when a decoder is late every card
-holds the same older frame instead of splitting the picture at the boundary
-between the cards. A card that cannot show the decided frame counts a
-`split` frame on the outputs concerned (output health, Producer).
+shows that frame (`Content::follow`), so when a decoder is a frame late every
+card holds the same older frame instead of splitting the picture at the
+boundary between the cards. Only a frame at most one frame from the one due
+is imposed this way; a card holding a stale picture (its decoder restarting)
+shows it alone, and the next card decides. A card that shows another frame
+than a card before it for the same refresh counts a `split` frame on the
+outputs concerned, including those that show the layer through a virtual
+display (output health, Producer).
 
 Without frame lock, the cards' scanouts are not aligned: each card shows the
 plan of the reference refresh nearest to its own, up to half a refresh away.

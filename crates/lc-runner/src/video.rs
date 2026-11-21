@@ -919,8 +919,15 @@ impl VideoContent {
 impl VideoContent {
     /// Bring the texture to frame `target`. `due` is the frame the clock
     /// asks for (what lateness is measured against). `exact`: `target` was
-    /// decided by another card ([`Content::follow`]) — never show a frame
-    /// newer than it, and do not restart the decoder to go back a little.
+    /// decided by another card ([`Content::follow`]) — never take a frame
+    /// newer than it from the decoder, and do not restart the decoder to go
+    /// back a little. If this decoder has already passed `target` (and has
+    /// no frame held back), `target` is gone: it was decoded, shown or
+    /// skipped, and given back. The texture then keeps the frame it holds,
+    /// which may be older or newer than `target`, until the decision
+    /// catches up with the decoder; the card counts each such frame as
+    /// split. Restarting ffmpeg to fetch one frame would cost far more than
+    /// the frame.
     fn advance(&mut self, due: i64, target: i64, exact: bool, gpu: &TextureFactory) {
         if self.failed {
             return;
@@ -934,7 +941,9 @@ impl VideoContent {
         // Is the running decoder still useful? It only moves forward, so it
         // is not if the wanted frame is behind it, or so far ahead that
         // decoding up to it would take longer than starting over. A frame
-        // held back counts as not yet taken.
+        // held back counts as not yet taken. When following, a decoder up to
+        // `window` frames past the decided frame is kept anyway (see above:
+        // it cannot show that frame, and holds its picture instead).
         let reach = |d: &Decoder, pending: &Option<(i64, Vec<u8>)>| {
             pending.as_ref().map_or(d.next_frame, |(index, _)| *index)
         };
@@ -1036,6 +1045,10 @@ impl Content for VideoContent {
 
     fn shown_frame(&self) -> Option<i64> {
         self.shown
+    }
+
+    fn due_frame(&self) -> Option<i64> {
+        self.last_want
     }
 
     fn idle(&mut self) {

@@ -188,7 +188,10 @@ impl App {
     }
 
     /// Take every card's lock, in order (waiting at most for each card's
-    /// frame in progress).
+    /// frame in progress). Only for changes every card must make at once: a
+    /// card locked early is held while a later one finishes its frame, and
+    /// can miss a refresh (see [`crate::card`]). Anything else locks one card
+    /// at a time.
     fn lock_all(&self) -> Vec<CardGuard> {
         self.cards.iter().map(|c| c.lock_arc()).collect()
     }
@@ -257,25 +260,32 @@ impl App {
                     self.apply_show(event_loop, show);
                 }
                 RunnerAction::SendPreview => {
-                    let mut guards = self.lock_all();
-                    if let Some(g) = guards.first_mut() {
-                        g.timing.note("preview requested");
-                    }
-                    self.captures = self
-                        .windows
-                        .iter()
-                        .filter_map(|rw| {
+                    // One card at a time; captures stay in window order.
+                    let mut captures: Vec<_> = self.windows.iter().map(|_| None).collect();
+                    for (c, card) in self.cards.iter().enumerate() {
+                        let windows: Vec<usize> = (0..self.windows.len())
+                            .filter(|&i| self.windows[i].card == c)
+                            .collect();
+                        if windows.is_empty() && c != 0 {
+                            continue;
+                        }
+                        let mut g = card.lock();
+                        if c == 0 {
+                            g.timing.note("preview requested");
+                        }
+                        for i in windows {
+                            let rw = &self.windows[i];
                             let name = if rw.output.name.is_empty() {
                                 &rw.output.id
                             } else {
                                 &rw.output.name
                             };
-                            let card = &guards[rw.card];
-                            let out = card.output(&rw.output.id)?;
-                            Some(card.gpu.capture_output(&out.gpu, name, PREVIEW_WIDTH))
-                        })
-                        .collect();
-                    drop(guards);
+                            captures[i] = g
+                                .output(&rw.output.id)
+                                .map(|out| g.gpu.capture_output(&out.gpu, name, PREVIEW_WIDTH));
+                        }
+                    }
+                    self.captures = captures.into_iter().flatten().collect();
                     if self.captures.is_empty() {
                         // Nothing to show: answer anyway, so the operator
                         // sees that there are no outputs.
@@ -305,8 +315,8 @@ impl App {
         if self.captures.is_empty() {
             return;
         }
-        for g in self.lock_all() {
-            g.gpu.poll();
+        for card in &self.cards {
+            card.lock().gpu.poll();
         }
         let all_done = self.captures.iter().all(|c| c.take_ready());
         let too_old = self
@@ -682,37 +692,34 @@ impl App {
     /// moved to another monitor, or the mode changed.
     fn publish_output_health(&self) {
         let now = self.playhead().clock.local_now_ns();
-        let mut guards = self.lock_all();
-        for rw in &self.windows {
-            // The window system can briefly not know the monitor (while a
-            // window moves): then the last known mode stands.
-            if let Some(nominal) = crate::render::nominal_period(&rw.window) {
-                if let Some(o) = guards[rw.card].output_mut(&rw.output.id) {
-                    o.gpu.timing.clock.set_nominal(Some(nominal));
+        // One card at a time (see `lock_all`), the results in window order.
+        let mut health: Vec<Option<lc_proto::OutputHealth>> =
+            self.windows.iter().map(|_| None).collect();
+        let mut vblank = None;
+        for (c, card) in self.cards.iter().enumerate() {
+            let windows: Vec<usize> = (0..self.windows.len())
+                .filter(|&i| self.windows[i].card == c)
+                .collect();
+            if windows.is_empty() {
+                continue;
+            }
+            let mut g = card.lock();
+            for i in windows {
+                let rw = &self.windows[i];
+                // The window system can briefly not know the monitor (while a
+                // window moves): then the last known mode stands.
+                if let Some(nominal) = crate::render::nominal_period(&rw.window) {
+                    if let Some(o) = g.output_mut(&rw.output.id) {
+                        o.gpu.timing.clock.set_nominal(Some(nominal));
+                    }
+                }
+                health[i] = g.health(&rw.output.id);
+                if i == 0 {
+                    vblank = self.vblank_report(&g, &rw.output.id, now);
                 }
             }
         }
-        let health: Vec<lc_proto::OutputHealth> = self
-            .windows
-            .iter()
-            .filter_map(|rw| guards[rw.card].health(&rw.output.id))
-            .collect();
-        let vblank = self.windows.first().and_then(|rw| {
-            let clock = &guards[rw.card].output(&rw.output.id)?.gpu.timing.clock;
-            // A young or foreign estimate would become every Runner's grid.
-            if !clock.is_mature() {
-                return None;
-            }
-            let (_, at) = clock.last_refresh(now)?;
-            let period = clock.period()?;
-            let reading = self.playhead().clock.read(at);
-            reading.synced.then(|| lc_proto::VblankReport {
-                vblank_ns: reading.cluster_ns,
-                period_ps: (period * 1000.0).round() as i64,
-                exact: clock.is_exact(),
-            })
-        });
-        drop(guards);
+        let health: Vec<lc_proto::OutputHealth> = health.into_iter().flatten().collect();
         let downloads = match &self.source {
             ShowSource::Cluster { assets, .. } => assets.downloads(),
             ShowSource::Local(_) => Vec::new(),
@@ -722,6 +729,26 @@ impl App {
             h.vblank = vblank;
             h.downloads = downloads;
         });
+    }
+}
+
+impl App {
+    /// The refresh of output `id` (on `card`) for the Director's grid, if
+    /// its estimate can be trusted.
+    fn vblank_report(&self, card: &Card, id: &str, now: i64) -> Option<lc_proto::VblankReport> {
+        let clock = &card.output(id)?.gpu.timing.clock;
+        // A young or foreign estimate would become every Runner's grid.
+        if !clock.is_mature() {
+            return None;
+        }
+        let (_, at) = clock.last_refresh(now)?;
+        let period = clock.period()?;
+        let reading = self.playhead().clock.read(at);
+        reading.synced.then(|| lc_proto::VblankReport {
+            vblank_ns: reading.cluster_ns,
+            period_ps: (period * 1000.0).round() as i64,
+            exact: clock.is_exact(),
+        })
     }
 }
 

@@ -36,13 +36,22 @@
 //! ## One decision per frame when a decoder is late
 //!
 //! A plan also records, per layer, the media frame the first card to update
-//! that layer actually showed ([`FramePlan::decide`]). Cards updating the
-//! layer later for the same plan show that frame
+//! that layer showed ([`FramePlan::decide`]). Cards updating the layer later
+//! for the same plan show that frame
 //! ([`crate::content::Content::follow`]) instead of deciding again: if the
-//! first card's decoder was late, every card holds the same older frame,
-//! rather than one card showing frame N and the other N−1. When a follower
-//! cannot show the decided frame (its own decoder is behind), that is
-//! counted per output as a *split frame*.
+//! first card's decoder was a frame late, every card holds the same older
+//! frame, rather than one card showing frame N and the other N−1.
+//!
+//! Only a frame within one frame of the one due can be the decision. A card
+//! whose picture is further off (its decoder was just restarted, or is
+//! rate-limited after a jump, and the texture still holds a frame from
+//! before) does not pin the other cards to that stale frame: it shows it
+//! alone, and the next card to update the layer decides.
+//!
+//! Separately, the plan records the first frame shown of each layer
+//! ([`FramePlan::shown`]), decided or not. A card that shows a different
+//! one for the same plan has split the picture; that is counted per output
+//! as a *split frame*.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -102,8 +111,24 @@ pub struct FramePlan {
     pub times: Vec<Option<f64>>,
     /// Parallel to `show.layers`.
     pub steps: Vec<LayerStep>,
-    /// Per layer: the media frame the first card to update it showed.
-    decisions: Mutex<Vec<Option<i64>>>,
+    /// Per layer: the frame decided on, and the first frame shown.
+    decisions: Mutex<Vec<Slot>>,
+}
+
+/// What the cards did with one layer of a plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Slot {
+    /// The frame every card shows ([`FramePlan::decide`]).
+    decided: Option<i64>,
+    /// The first frame a card showed ([`FramePlan::shown`]).
+    shown: Option<i64>,
+}
+
+/// Whether a card that shows media frame `shown` while frame `due` is due
+/// may decide the frame for every card: only if it is at most one frame off
+/// (a decoder a frame late). A picture further off is stale.
+pub fn may_decide(shown: i64, due: i64) -> bool {
+    (due - shown).abs() <= 1
 }
 
 impl FramePlan {
@@ -113,8 +138,7 @@ impl FramePlan {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(layer)
-            .copied()
-            .flatten()
+            .and_then(|s| s.decided)
     }
 
     /// Record that `frame` of `layer` was shown — unless another card got
@@ -122,8 +146,19 @@ impl FramePlan {
     pub fn decide(&self, layer: usize, frame: i64) -> i64 {
         let mut decisions = self.decisions.lock().unwrap_or_else(|e| e.into_inner());
         match decisions.get_mut(layer) {
-            Some(slot) => *slot.get_or_insert(frame),
+            Some(slot) => *slot.decided.get_or_insert(frame),
             None => frame,
+        }
+    }
+
+    /// Record that a card showed `frame` of `layer`. Returns whether another
+    /// card showed a different frame of it for this plan: the picture is
+    /// split between them.
+    pub fn shown(&self, layer: usize, frame: i64) -> bool {
+        let mut decisions = self.decisions.lock().unwrap_or_else(|e| e.into_inner());
+        match decisions.get_mut(layer) {
+            Some(slot) => *slot.shown.get_or_insert(frame) != frame,
+            None => false,
         }
     }
 
@@ -277,6 +312,17 @@ struct Inner {
     generation: u64,
     /// Free-running layers on air: layer id → the cluster time they went on
     /// air.
+    ///
+    /// One map for every plan, those a card at another refresh rate builds
+    /// for itself (`Key::Own`) included, so those cards see a layer go on
+    /// and off air at slightly different instants, in turn. That is safe
+    /// because an onset is not the instant a card first saw the layer on
+    /// air: it is worked out from the transport (`on_air_since`), the same
+    /// whichever card works it out, whenever. An entry dropped by one card
+    /// and added again by another comes back the same. Anything that makes
+    /// an onset depend on *when* it is recorded would break that; the test
+    /// `cards_at_different_rates_agree_on_when_a_free_running_layer_went_on_air`
+    /// pins it.
     onsets: HashMap<String, i64>,
     /// The latest plans, newest last.
     recent: VecDeque<Arc<FramePlan>>,
@@ -322,7 +368,7 @@ impl Inner {
             generation: self.generation,
             position,
             times,
-            decisions: Mutex::new(vec![None; steps.len()]),
+            decisions: Mutex::new(vec![Slot::default(); steps.len()]),
             steps,
         });
         if plan.is_shared() {
@@ -575,7 +621,7 @@ mod tests {
                 };
                 2
             ],
-            decisions: Mutex::new(vec![None; 2]),
+            decisions: Mutex::new(vec![Slot::default(); 2]),
         };
         assert_eq!(plan.decided(0), None);
         assert_eq!(plan.decide(0, 41), 41);
@@ -584,6 +630,45 @@ mod tests {
         assert_eq!(plan.decided(1), None);
         // Out of range (a show change raced it): nothing recorded.
         assert_eq!(plan.decide(5, 7), 7);
+        assert!(!plan.shown(5, 7));
+    }
+
+    #[test]
+    fn a_different_frame_shown_for_the_same_plan_is_a_split() {
+        let plan = FramePlan {
+            key: Key::Grid(0),
+            generation: 0,
+            position: position(0, 0, false),
+            times: vec![Some(0.0); 2],
+            steps: vec![
+                LayerStep {
+                    on_air: true,
+                    media: Some(0.0)
+                };
+                2
+            ],
+            decisions: Mutex::new(vec![Slot::default(); 2]),
+        };
+        // The first card shows a stale frame without deciding; the second
+        // decides its own. Whichever came second sees the split.
+        assert!(!plan.shown(0, 10));
+        assert_eq!(plan.decide(0, 42), 42);
+        assert!(plan.shown(0, 42));
+        // A third card showing the first frame again: no split with it.
+        assert!(!plan.shown(0, 10));
+        // Layers are independent.
+        assert!(!plan.shown(1, 42));
+    }
+
+    #[test]
+    fn only_a_frame_close_to_the_one_due_may_be_decided() {
+        assert!(may_decide(42, 42));
+        // A frame late, or (in reverse) a frame ahead.
+        assert!(may_decide(41, 42));
+        assert!(may_decide(43, 42));
+        // Stale: what the texture held before a jump or a restart.
+        assert!(!may_decide(40, 42));
+        assert!(!may_decide(300, 42));
     }
 
     #[test]
@@ -679,6 +764,48 @@ mod tests {
         let (d, _) = planner.plan(&playhead, 1, refresh, Some(1e9 / 50.0), false);
         assert!(!d.is_shared());
         assert!(!Arc::ptr_eq(&a, &d));
+    }
+
+    #[test]
+    fn cards_at_different_rates_agree_on_when_a_free_running_layer_went_on_air() {
+        let clock = Arc::new(lc_time::ClusterClock::new(Arc::new(
+            lc_time::MonotonicClock::new(),
+        )));
+        let playhead = Playhead::new(
+            clock,
+            TransportState::STOPPED,
+            lc_proto::FrameRate::default(),
+        );
+        let show = Arc::new(Show {
+            layers: vec![layer("free", 2.0, true)],
+            ..Show::empty()
+        });
+        let planner = Planner::new(show);
+        let mut inner = planner.lock();
+        // Show time 0 at cluster 100 s, so the layer goes on air at 102 s.
+        // Card A (60 Hz) shares its plans; card B (50 Hz, 3 ms ahead) plans
+        // for itself. They take turns through the layer's start, each
+        // seeing it go on air at its own instant, and each adding the onset
+        // the other may just have dropped.
+        let mut a = 101_900_000_000;
+        let mut b = 101_903_000_000;
+        let mut seen_on_air = 0;
+        while a < 102_500_000_000 {
+            for (key, at) in [(Key::Grid(a), a), (Key::Own, b)] {
+                let plan = inner.build(key, position(at, at - 100 * S, true), &playhead);
+                let step = plan.steps[0];
+                if step.on_air {
+                    seen_on_air += 1;
+                    assert_eq!(inner.onsets.get("free"), Some(&(102 * S)));
+                    assert_eq!(step.media, Some((at - 102 * S) as f64 / S as f64));
+                } else {
+                    assert_eq!(step.media, Some(0.0), "about to appear: its first frame");
+                }
+            }
+            a += 16_666_667;
+            b += 20_000_000;
+        }
+        assert!(seen_on_air > 10);
     }
 
     #[test]
