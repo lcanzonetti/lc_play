@@ -108,7 +108,8 @@ const S = {
   frameRate: { num: 60, den: 1 },
   clockOffsetNs: null,  // cluster time − performance.now(), null until known
   status: null,         // last cluster status
-  library: [],          // items on the Asset Manager
+  library: [],          // items on the Asset Manager (null: not reachable)
+  uploads: [],          // files this window is sending to it, in order (see uploadFiles)
   pxPerSec: 40,         // timeline zoom
   view: { k: null, cx: 0, cy: 0 }, // stage view: screen px per canvas px (null = fit), canvas point at the centre
   onsets: new Map(),    // free-running cue id → cluster ns it went on air (preview)
@@ -1028,8 +1029,9 @@ async function loadLibrary() {
     }
     reconcileAssets();
   } catch {
-    if (S.library !== null) renderAssets('Asset Manager not reachable at ' + S.assetsUrl);
+    const was = S.library;
     S.library = null;
+    if (was !== null) renderAssets();
   }
 }
 
@@ -1167,11 +1169,13 @@ async function openOptimizeSettings() {
   $('#opt-cancel').onclick = () => ($('#opt-dialog').hidden = true);
 }
 
-function renderAssets(problem) {
+/** The asset list: files being uploaded from this window first, greyed out
+ *  with a bar under each, then the Asset Manager's library. */
+function renderAssets() {
   const list = $('#asset-list');
-  list.replaceChildren();
-  if (problem) return list.append(el('div', { class: 'empty' }, problem));
-  if (!S.library?.length) return list.append(el('div', { class: 'empty' }, 'No media yet. Upload files, or drop them here.'));
+  list.replaceChildren(...S.uploads.map(uploadRow));
+  if (S.library === null) return list.append(el('div', { class: 'empty' }, `Asset Manager not reachable at ${S.assetsUrl}`));
+  if (!S.library.length && !S.uploads.length) return list.append(el('div', { class: 'empty' }, 'No media yet. Upload files, or drop them here.'));
   for (const item of S.library) {
     const meta = [item.width ? `${item.width}×${item.height}` : item.kind,
       item.duration_s ? `${item.duration_s.toFixed(1)} s` : null].filter(Boolean).join(' · ');
@@ -1202,25 +1206,159 @@ async function deleteAsset(item) {
   loadLibrary();
 }
 
-/** Upload files one after another. XMLHttpRequest rather than fetch because
- *  it reports upload progress, which matters for multi-gigabyte media. */
-async function uploadFiles(files) {
-  for (const file of files) {
-    await new Promise((resolve) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', `${S.assetsUrl}/api/upload?name=${encodeURIComponent(file.name)}`);
-      xhr.upload.onprogress = (e) => toast(`Uploading ${file.name} — ${Math.round((100 * e.loaded) / e.total)} %`, true);
-      xhr.onload = () => {
-        if (xhr.status >= 300) toast(`Upload of ${file.name} failed: ${xhr.responseText}`);
-        else toast(`Uploaded ${file.name}`, true);
-        resolve();
-      };
-      xhr.onerror = () => { toast(`Upload of ${file.name} failed: Asset Manager not reachable`); resolve(); };
-      xhr.send(file);
-    });
-  }
-  loadLibrary();
+// ───────────────────────────── uploads ─────────────────────────────
+// Every file given to this window (Upload… or dropped on the list) joins
+// one queue, S.uploads, and is listed at once at the top of the asset list:
+// greyed out (it cannot be cued yet) with a bar under it. Files go one at a
+// time, in the order given. On one link, several at once would not finish
+// the batch sooner; one at a time gets the first file stored, and its
+// optimisation started, as soon as possible.
+//
+// An upload is one of:
+//   waiting  — queued behind another;         ✕ removes it
+//   sending  — bar = bytes sent;               ✕ stops it (the Asset Manager
+//              deletes what it had received:  it stores under a hidden
+//              temporary name until the last byte)
+//   stored   — the Asset Manager has the file; the row goes as soon as the
+//              library lists it as a normal item (where optimisation shows)
+//   failed   — the row stays, in red, with the reason: ↻ sends it again
+//              (from the start), ✕ removes it
+// A cancelled upload is not kept: the operator asked for it.
+//
+// XMLHttpRequest rather than fetch because it reports upload progress.
+
+/** "640 KB", "2.9 MB", "850 MB", "3.40 GB". */
+const mb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(b < 1e8 ? 1 : 0)} MB` : `${Math.round(b / 1e3)} KB`);
+
+function uploadFiles(files) {
+  for (const file of files) S.uploads.push({ key: uid(), file, name: file.name, size: file.size, sent: 0, state: 'waiting' });
+  renderAssets();
+  pumpUploads();
 }
+
+/** Start the next waiting upload, unless one is being sent. */
+function pumpUploads() {
+  if (S.uploads.some((u) => u.state === 'sending')) return;
+  const u = S.uploads.find((x) => x.state === 'waiting');
+  if (u) sendUpload(u);
+}
+
+function sendUpload(u) {
+  const xhr = new XMLHttpRequest();
+  Object.assign(u, { xhr, state: 'sending', sent: 0, error: '', started: performance.now() });
+  xhr.open('POST', `${S.assetsUrl}/api/upload?name=${encodeURIComponent(u.name)}`);
+  xhr.upload.onprogress = (e) => { u.sent = e.loaded; updateUploadRow(u); };
+  xhr.onload = async () => {
+    if (xhr.status >= 300) return uploadFailed(u, errorText(xhr));
+    u.state = 'stored';
+    u.sent = u.size;
+    updateUploadRow(u);
+    pumpUploads();
+    let kind = '';
+    try { kind = JSON.parse(xhr.responseText).kind; } catch { /* only used for the message */ }
+    // The library now has the file: list it, then drop the upload row, so
+    // the row is replaced rather than disappearing and coming back.
+    await loadLibrary();
+    dropUpload(u);
+    toast(kind === 'audio' ? `Uploaded ${u.name}: audio files are stored but cannot be cued yet, so they are not listed.` : `Uploaded ${u.name}`, true);
+  };
+  // No response at all: the Asset Manager went away, or closed the
+  // connection (it may refuse a file before reading it).
+  xhr.onerror = () => uploadFailed(u, 'the connection to the Asset Manager was lost');
+  xhr.send(u.file);
+  updateUploadRow(u);
+}
+
+/** The Asset Manager's reason for refusing a request: its JSON `error`, or
+ *  the body as it is. */
+function errorText(xhr) {
+  try { return JSON.parse(xhr.responseText).error || xhr.responseText; } catch { return xhr.responseText || `HTTP ${xhr.status}`; }
+}
+
+function uploadFailed(u, reason) {
+  Object.assign(u, { state: 'failed', error: reason, xhr: null });
+  updateUploadRow(u);
+  toast(`Upload of ${u.name} failed: ${reason}`);
+  pumpUploads();
+}
+
+/** ✕ on an upload row: stop it if it is being sent, forget it either way. */
+function cancelUpload(u) {
+  if (u.state === 'stored') return; // already on the Asset Manager; the row is about to go
+  if (u.state === 'sending') {
+    u.xhr.onerror = null;
+    u.xhr.abort();
+    toast(`Upload of ${u.name} cancelled`, true);
+  }
+  dropUpload(u);
+  pumpUploads();
+}
+
+function retryUpload(u) {
+  Object.assign(u, { state: 'waiting', sent: 0, error: '' });
+  updateUploadRow(u);
+  pumpUploads();
+}
+
+function dropUpload(u) {
+  S.uploads = S.uploads.filter((x) => x !== u);
+  renderAssets();
+}
+
+/** An upload's row in the asset list. The parts that change while bytes go
+ *  out are kept on the upload (u.ui) and updated in place: progress events
+ *  come many times a second and must not rebuild the list. */
+function uploadRow(u) {
+  const ext = (u.name.match(/\.([^.]+)$/)?.[1] || '?').slice(0, 4).toUpperCase();
+  const replaces = S.library?.some((i) => i.name === u.name);
+  const status = el('span', { class: 'up-status' });
+  const fill = el('div', { class: 'fill' });
+  const retry = el('button', { title: 'Upload again, from the start', onclick: () => retryUpload(u) }, '↻');
+  const cancel = el('button', { class: 'danger', onclick: () => cancelUpload(u) }, '✕');
+  const row = el('div', { class: 'asset upload', dataset: { upload: u.key } },
+    el('div', { class: 'up-thumb' }, ext),
+    el('div', {}, el('div', { class: 'name' }, u.name),
+      el('div', { class: 'meta' }, status, replaces ? el('span', { class: 'up-note' }, 'replaces the file of the same name') : null)),
+    el('div', { class: 'btns' }, retry, cancel),
+    el('div', { class: 'bar' }, fill));
+  u.ui = { row, status, fill, retry, cancel };
+  updateUploadRow(u);
+  return row;
+}
+
+function updateUploadRow(u) {
+  if (!u.ui) return;
+  const { row, status, fill, retry, cancel } = u.ui;
+  const frac = u.size ? Math.min(1, u.sent / u.size) : u.state === 'stored' ? 1 : 0;
+  // The status is a few parts joined by " · ". In the (narrow) Assets
+  // window it wraps between parts, never inside one: no-break spaces.
+  let parts;
+  if (u.state === 'waiting') parts = ['waiting to upload', mb(u.size)];
+  else if (u.state === 'stored') parts = ['uploaded', 'adding to the list'];
+  else if (u.state === 'failed') parts = [];
+  else {
+    const secs = (performance.now() - u.started) / 1000;
+    const rate = secs > 0.5 ? u.sent / secs : 0;           // average since the start: steady on a LAN
+    const left = rate > 0 ? (u.size - u.sent) / rate : null;
+    parts = [`uploading ${Math.floor(frac * 100)} %`, `${mb(u.sent)} / ${mb(u.size)}`];
+    if (rate) parts.push(`${mb(rate)}/s`);
+    if (left != null) parts.push(left >= 90 ? `${Math.round(left / 60)} min left` : `${Math.ceil(left)} s left`);
+  }
+  // A failure's reason is a sentence: it wraps normally.
+  const text = u.state === 'failed' ? `upload failed: ${u.error}` : parts.map((x) => x.replace(/ /g, '\u00a0')).join(' · ');
+  row.className = `asset upload up-${u.state}`;
+  row.title = u.name;
+  status.textContent = text;
+  fill.style.width = `${(frac * 100).toFixed(1)}%`;
+  retry.hidden = u.state !== 'failed';
+  cancel.hidden = u.state === 'stored';
+  cancel.title = u.state === 'sending' ? 'Stop this upload' : 'Remove from the list';
+}
+
+// Leaving the page stops the uploads: ask first.
+window.addEventListener('beforeunload', (e) => {
+  if (S.uploads.some((u) => u.state === 'waiting' || u.state === 'sending')) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // ───────────────────────────── preview media ─────────────────────────────
 // What the stage draws for a cue. This is a PREVIEW of the content, played
@@ -2510,7 +2648,6 @@ function renderRunners(force = false) {
  *  complete, the cues that use it show the black-and-magenta placeholder on
  *  that Runner's outputs. */
 function downloadBars(downloads) {
-  const mb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`);
   const box = el('div', { class: 'downloads' }, el('h4', {}, 'Loading media'));
   for (const d of downloads) {
     const frac = d.total ? Math.min(1, d.done / d.total) : 0;

@@ -118,7 +118,7 @@ input[type=checkbox] { vertical-align: -2px; }
 /* ---- assets ----------------------------------------------------------- */
 #asset-list { padding: 6px; }
 #asset-list.drop { outline: 2px dashed var(--accent); outline-offset: -4px; }
-.asset { display: grid; grid-template-columns: 64px 1fr auto; gap: 8px; align-items: center; padding: 4px; border-radius: 4px; cursor: grab; }
+.asset { display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 4px; border-radius: 4px; cursor: grab; }
 .asset:hover { background: var(--head); }
 .asset img { width: 64px; height: 36px; object-fit: cover; background: #000; border-radius: 2px; }
 .asset .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -131,6 +131,25 @@ input[type=checkbox] { vertical-align: -2px; }
 .opt-optimizing { color: #e0b040; }
 .opt-done { color: #5fbf6f; }
 .opt-failed { color: #e05050; cursor: help; }
+/* A file being uploaded from this window: greyed out (not usable yet), with
+   a bar under it. Its buttons stay visible: stopping it is what the row is
+   for. The bar spans the row's three columns. */
+.asset.upload { cursor: default; row-gap: 3px; }
+.asset.upload:hover { background: none; }
+.asset.upload > :nth-child(-n+2) { opacity: .5; }
+.asset.upload button { visibility: visible; }
+.asset .up-thumb {
+  width: 64px; height: 36px; border-radius: 2px; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); border: 1px dashed var(--line); color: var(--dim); font-size: 10px; letter-spacing: .05em;
+}
+/* The status wraps only between its parts (see updateUploadRow). */
+.asset .up-status, .asset .up-note { display: block; }
+.asset .bar { grid-column: 1 / -1; height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.asset .bar .fill { height: 100%; width: 0; background: var(--accent); transition: width .25s linear; }
+.asset.up-stored .bar .fill { background: var(--ok); }
+.asset.up-failed > :nth-child(2) { opacity: 1; }
+.asset.up-failed .up-status { color: var(--bad); }
+.asset.up-failed .bar .fill { background: var(--bad); }
 #opt-dialog { position: fixed; inset: 0; background: rgba(0, 0, 0, .55); z-index: 9400; display: flex; align-items: center; justify-content: center; }
 #opt-dialog[hidden] { display: none; }
 #opt-dialog .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; max-width: 640px; max-height: 90vh; overflow: auto; }
