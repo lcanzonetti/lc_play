@@ -592,15 +592,17 @@ the whole system played it at ~57 fps on lavapipe (software Vulkan, 4 CPU
 cores). Needs a GPU with BC texture support — every desktop GPU has it.
 
 **Everything else** (`video.rs`). An `ffmpeg` child process per playing
-cue, decoding on the GPU's video engine where there is one (NVDEC, Quick
-Sync, VCN; software otherwise). On Windows each decoder is bound to the
-card that renders its layer: `-hwaccel d3d11va -hwaccel_device <DXGI
-adapter index>`, found from the card's LUID, and the device ffmpeg reports
-opening is logged ("ffmpeg decodes on …", or a warning if it is another
-card). Elsewhere, or when the card's LUID is unknown (not D3D12), ffmpeg
-picks (`-hwaccel auto`). `LCPLAY_HWACCEL=auto` restores ffmpeg's pick on
-Windows too, `LCPLAY_HWACCEL=none` decodes in software. It writes YUV 4:2:0 planes to a pipe — 1.5 bytes per pixel instead of
-4 for RGBA — and the shader converts them (BT.709 or BT.601, limited range).
+cue and card decodes on a GPU's video engine where there is one (NVDEC,
+Quick Sync, VCN; software otherwise). On Windows each decoder is bound to
+the card that renders its layer: `-hwaccel d3d11va -hwaccel_device <DXGI
+adapter index>`, found from the card's LUID when its device is created.
+The device ffmpeg reports opening is logged ("ffmpeg decodes on …", or a
+warning naming both cards if it is another one). Elsewhere, or when the
+card's LUID is unknown (not D3D12), ffmpeg picks (`-hwaccel auto`).
+`LCPLAY_HWACCEL=auto` restores ffmpeg's pick on Windows too, and
+`LCPLAY_HWACCEL=none` decodes in software. ffmpeg writes YUV 4:2:0 planes
+to a pipe — 1.5 bytes per pixel instead of 4 for RGBA — and the shader
+converts them (BT.709 or BT.601, limited range).
 Only video with alpha travels as premultiplied RGBA. A jump restarts
 `ffmpeg` at the new position (frame-exact: verified against a clip with
 frame-numbered content). A cue is pre-rolled one second before it starts,

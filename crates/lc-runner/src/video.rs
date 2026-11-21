@@ -295,12 +295,21 @@ impl HwAccel {
     }
 
     /// Where to decode for the card with this adapter LUID (`None`: not a
-    /// D3D12 card, or not Windows). Enumerates DXGI adapters: call once per
-    /// layer, not per decoder start.
+    /// D3D12 card, or not Windows). Runs `ffmpeg -hwaccels` the first time
+    /// and enumerates DXGI adapters: called once per card, when its device
+    /// is created ([`crate::render::Gpu`]), never on a render thread.
     pub fn for_card(luid: Option<i64>) -> HwAccel {
         let mode = HwMode::from_env();
-        let card = match mode {
-            HwMode::Card => luid.and_then(card_decoder),
+        let card = match (mode, luid) {
+            (HwMode::Card, Some(luid)) => card_decoder(luid),
+            (HwMode::Card, None) => {
+                #[cfg(windows)]
+                tracing::info!(
+                    "video: this card has no DXGI LUID (not D3D12): \
+                     its video is decoded where ffmpeg picks"
+                );
+                None
+            }
             _ => None,
         };
         HwAccel::choose(mode, card)
@@ -328,8 +337,8 @@ fn card_decoder(luid: i64) -> Option<(u32, String)> {
     let found = crate::dxgi::dxgi_index_of_luid(luid);
     if found.is_none() {
         tracing::warn!(
-            "video: no DXGI adapter has the card's LUID {luid:#x}; \
-             decoding where ffmpeg picks"
+            "video: no hardware DXGI adapter has the card's LUID {luid:#x} \
+             (a software adapter, or a card removed); decoding where ffmpeg picks"
         );
     }
     found
@@ -417,10 +426,12 @@ pub fn decoder_args(
     let mut push = |items: &[&str]| args.extend(items.iter().map(|s| s.to_string()));
     // Log at info, each line tagged with its level ("[info] …"), so the
     // Runner can pick out the device ffmpeg opens and pass errors on (see
-    // `forward_log`). No banner, no progress lines. No auto-rotation:
-    // ffprobe reports the stored size, and the frames must come out at
-    // exactly that size.
-    push(&["-hide_banner", "-nostats", "-loglevel", "level+info"]);
+    // `forward_log`). The leading `+` adds the tag to ffmpeg's default
+    // flags rather than replacing them, which keeps repeated lines folded
+    // into "Last message repeated N times". No banner, no progress lines.
+    // No auto-rotation: ffprobe reports the stored size, and the frames
+    // must come out at exactly that size.
+    push(&["-hide_banner", "-nostats", "-loglevel", "+level+info"]);
     push(&["-nostdin", "-noautorotate"]);
     match hw {
         HwAccel::None => {}
@@ -430,7 +441,9 @@ pub fn decoder_args(
         // Frames are downloaded to system memory (no
         // `-hwaccel_output_format`), as with auto: the pipe needs them
         // there. A codec or profile the card cannot decode is decoded in
-        // software, still with no error.
+        // software; ffmpeg says so ("Failed setup for format d3d11…"),
+        // which the log passes on as a warning. An adapter index that
+        // does not exist makes ffmpeg use the default adapter, silently.
         HwAccel::D3d11va { adapter, .. } => {
             let adapter = adapter.to_string();
             push(&["-hwaccel", "d3d11va", "-hwaccel_device", &adapter]);
@@ -448,39 +461,77 @@ pub fn decoder_args(
 /// One line of ffmpeg's log, sorted.
 #[derive(Debug, PartialEq, Eq)]
 enum LogLine {
-    /// The hardware device ffmpeg opened, as it describes it: D3D11VA's
-    /// "10de:2560 (NVIDIA …)", or auto's "hwaccel type d3d11va with new
-    /// default device".
+    /// The D3D11VA device ffmpeg opened, as it describes it:
+    /// "10de:2560 (NVIDIA …)" (`libavutil/hwcontext_d3d11va.c`).
     Device(String),
+    /// What `-hwaccel auto` settled on: "hwaccel type d3d11va with new
+    /// default device" (`fftools/ffmpeg_dec.c`). It may still fail and fall
+    /// back to software afterwards.
+    Auto(String),
     Error(String),
+    /// Warnings, and errors that only mean "not in hardware": auto probing
+    /// device types the machine does not have, or a hardware decoder that
+    /// cannot take this file (ffmpeg then decodes in software).
     Warning(String),
     /// Stream information and the like.
     Other,
 }
 
-/// Sort a line logged with `-loglevel level+info`:
-/// `[h264 @ 0000020c3f0e1c40] [error] message`, or `[info] message`.
+const LEVELS: [&str; 8] = [
+    "quiet", "panic", "fatal", "error", "warning", "info", "verbose", "debug",
+];
+
+/// Messages ffmpeg logs as errors that only say a hardware path is not
+/// available: decoding goes on, in software or on another device type.
+const HW_SETUP_NOISE: &[&str] = &[
+    "Failed setup for format",
+    "hwaccel initialisation returned error",
+    "Device creation failed",
+    "Cannot load ",
+    "Cannot open the X11 display",
+    "Failed to initialise VAAPI",
+    "No VA display found",
+    "Failed to create Direct3D device",
+    "Failed to create a device",
+    "Could not dynamically load",
+    "Device does not support the VK_KHR_video",
+];
+
+/// Sort a line logged with `-loglevel +level+info`:
+/// `[h264 @ 0000020c3f0e1c40] [error] message`, or `[info] message`. Up to
+/// two context tags (parent and object) come before the level tag; only
+/// tags at the start of the line count, so a "[error] " inside a message
+/// or a file name is not taken for one.
 fn classify(line: &str) -> LogLine {
-    let line = line.trim_end();
-    let (level, message) = ["panic", "fatal", "error", "warning", "info", "verbose"]
-        .iter()
-        .find_map(|level| {
-            let tag = format!("[{level}] ");
-            let at = line.find(&tag)?;
-            // The context ("[h264 @ 0x…] ") before the tag is kept, without
-            // its address, which changes with every run.
-            let context = strip_address(&line[..at]);
-            Some((*level, format!("{context}{}", &line[at + tag.len()..])))
-        })
-        .unwrap_or(("info", line.to_string()));
+    let mut rest = line.trim_end();
+    let mut context = String::new();
+    let mut level = "info";
+    while let Some(inner) = rest.strip_prefix('[') {
+        let Some(close) = inner.find("] ") else { break };
+        let tag = &inner[..close];
+        rest = &inner[close + 2..];
+        if let Some(l) = LEVELS.iter().find(|&&l| l == tag) {
+            level = l;
+            break;
+        }
+        // A context, kept without its address (it changes every run).
+        context.push_str(&format!("[{}] ", strip_address(tag)));
+    }
+    let message = format!("{context}{rest}");
     match level {
-        "panic" | "fatal" | "error" => LogLine::Error(message),
+        "panic" | "fatal" | "error" => {
+            if HW_SETUP_NOISE.iter().any(|n| rest.contains(n)) {
+                LogLine::Warning(message)
+            } else {
+                LogLine::Error(message)
+            }
+        }
         "warning" => LogLine::Warning(message),
         _ => {
-            if let Some(device) = message.split("Using device ").nth(1) {
+            if let Some(device) = rest.strip_prefix("Using device ") {
                 LogLine::Device(device.trim_end_matches('.').to_string())
-            } else if let Some(auto) = message.split("Using auto ").nth(1) {
-                LogLine::Device(auto.trim_end_matches('.').to_string())
+            } else if let Some(auto) = rest.strip_prefix("Using auto ") {
+                LogLine::Auto(auto.trim_end_matches('.').to_string())
             } else {
                 LogLine::Other
             }
@@ -488,61 +539,71 @@ fn classify(line: &str) -> LogLine {
     }
 }
 
-/// "[h264 @ 0000020c3f0e1c40] " → "[h264] ".
-fn strip_address(context: &str) -> String {
-    let mut out = String::with_capacity(context.len());
-    let mut rest = context;
-    while let Some(at) = rest.find(" @ ") {
-        out.push_str(&rest[..at]);
-        rest = &rest[at + 3..];
-        let end = rest
-            .find(|c: char| !c.is_ascii_hexdigit() && c != 'x')
-            .unwrap_or(rest.len());
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
+/// "h264 @ 0000020c3f0e1c40" → "h264".
+fn strip_address(tag: &str) -> &str {
+    tag.split(" @ ").next().unwrap_or(tag)
 }
 
 /// Report something once per process (a decoder restarts at every seek and
-/// loop; its device and warnings would otherwise fill the log).
+/// loop; its device, warnings and errors would otherwise fill the log).
+/// Forgets everything once it holds a few thousand keys, so that messages
+/// with changing numbers in them cannot grow it without end.
 fn first_time(key: String) -> bool {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     SEEN.get_or_init(Default::default)
         .lock()
-        .map(|mut seen| seen.insert(key))
+        .map(|mut seen| {
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            seen.insert(key)
+        })
         .unwrap_or(false)
 }
 
-/// Pass an ffmpeg child's log on to the Runner's: errors always, warnings
-/// and the opened device once per file, and a warning when the device is
-/// not the card asked for.
+/// Pass an ffmpeg child's log on to the Runner's, each distinct line once
+/// per file: errors, warnings, the device ffmpeg opened — and a warning
+/// when that device is not the card asked for. Reads to the end (a full
+/// pipe would stall ffmpeg), whatever bytes the lines hold (ffmpeg prints
+/// file metadata as it is, not always UTF-8).
 fn forward_log(stderr: impl Read, path: &str, hw: &HwAccel) {
-    for line in std::io::BufReader::new(stderr).lines() {
-        let Ok(line) = line else { break };
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf);
         match classify(&line) {
             LogLine::Device(device) => {
-                let key = format!("device\0{path}\0{device}");
+                if !first_time(format!("device\0{path}\0{device}")) {
+                    continue;
+                }
                 match hw {
                     HwAccel::D3d11va { adapter, expect } if &device != expect => {
-                        if first_time(key) {
-                            tracing::warn!(
-                                "video '{path}': ffmpeg opened {device}, \
-                                 but the layer's card is {expect} (DXGI adapter {adapter}): \
-                                 ffmpeg enumerates the cards in another order \
-                                 (a per-app GPU preference for ffmpeg.exe?)"
-                            );
-                        }
+                        tracing::warn!(
+                            "video '{path}': ffmpeg opened {device}, \
+                             but the layer's card is {expect} (DXGI adapter {adapter}): \
+                             ffmpeg enumerates the cards in another order \
+                             (a per-app GPU preference for ffmpeg.exe?)"
+                        );
                     }
-                    _ => {
-                        if first_time(key) {
-                            tracing::info!("video '{path}': ffmpeg decodes on {device}");
-                        }
-                    }
+                    _ => tracing::info!("video '{path}': ffmpeg decodes on {device}"),
                 }
             }
-            LogLine::Error(message) => tracing::error!("video '{path}': ffmpeg: {message}"),
+            LogLine::Auto(choice) => {
+                if first_time(format!("auto\0{path}\0{choice}")) {
+                    tracing::info!("video '{path}': ffmpeg -hwaccel auto: using {choice}");
+                }
+            }
+            LogLine::Error(message) => {
+                if first_time(format!("error\0{path}\0{message}")) {
+                    tracing::error!("video '{path}': ffmpeg: {message}");
+                }
+            }
             LogLine::Warning(message) => {
                 if first_time(format!("warning\0{path}\0{message}")) {
                     tracing::warn!("video '{path}': ffmpeg: {message}");
@@ -612,7 +673,7 @@ impl Decoder {
         let frame_len = layout.frame_len(width, height);
         let (tx, frames) = sync_channel::<Vec<u8>>(QUEUE_FRAMES);
         let (recycle, recycled) = sync_channel::<Vec<u8>>(QUEUE_FRAMES + 2);
-        std::thread::Builder::new()
+        let reader = std::thread::Builder::new()
             .name("lc-video".into())
             .spawn(move || {
                 crate::priority::background_thread();
@@ -628,8 +689,12 @@ impl Decoder {
                         break;
                     }
                 }
-            })
-            .context("starting video reader thread")?;
+            });
+        if let Err(e) = reader {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("starting video reader thread");
+        }
 
         Ok(Decoder {
             child,
@@ -682,7 +747,7 @@ pub struct VideoContent {
     bind_group: wgpu::BindGroup,
     sampling: Sampling,
     timing: Timing,
-    /// Where this layer is decoded on this card (decided once, in `new`).
+    /// Where this layer is decoded on this card (the card's choice).
     hw: HwAccel,
     decoder: Option<Decoder>,
     /// A second decoder started shortly before a loop point, already
@@ -756,7 +821,7 @@ impl VideoContent {
                 &planes[planes.len() - 1],
             ],
         );
-        let hw = HwAccel::for_card(gpu.luid);
+        let hw = gpu.decode.clone();
         tracing::info!(
             "video '{path}': {}x{} at {:.3} fps, {} — decoded by ffmpeg, {}",
             info.width,
@@ -1206,7 +1271,7 @@ mod tests {
         assert!(hwaccel < input);
         assert_eq!(args[input + 1], "clip.mp4");
         // Tagged levels at info, so the device line can be read.
-        assert_eq!(value_of(&args, "-loglevel"), Some("level+info"));
+        assert_eq!(value_of(&args, "-loglevel"), Some("+level+info"));
         assert!(args.iter().any(|a| a == "-nostats"));
         assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
     }
@@ -1278,31 +1343,74 @@ mod tests {
     fn ffmpeg_log_lines_are_sorted() {
         // libavutil/hwcontext_d3d11va.c: "Using device %04x:%04x (%ls).\n".
         assert_eq!(
-            classify("[AVHWDeviceContext @ 000001d2c5e0a940] [info] Using device 10de:2560 (NVIDIA GeForce RTX 3050 Ti Laptop GPU).\r"),
+            classify(
+                "[AVHWDeviceContext @ 000001d2c5e0a940] [info] Using device \
+                 10de:2560 (NVIDIA GeForce RTX 3050 Ti Laptop GPU).\r"
+            ),
             LogLine::Device("10de:2560 (NVIDIA GeForce RTX 3050 Ti Laptop GPU)".into())
         );
         // fftools/ffmpeg_dec.c, with -hwaccel auto.
         assert_eq!(
-            classify("[vist#0:0/h264 @ 0x5581e0c0] [info] Using auto hwaccel type vaapi with new default device."),
-            LogLine::Device("hwaccel type vaapi with new default device".into())
+            classify(
+                "[vist#0:0/h264 @ 0x5581e0c0] [info] Using auto hwaccel type vaapi \
+                 with new default device."
+            ),
+            LogLine::Auto("hwaccel type vaapi with new default device".into())
         );
         assert_eq!(
             classify("[h264 @ 0x55d1c2a3b4c0] [error] Invalid NAL unit size."),
             LogLine::Error("[h264] Invalid NAL unit size.".into())
         );
+        // Parent and object context.
+        assert_eq!(
+            classify("[in#0/mov,mp4 @ 0x1] [h264 @ 0x2] [error] mmco: unref short failure"),
+            LogLine::Error("[in#0/mov,mp4] [h264] mmco: unref short failure".into())
+        );
         assert_eq!(
             classify("[fatal] No such file or directory"),
             LogLine::Error("No such file or directory".into())
         );
+        // libavcodec/decode.c logs this at error level; it only means
+        // "decoding in software".
         assert_eq!(
-            classify("[hevc @ 000001d2c5e0a940] [warning] Failed setup for format d3d11: hwaccel initialisation returned error."),
-            LogLine::Warning("[hevc] Failed setup for format d3d11: hwaccel initialisation returned error.".into())
+            classify(
+                "[hevc @ 000001d2c5e0a940] [error] Failed setup for format d3d11: \
+                 hwaccel initialisation returned error."
+            ),
+            LogLine::Warning(
+                "[hevc] Failed setup for format d3d11: hwaccel initialisation returned error."
+                    .into()
+            )
+        );
+        // Auto probing device types the machine lacks.
+        assert_eq!(
+            classify("[AVHWDeviceContext @ 0x3] [error] Cannot load libcuda.so.1"),
+            LogLine::Warning("[AVHWDeviceContext] Cannot load libcuda.so.1".into())
+        );
+        assert_eq!(
+            classify("[warning] deprecated pixel format used"),
+            LogLine::Warning("deprecated pixel format used".into())
+        );
+        // Only a tag at the start counts.
+        assert_eq!(
+            classify("[info]   title           : [error] in the name"),
+            LogLine::Other
         );
         assert_eq!(
             classify("[info]   Stream #0:0: Video: h264"),
             LogLine::Other
         );
         assert_eq!(classify("untagged"), LogLine::Other);
+    }
+
+    #[test]
+    fn the_log_is_read_to_its_end_whatever_its_bytes() {
+        // ffmpeg prints metadata as it is: Latin-1 here.
+        let log: &[u8] =
+            b"[info]   title : Caf\xE9\n[info] Using device 10de:24b0 (X).\n[info] end\n";
+        let mut input = std::io::Cursor::new(log);
+        forward_log(&mut input, "t.mkv", &HwAccel::Auto);
+        assert_eq!(input.position() as usize, log.len());
     }
 
     #[test]

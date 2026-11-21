@@ -604,7 +604,11 @@ pub fn adapter_of_monitor(hmonitor: isize) -> Option<i64> {
 /// Runner can compare it with what ffmpeg reports and say so when they
 /// differ (which only shows when the cards are different models).
 ///
-/// `None` when no adapter has this LUID (a card removed since).
+/// `None` when no adapter has this LUID (a card removed since), or when it
+/// is a software adapter (WARP, "Microsoft Basic Render Driver"): ffmpeg's
+/// D3D11VA device needs video support, which those lack, and with an
+/// explicit `-hwaccel d3d11va` a device that cannot be created stops the
+/// decoder instead of falling back to software.
 pub fn dxgi_index_of_luid(luid: i64) -> Option<(u32, String)> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -612,6 +616,9 @@ pub fn dxgi_index_of_luid(luid: i64) -> Option<(u32, String)> {
         while let Ok(adapter) = factory.EnumAdapters1(index) {
             if let Ok(desc) = adapter.GetDesc1() {
                 if luid_value(desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart) == luid {
+                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                        return None;
+                    }
                     let len = desc
                         .Description
                         .iter()

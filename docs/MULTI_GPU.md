@@ -357,22 +357,28 @@ on Windows/D3D12 or on two physical cards.**
 Route 1 is implemented on the same branch:
 
 - `dxgi::dxgi_index_of_luid` finds the DXGI adapter index (and the
-  "VVVV:DDDD (name)" ffmpeg will print for it) of a card's LUID. `Gpu`
-  reads its LUID once; `TextureFactory.luid` carries it to
-  `VideoContent::new`, which decides once per layer and card where to
-  decode (`HwAccel`), and every `Decoder::start` uses that.
+  "VVVV:DDDD (name)" ffmpeg will print for it) of a card's LUID; software
+  adapters (WARP) are left out. When a card's device is created, `Gpu`
+  reads its LUID and decides where its video is decoded (`HwAccel`), once,
+  off the render threads; the log says `video shown on <card>: …`.
+  `TextureFactory.decode` carries that to `VideoContent::new`, and every
+  `Decoder::start` uses it.
 - On Windows: `-hwaccel d3d11va -hwaccel_device <index>`. Never auto with a
   device, never `cuda`. If `ffmpeg -hwaccels` does not list `d3d11va`, or
   the card has no LUID (Vulkan backend), decoding stays on `-hwaccel auto`
   and the log says why.
 - `LCPLAY_HWACCEL`: unset (or `card`) binds to the card; `auto` is the old
   behaviour; `none` is software.
-- ffmpeg now logs at `level+info` into a pipe the Runner reads: errors are
-  passed on as before, warnings and the opened device once per file
-  (`video '…': ffmpeg decodes on 10de:…`). If ffmpeg reports a different
+- ffmpeg now logs at `+level+info` into a pipe the Runner reads. Each
+  distinct line is passed on once per file: errors, warnings, and the
+  opened device (`video '…': ffmpeg decodes on 10de:…`). Errors that only
+  mean "not in hardware" (auto probing CUDA/VAAPI/Vulkan, "Failed setup
+  for format d3d11") become warnings. If ffmpeg reports a different
   adapter than the card's, a warning names both. ffmpeg falls back to the
   default adapter *without a message* when the index does not exist, so a
-  missing "decodes on" line for a layer is itself a sign of trouble.
+  missing "decodes on" line for a layer is itself a sign of trouble. Two
+  identical cards in swapped order would not be caught by this check:
+  verify with Task Manager's per-process GPU engine column.
 - `decoder_args` is a pure function with unit tests (item 4).
 - **Not done: item 6, one shared decoder for a spanning layer.** With the
   render thread per card, a shared decoder means a frame queue read by

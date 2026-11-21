@@ -141,9 +141,12 @@ pub struct Gpu {
     /// Copies recorded by contents for the next frame (see [`Uploads`]).
     uploads: std::cell::RefCell<Uploads>,
 
-    /// The adapter's LUID (Windows/D3D12), read once: contents ask for it
-    /// through [`TextureFactory`] every frame.
+    /// The adapter's LUID (Windows/D3D12), read once.
     luid: Option<i64>,
+    /// Where video shown on this card is decoded (on Windows: on this
+    /// card), decided once here rather than on the render thread: it may
+    /// run `ffmpeg -hwaccels` and enumerates DXGI adapters.
+    decode: crate::video::HwAccel,
 }
 
 impl Gpu {
@@ -378,6 +381,17 @@ impl Gpu {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        #[cfg(windows)]
+        let luid = crate::dxgi::adapter_luid(&adapter);
+        #[cfg(not(windows))]
+        let luid = None;
+        let decode = crate::video::HwAccel::for_card(luid);
+        tracing::info!(
+            "video shown on {}: {}",
+            adapter.get_info().name,
+            decode.describe()
+        );
+
         Ok(Gpu {
             instance,
             device,
@@ -392,10 +406,8 @@ impl Gpu {
             quad_vbo,
             quad_ibo,
             uploads: Default::default(),
-            #[cfg(windows)]
-            luid: crate::dxgi::adapter_luid(&adapter),
-            #[cfg(not(windows))]
-            luid: None,
+            luid,
+            decode,
             adapter,
         })
     }
@@ -1211,7 +1223,7 @@ impl Gpu {
             sampler: &self.sampler,
             max_dimension: self.max_texture_dimension(),
             supports_bc: self.supports_bc(),
-            luid: self.luid,
+            decode: &self.decode,
         }
     }
 

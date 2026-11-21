@@ -171,9 +171,9 @@ pub struct TextureFactory<'a> {
     pub max_dimension: u32,
     /// The device samples BCn-compressed textures (needed for GPU HAP).
     pub supports_bc: bool,
-    /// The card's adapter LUID (Windows/D3D12; `None` elsewhere), so that
-    /// video is decoded on the card that shows it (see `video.rs`).
-    pub luid: Option<i64>,
+    /// Where video shown on this card is decoded: on Windows/D3D12, on this
+    /// card's DXGI adapter, found from its LUID (see `video.rs`).
+    pub decode: &'a crate::video::HwAccel,
 }
 
 impl TextureFactory<'_> {
