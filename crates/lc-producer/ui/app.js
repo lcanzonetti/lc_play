@@ -3097,7 +3097,7 @@ function renderInspector() {
       el('h3', {}, 'Task'),
       field('Name', task, 'name', { type: 'text' }),
       field('Length (s)', task, 'duration_s', { min: 1 }),
-      note(`An auxiliary timeline with its own transport. It is off stage until played — or paused (on stage, at the start), or positioned: clicking or dragging on its ruler brings it on stage, paused on that frame — and is drawn in front of the main timeline; among the tasks, the order in the Tasks window is the stacking (the top one in front — drag to reorder; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste a task). Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
+      note(`An auxiliary timeline with its own transport. It is off stage until played — or paused (on stage, at the start), or positioned: clicking or dragging on its ruler, or a control cue's jump, brings it on stage, paused on that frame — and is drawn in front of the main timeline; among the tasks, the order in the Tasks window is the stacking (the top one in front — drag to reorder; Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste a task). Start it from the Tasks window, from a control cue, or over OSC: /lcplay/task/${task.id}/play (also pause, stop, seek).`),
       deleteButton('Delete task'));
     return;
   }

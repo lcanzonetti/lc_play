@@ -63,6 +63,7 @@ enum Action {
     /// Print the status once a second until interrupted.
     Watch,
     Play,
+    /// Hold the current frame. A stopped task: bring it on stage, paused at 0.
     Pause,
     /// Main timeline: pause and rewind. A task: take it off stage.
     Stop,

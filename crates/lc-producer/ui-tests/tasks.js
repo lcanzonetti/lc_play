@@ -144,8 +144,7 @@ const assert = (c, m) => { if (!c) { console.log('FAIL', m); process.exitCode = 
   const gone = await p.evaluate((id) => [...virtualCanvases.get(id).getContext('2d').getImageData(50, 50, 1, 1).data], vid);
   assert(gone[3] === 0, 'and the virtual display no longer shows it');
 
-  // ── Pause on a stopped task cues it up: on stage, paused at the start,
-  //    not where its playhead was left (3 s, where its cue is on air).
+  // ── Pause on a stopped task cues it up: on stage, paused at the start.
   await p.click(`#tasks .task[data-id="${taskId}"] button[title^="Pause"]`);
   await p.waitForTimeout(400);
   const cued = await p.evaluate((id) => currentTransport(id), taskId);
