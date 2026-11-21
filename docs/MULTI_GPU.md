@@ -352,3 +352,35 @@ Phase 1 (sync) is implemented on the long-lived branch (not on `main`):
 Tested on Linux (lavapipe, Xvfb, two devices on one adapter). **Not yet run
 on Windows/D3D12 or on two physical cards.**
 
+## Status (2026-11-21): Route 1
+
+Route 1 is implemented on the same branch:
+
+- `dxgi::dxgi_index_of_luid` finds the DXGI adapter index (and the
+  "VVVV:DDDD (name)" ffmpeg will print for it) of a card's LUID. `Gpu`
+  reads its LUID once; `TextureFactory.luid` carries it to
+  `VideoContent::new`, which decides once per layer and card where to
+  decode (`HwAccel`), and every `Decoder::start` uses that.
+- On Windows: `-hwaccel d3d11va -hwaccel_device <index>`. Never auto with a
+  device, never `cuda`. If `ffmpeg -hwaccels` does not list `d3d11va`, or
+  the card has no LUID (Vulkan backend), decoding stays on `-hwaccel auto`
+  and the log says why.
+- `LCPLAY_HWACCEL`: unset (or `card`) binds to the card; `auto` is the old
+  behaviour; `none` is software.
+- ffmpeg now logs at `level+info` into a pipe the Runner reads: errors are
+  passed on as before, warnings and the opened device once per file
+  (`video '…': ffmpeg decodes on 10de:…`). If ffmpeg reports a different
+  adapter than the card's, a warning names both. ffmpeg falls back to the
+  default adapter *without a message* when the index does not exist, so a
+  missing "decodes on" line for a layer is itself a sign of trouble.
+- `decoder_args` is a pure function with unit tests (item 4).
+- **Not done: item 6, one shared decoder for a spanning layer.** With the
+  render thread per card, a shared decoder means a frame queue read by
+  two threads, released only when both cards have uploaded a frame: the
+  slower card would hold back the faster card's decoder, coupling the
+  cards again, and a seek or loop on one would have to restart the other.
+  With Route 1 the two decodes of a spanning layer already land on two
+  different cards' NVDEC, so the cost left is one extra decode and
+  download per spanning layer, on CPU/PCIe. Worth doing with Route 2's
+  placement policy, once there are measurements from real cards.
+

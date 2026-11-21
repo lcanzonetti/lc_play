@@ -589,6 +589,46 @@ pub fn adapter_of_monitor(hmonitor: isize) -> Option<i64> {
     None
 }
 
+/// The DXGI adapter index of the card with this LUID, and how ffmpeg will
+/// describe that adapter when it opens it.
+///
+/// The index is what ffmpeg's D3D11VA device takes (`-hwaccel_device N`):
+/// `libavutil/hwcontext_d3d11va.c` parses the string with `atoi` and opens
+/// `IDXGIFactory::EnumAdapters(N)`, then logs "Using device
+/// VVVV:DDDD (Description)." at info level. The walk here uses the same
+/// enumeration (`EnumAdapters1` lists adapters in the same order as
+/// `EnumAdapters`), so within one boot the index names the same card in the
+/// Runner and in its ffmpeg children — unless something makes the two
+/// processes see different orders (a per-app GPU preference for
+/// `ffmpeg.exe` is the suspect). The description is returned so that the
+/// Runner can compare it with what ffmpeg reports and say so when they
+/// differ (which only shows when the cards are different models).
+///
+/// `None` when no adapter has this LUID (a card removed since).
+pub fn dxgi_index_of_luid(luid: i64) -> Option<(u32, String)> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                if luid_value(desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart) == luid {
+                    let len = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    let name = String::from_utf16_lossy(&desc.Description[..len]);
+                    // ffmpeg's format: "%04x:%04x (%ls)".
+                    let ident = format!("{:04x}:{:04x} ({name})", desc.VendorId, desc.DeviceId);
+                    return Some((index, ident));
+                }
+            }
+            index += 1;
+        }
+    }
+    None
+}
+
 /// The LUID of a wgpu adapter (D3D12 only).
 pub fn adapter_luid(adapter: &wgpu::Adapter) -> Option<i64> {
     unsafe {

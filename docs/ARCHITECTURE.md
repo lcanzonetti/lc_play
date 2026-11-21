@@ -592,8 +592,14 @@ the whole system played it at ~57 fps on lavapipe (software Vulkan, 4 CPU
 cores). Needs a GPU with BC texture support — every desktop GPU has it.
 
 **Everything else** (`video.rs`). An `ffmpeg` child process per playing
-cue, with `-hwaccel auto` (NVDEC, Quick Sync, D3D11VA, VideoToolbox where
-present), writes YUV 4:2:0 planes to a pipe — 1.5 bytes per pixel instead of
+cue, decoding on the GPU's video engine where there is one (NVDEC, Quick
+Sync, VCN; software otherwise). On Windows each decoder is bound to the
+card that renders its layer: `-hwaccel d3d11va -hwaccel_device <DXGI
+adapter index>`, found from the card's LUID, and the device ffmpeg reports
+opening is logged ("ffmpeg decodes on …", or a warning if it is another
+card). Elsewhere, or when the card's LUID is unknown (not D3D12), ffmpeg
+picks (`-hwaccel auto`). `LCPLAY_HWACCEL=auto` restores ffmpeg's pick on
+Windows too, `LCPLAY_HWACCEL=none` decodes in software. It writes YUV 4:2:0 planes to a pipe — 1.5 bytes per pixel instead of
 4 for RGBA — and the shader converts them (BT.709 or BT.601, limited range).
 Only video with alpha travels as premultiplied RGBA. A jump restarts
 `ffmpeg` at the new position (frame-exact: verified against a clip with
@@ -708,7 +714,7 @@ Still to do, roughly in order of how much they limit real use:
 
 | Area | Missing |
 |---|---|
-| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); decoding shared between cards (today a layer spanning two cards is decoded on each); audio. |
+| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); decoding shared between cards (today a layer spanning two cards is decoded once on each of them); audio. |
 | Sync | Verification of §3.3 on frame-locked hardware; Vulkan present barrier (`VK_NV_present_barrier`) for non-D3D12 Runners. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
 | Authoring | Keyframes/tweens; a warp editor; control cues executed by Runners (so they work without the Director). |

@@ -140,6 +140,10 @@ pub struct Gpu {
 
     /// Copies recorded by contents for the next frame (see [`Uploads`]).
     uploads: std::cell::RefCell<Uploads>,
+
+    /// The adapter's LUID (Windows/D3D12), read once: contents ask for it
+    /// through [`TextureFactory`] every frame.
+    luid: Option<i64>,
 }
 
 impl Gpu {
@@ -376,7 +380,6 @@ impl Gpu {
 
         Ok(Gpu {
             instance,
-            adapter,
             device,
             queue,
             surface_format,
@@ -389,6 +392,11 @@ impl Gpu {
             quad_vbo,
             quad_ibo,
             uploads: Default::default(),
+            #[cfg(windows)]
+            luid: crate::dxgi::adapter_luid(&adapter),
+            #[cfg(not(windows))]
+            luid: None,
+            adapter,
         })
     }
 
@@ -404,12 +412,10 @@ impl Gpu {
         self.adapter.get_info().backend == wgpu::Backend::Dx12
     }
 
-    /// The adapter's LUID (Windows/D3D12), to match it with monitors.
+    /// The adapter's LUID (Windows/D3D12), to match it with monitors and
+    /// to put video decoding on the same card.
     pub fn luid(&self) -> Option<i64> {
-        #[cfg(windows)]
-        return crate::dxgi::adapter_luid(&self.adapter);
-        #[cfg(not(windows))]
-        None
+        self.luid
     }
 
     /// Whether the card is an integrated GPU.
@@ -1205,6 +1211,7 @@ impl Gpu {
             sampler: &self.sampler,
             max_dimension: self.max_texture_dimension(),
             supports_bc: self.supports_bc(),
+            luid: self.luid,
         }
     }
 

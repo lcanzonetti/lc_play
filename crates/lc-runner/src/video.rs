@@ -10,10 +10,16 @@
 //!
 //! ## Keeping it fast
 //!
-//! * **Hardware decoding.** ffmpeg is started with `-hwaccel auto`: H.264,
-//!   HEVC, VP9, AV1 … are decoded by the GPU's video engine (NVDEC, Quick
-//!   Sync, D3D11VA, VideoToolbox) where the machine has one, and in software
-//!   otherwise. `LCPLAY_HWACCEL=none` turns it off.
+//! * **Hardware decoding, on the card that shows the video.** H.264, HEVC,
+//!   VP9, AV1 … are decoded by a GPU's video engine (NVDEC, Quick Sync,
+//!   VCN) where there is one, and in software otherwise. On Windows each
+//!   layer is decoded on the card that renders it: ffmpeg is started with
+//!   `-hwaccel d3d11va -hwaccel_device <DXGI adapter index>` of that card
+//!   (see [`HwAccel`]), so a machine with several cards spreads decoding
+//!   over them instead of piling it on the primary-display card, which is
+//!   where `-hwaccel auto` lands. Elsewhere, and when the card is unknown,
+//!   ffmpeg picks (`-hwaccel auto`). `LCPLAY_HWACCEL=none` decodes in
+//!   software; `LCPLAY_HWACCEL=auto` restores ffmpeg's own pick everywhere.
 //! * **YUV, not RGB.** Video is stored as YUV 4:2:0; converting it to RGBA on
 //!   the CPU is expensive and makes every frame 2.7× larger. Frames therefore
 //!   leave ffmpeg as three YUV planes (1.5 bytes per pixel) and the GPU
@@ -36,7 +42,7 @@
 //!
 //! A jump (seek, loop, scrubbing) restarts `ffmpeg` at the new position.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 
@@ -214,6 +220,339 @@ impl Layout {
     }
 }
 
+/// What `LCPLAY_HWACCEL` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwMode {
+    /// Decode on the card that renders the layer, where that card is known
+    /// (the default).
+    Card,
+    /// Let ffmpeg pick (`-hwaccel auto`): the behaviour before decoders were
+    /// bound to cards. On Windows that is the primary-display card.
+    Auto,
+    /// Software decoding only.
+    None,
+}
+
+impl HwMode {
+    /// The mode for a value of `LCPLAY_HWACCEL` (unset: [`HwMode::Card`]).
+    /// An unknown value is reported and treated as unset.
+    pub fn parse(value: Option<&str>) -> HwMode {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("card") | Some("d3d11va") => HwMode::Card,
+            Some("auto") => HwMode::Auto,
+            Some("none") => HwMode::None,
+            Some(other) => {
+                if first_time(format!("hwaccel-env\0{other}")) {
+                    tracing::warn!(
+                        "LCPLAY_HWACCEL={other} is not one of none, auto, card: \
+                         decoding on each layer's card"
+                    );
+                }
+                HwMode::Card
+            }
+        }
+    }
+
+    fn from_env() -> HwMode {
+        HwMode::parse(std::env::var("LCPLAY_HWACCEL").ok().as_deref())
+    }
+}
+
+/// Where a decoder runs, as decided once per video layer and card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HwAccel {
+    /// Software.
+    None,
+    /// `-hwaccel auto`: ffmpeg tries the decoder's hardware types in order
+    /// and takes the first device it can open, on the default adapter.
+    Auto,
+    /// `-hwaccel d3d11va -hwaccel_device <adapter>`: D3D11VA on the DXGI
+    /// adapter with this index (Windows).
+    ///
+    /// Never `-hwaccel auto -hwaccel_device N`: auto hands the same N to
+    /// DXVA2 (a D3D9 ordinal), D3D11VA (a DXGI index) and CUDA (a CUDA
+    /// ordinal), which number cards differently. Not `cuda` either: its
+    /// ordinal follows `CUDA_DEVICE_ORDER` (fastest first by default), not
+    /// DXGI's order.
+    D3d11va {
+        adapter: u32,
+        /// How ffmpeg should describe the adapter it opens
+        /// ("10de:2560 (NVIDIA GeForce …)"), to check that it opened the
+        /// intended one.
+        expect: String,
+    },
+}
+
+impl HwAccel {
+    /// Pure policy: `card` is the DXGI index and description of the layer's
+    /// card when it is known and ffmpeg can decode on it with D3D11VA.
+    pub fn choose(mode: HwMode, card: Option<(u32, String)>) -> HwAccel {
+        match (mode, card) {
+            (HwMode::None, _) => HwAccel::None,
+            (HwMode::Auto, _) | (HwMode::Card, None) => HwAccel::Auto,
+            (HwMode::Card, Some((adapter, expect))) => HwAccel::D3d11va { adapter, expect },
+        }
+    }
+
+    /// Where to decode for the card with this adapter LUID (`None`: not a
+    /// D3D12 card, or not Windows). Enumerates DXGI adapters: call once per
+    /// layer, not per decoder start.
+    pub fn for_card(luid: Option<i64>) -> HwAccel {
+        let mode = HwMode::from_env();
+        let card = match mode {
+            HwMode::Card => luid.and_then(card_decoder),
+            _ => None,
+        };
+        HwAccel::choose(mode, card)
+    }
+
+    /// For the log: where this layer's frames are decoded.
+    pub fn describe(&self) -> String {
+        match self {
+            HwAccel::None => "software decoding (LCPLAY_HWACCEL=none)".into(),
+            HwAccel::Auto => "decoder chosen by ffmpeg (-hwaccel auto)".into(),
+            HwAccel::D3d11va { adapter, expect } => {
+                format!("D3D11VA on DXGI adapter {adapter}, {expect}")
+            }
+        }
+    }
+}
+
+/// The DXGI index and description of the card with this LUID, if ffmpeg can
+/// decode on it there.
+#[cfg(windows)]
+fn card_decoder(luid: i64) -> Option<(u32, String)> {
+    if !ffmpeg_has_d3d11va() {
+        return None;
+    }
+    let found = crate::dxgi::dxgi_index_of_luid(luid);
+    if found.is_none() {
+        tracing::warn!(
+            "video: no DXGI adapter has the card's LUID {luid:#x}; \
+             decoding where ffmpeg picks"
+        );
+    }
+    found
+}
+
+#[cfg(not(windows))]
+fn card_decoder(_luid: i64) -> Option<(u32, String)> {
+    None
+}
+
+/// Whether the ffmpeg in use lists `d3d11va` among its hardware decoders
+/// (`ffmpeg -hwaccels`). Asked once. Without it, `-hwaccel d3d11va` would
+/// stop ffmpeg with an error rather than fall back, so decoding is left to
+/// ffmpeg's own pick, as before.
+#[cfg(windows)]
+fn ffmpeg_has_d3d11va() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        let listed = quiet_command(ffmpeg_bin())
+            .args(["-hide_banner", "-hwaccels"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| hwaccels_list_d3d11va(&String::from_utf8_lossy(&out.stdout)));
+        if !listed {
+            tracing::warn!(
+                "video: this ffmpeg has no d3d11va hardware decoder (ffmpeg -hwaccels); \
+                 decoders are not bound to their card"
+            );
+        }
+        listed
+    })
+}
+
+/// Whether the output of `ffmpeg -hwaccels` lists d3d11va.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn hwaccels_list_d3d11va(listing: &str) -> bool {
+    listing.lines().any(|l| l.trim() == "d3d11va")
+}
+
+/// The ffmpeg command line (without the program) that decodes `path` from
+/// frame `start_frame`, at `width × height`, into the pipe in `layout`, on
+/// `hw`. Pure: what the tests check.
+#[allow(clippy::too_many_arguments)]
+pub fn decoder_args(
+    path: &str,
+    info: &VideoInfo,
+    layout: Layout,
+    width: u32,
+    height: u32,
+    start_frame: i64,
+    hw: &HwAccel,
+) -> Vec<String> {
+    let start_s = start_frame as f64 * info.fps_den as f64 / info.fps_num as f64;
+    // `fps=` makes the output strictly constant-rate, so "the n-th frame
+    // out of the pipe" is a well-defined point in time.
+    let mut filter = format!("fps={}/{}", info.fps_num, info.fps_den);
+    let scale = if (width, height) != (info.width, info.height) {
+        format!("{width}:{height}:")
+    } else {
+        String::new()
+    };
+    let pix_fmt = match layout {
+        // Renderer textures are premultiplied; files with alpha are
+        // straight.
+        Layout::Rgba => {
+            if !scale.is_empty() {
+                filter.push_str(&format!(",scale={}", scale.trim_end_matches(':')));
+            }
+            filter.push_str(",format=rgba,premultiply=inplace=1");
+            "rgba"
+        }
+        Layout::Yuv420 => {
+            // The shader expects limited ("TV") range. Many files are
+            // full range (VP9, HEVC from phones, screen recordings); a
+            // plain format conversion would pass their levels through
+            // and crush blacks / clip whites. Convert explicitly.
+            filter.push_str(&format!(",scale={scale}out_range=tv,format=yuv420p"));
+            "yuv420p"
+        }
+    };
+    let mut args: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| args.extend(items.iter().map(|s| s.to_string()));
+    // Log at info, each line tagged with its level ("[info] …"), so the
+    // Runner can pick out the device ffmpeg opens and pass errors on (see
+    // `forward_log`). No banner, no progress lines. No auto-rotation:
+    // ffprobe reports the stored size, and the frames must come out at
+    // exactly that size.
+    push(&["-hide_banner", "-nostats", "-loglevel", "level+info"]);
+    push(&["-nostdin", "-noautorotate"]);
+    match hw {
+        HwAccel::None => {}
+        // ffmpeg falls back to software by itself where there is no
+        // hardware decoder for the codec.
+        HwAccel::Auto => push(&["-hwaccel", "auto"]),
+        // Frames are downloaded to system memory (no
+        // `-hwaccel_output_format`), as with auto: the pipe needs them
+        // there. A codec or profile the card cannot decode is decoded in
+        // software, still with no error.
+        HwAccel::D3d11va { adapter, .. } => {
+            let adapter = adapter.to_string();
+            push(&["-hwaccel", "d3d11va", "-hwaccel_device", &adapter]);
+        }
+    }
+    // Before `-i`: seek in the input. ffmpeg then decodes from the
+    // preceding keyframe and discards up to the exact position.
+    let start = format!("{start_s:.6}");
+    push(&["-ss", &start, "-i", path]);
+    push(&["-an", "-sn", "-vf", &filter]);
+    push(&["-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]);
+    args
+}
+
+/// One line of ffmpeg's log, sorted.
+#[derive(Debug, PartialEq, Eq)]
+enum LogLine {
+    /// The hardware device ffmpeg opened, as it describes it: D3D11VA's
+    /// "10de:2560 (NVIDIA …)", or auto's "hwaccel type d3d11va with new
+    /// default device".
+    Device(String),
+    Error(String),
+    Warning(String),
+    /// Stream information and the like.
+    Other,
+}
+
+/// Sort a line logged with `-loglevel level+info`:
+/// `[h264 @ 0000020c3f0e1c40] [error] message`, or `[info] message`.
+fn classify(line: &str) -> LogLine {
+    let line = line.trim_end();
+    let (level, message) = ["panic", "fatal", "error", "warning", "info", "verbose"]
+        .iter()
+        .find_map(|level| {
+            let tag = format!("[{level}] ");
+            let at = line.find(&tag)?;
+            // The context ("[h264 @ 0x…] ") before the tag is kept, without
+            // its address, which changes with every run.
+            let context = strip_address(&line[..at]);
+            Some((*level, format!("{context}{}", &line[at + tag.len()..])))
+        })
+        .unwrap_or(("info", line.to_string()));
+    match level {
+        "panic" | "fatal" | "error" => LogLine::Error(message),
+        "warning" => LogLine::Warning(message),
+        _ => {
+            if let Some(device) = message.split("Using device ").nth(1) {
+                LogLine::Device(device.trim_end_matches('.').to_string())
+            } else if let Some(auto) = message.split("Using auto ").nth(1) {
+                LogLine::Device(auto.trim_end_matches('.').to_string())
+            } else {
+                LogLine::Other
+            }
+        }
+    }
+}
+
+/// "[h264 @ 0000020c3f0e1c40] " → "[h264] ".
+fn strip_address(context: &str) -> String {
+    let mut out = String::with_capacity(context.len());
+    let mut rest = context;
+    while let Some(at) = rest.find(" @ ") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 3..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Report something once per process (a decoder restarts at every seek and
+/// loop; its device and warnings would otherwise fill the log).
+fn first_time(key: String) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(false)
+}
+
+/// Pass an ffmpeg child's log on to the Runner's: errors always, warnings
+/// and the opened device once per file, and a warning when the device is
+/// not the card asked for.
+fn forward_log(stderr: impl Read, path: &str, hw: &HwAccel) {
+    for line in std::io::BufReader::new(stderr).lines() {
+        let Ok(line) = line else { break };
+        match classify(&line) {
+            LogLine::Device(device) => {
+                let key = format!("device\0{path}\0{device}");
+                match hw {
+                    HwAccel::D3d11va { adapter, expect } if &device != expect => {
+                        if first_time(key) {
+                            tracing::warn!(
+                                "video '{path}': ffmpeg opened {device}, \
+                                 but the layer's card is {expect} (DXGI adapter {adapter}): \
+                                 ffmpeg enumerates the cards in another order \
+                                 (a per-app GPU preference for ffmpeg.exe?)"
+                            );
+                        }
+                    }
+                    _ => {
+                        if first_time(key) {
+                            tracing::info!("video '{path}': ffmpeg decodes on {device}");
+                        }
+                    }
+                }
+            }
+            LogLine::Error(message) => tracing::error!("video '{path}': ffmpeg: {message}"),
+            LogLine::Warning(message) => {
+                if first_time(format!("warning\0{path}\0{message}")) {
+                    tracing::warn!("video '{path}': ffmpeg: {message}");
+                }
+            }
+            LogLine::Other => {}
+        }
+    }
+}
+
 /// One running `ffmpeg`, delivering consecutive frames from `start_frame`.
 pub struct Decoder {
     child: Child,
@@ -226,7 +565,8 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Start decoding `path` at frame `start_frame`, at `width × height`.
+    /// Start decoding `path` at frame `start_frame`, at `width × height`,
+    /// on `hw`.
     pub fn start(
         path: &str,
         info: &VideoInfo,
@@ -234,55 +574,39 @@ impl Decoder {
         width: u32,
         height: u32,
         start_frame: i64,
+        hw: &HwAccel,
     ) -> anyhow::Result<Decoder> {
-        let start_s = start_frame as f64 * info.fps_den as f64 / info.fps_num as f64;
-        // `fps=` makes the output strictly constant-rate, so "the n-th frame
-        // out of the pipe" is a well-defined point in time.
-        let mut filter = format!("fps={}/{}", info.fps_num, info.fps_den);
-        let scale = if (width, height) != (info.width, info.height) {
-            format!("{width}:{height}:")
-        } else {
-            String::new()
-        };
-        let pix_fmt = match layout {
-            // Renderer textures are premultiplied; files with alpha are
-            // straight.
-            Layout::Rgba => {
-                if !scale.is_empty() {
-                    filter.push_str(&format!(",scale={}", scale.trim_end_matches(':')));
-                }
-                filter.push_str(",format=rgba,premultiply=inplace=1");
-                "rgba"
-            }
-            Layout::Yuv420 => {
-                // The shader expects limited ("TV") range. Many files are
-                // full range (VP9, HEVC from phones, screen recordings); a
-                // plain format conversion would pass their levels through
-                // and crush blacks / clip whites. Convert explicitly.
-                filter.push_str(&format!(",scale={scale}out_range=tv,format=yuv420p"));
-                "yuv420p"
-            }
-        };
-        let mut command = quiet_command(ffmpeg_bin());
-        // No auto-rotation: ffprobe reports the stored size, and the frames
-        // must come out at exactly that size.
-        command.args(["-v", "error", "-nostdin", "-noautorotate"]);
-        if std::env::var("LCPLAY_HWACCEL").map_or(true, |v| v != "none") {
-            // Decode on the GPU's video engine where there is one; ffmpeg
-            // falls back to software by itself when there is not.
-            command.args(["-hwaccel", "auto"]);
-        }
-        let mut child = command
-            // Before `-i`: seek in the input. ffmpeg then decodes from the
-            // preceding keyframe and discards up to the exact position.
-            .args(["-ss", &format!("{start_s:.6}"), "-i", path])
-            .args(["-an", "-sn", "-vf", &filter])
-            .args(["-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"])
+        let mut child = quiet_command(ffmpeg_bin())
+            .args(decoder_args(
+                path,
+                info,
+                layout,
+                width,
+                height,
+                start_frame,
+                hw,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .context("starting ffmpeg (is it installed and on the PATH?)")?;
+        // Read the log to its end (a full pipe would stall ffmpeg); it ends
+        // when ffmpeg does.
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let (log_path, log_hw) = (path.to_string(), hw.clone());
+        let logger = std::thread::Builder::new()
+            .name("lc-video-log".into())
+            .spawn(move || {
+                crate::priority::background_thread();
+                forward_log(stderr, &log_path, &log_hw)
+            });
+        if let Err(e) = logger {
+            // No Decoder will exist to kill it: do it here.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("starting video log thread");
+        }
         let mut stdout = child.stdout.take().expect("stdout was piped");
 
         let frame_len = layout.frame_len(width, height);
@@ -358,6 +682,8 @@ pub struct VideoContent {
     bind_group: wgpu::BindGroup,
     sampling: Sampling,
     timing: Timing,
+    /// Where this layer is decoded on this card (decided once, in `new`).
+    hw: HwAccel,
     decoder: Option<Decoder>,
     /// A second decoder started shortly before a loop point, already
     /// positioned at the loop start, so the wrap does not wait for ffmpeg.
@@ -430,8 +756,9 @@ impl VideoContent {
                 &planes[planes.len() - 1],
             ],
         );
+        let hw = HwAccel::for_card(gpu.luid);
         tracing::info!(
-            "video '{path}': {}x{} at {:.3} fps, {} — decoded by ffmpeg",
+            "video '{path}': {}x{} at {:.3} fps, {} — decoded by ffmpeg, {}",
             info.width,
             info.height,
             info.fps(),
@@ -439,7 +766,8 @@ impl VideoContent {
                 "with alpha (RGBA)"
             } else {
                 "YUV 4:2:0"
-            }
+            },
+            hw.describe()
         );
         VideoContent {
             path: path.to_string(),
@@ -450,6 +778,7 @@ impl VideoContent {
             bind_group,
             sampling,
             timing: timing.clone(),
+            hw,
             decoder: None,
             standby: None,
             shown: None,
@@ -467,7 +796,7 @@ impl VideoContent {
     fn start_decoder(&mut self, frame: i64) -> Option<Decoder> {
         self.last_start = Some(std::time::Instant::now());
         let (w, h) = self.size;
-        match Decoder::start(&self.path, &self.info, self.layout, w, h, frame) {
+        match Decoder::start(&self.path, &self.info, self.layout, w, h, frame, &self.hw) {
             Ok(d) => Some(d),
             Err(e) => {
                 // Report once; retrying 60 times a second would not help.
@@ -718,7 +1047,8 @@ mod tests {
         assert!(info.bt601, "untagged and below 720 lines: BT.601");
 
         // From the start: frames 0, 1, 2 with the box at 0, 4, 8.
-        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0).unwrap();
+        let mut d =
+            Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0, &HwAccel::None).unwrap();
         for expect in 0..3 {
             let (index, frame) = d.next_blocking().unwrap();
             assert_eq!(index, expect);
@@ -727,7 +1057,8 @@ mod tests {
         }
 
         // Seek to frame 7 — not a keyframe (they are every 5): still exact.
-        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 7).unwrap();
+        let mut d =
+            Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 7, &HwAccel::None).unwrap();
         let (index, frame) = d.next_blocking().unwrap();
         assert_eq!((index, box_x(&frame)), (7, Some(28)));
         let (index, frame) = d.next_blocking().unwrap();
@@ -769,7 +1100,8 @@ mod tests {
         }
         let path = path.to_string_lossy();
         let info = VideoInfo::probe(&path).unwrap();
-        let mut d = Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0).unwrap();
+        let mut d =
+            Decoder::start(&path, &info, Layout::Yuv420, 64, 48, 0, &HwAccel::None).unwrap();
         let (_, frame) = d.next_blocking().unwrap();
         assert!((233..=237).contains(&frame[0]), "Y of white = {}", frame[0]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -836,6 +1168,150 @@ mod tests {
             || video.borrow().shown_frame() == Some(7)
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn info_64x48() -> VideoInfo {
+        VideoInfo {
+            width: 64,
+            height: 48,
+            fps_num: 30000,
+            fps_den: 1001,
+            frames: Some(300),
+            has_alpha: false,
+            bt601: true,
+        }
+    }
+
+    /// The arguments that follow `flag` (its value), if `flag` is there.
+    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn decoder_args_bind_d3d11va_to_the_cards_adapter() {
+        let info = info_64x48();
+        let hw = HwAccel::D3d11va {
+            adapter: 1,
+            expect: "10de:2560 (NVIDIA RTX A4000)".into(),
+        };
+        let args = decoder_args("clip.mp4", &info, Layout::Yuv420, 64, 48, 0, &hw);
+        assert_eq!(value_of(&args, "-hwaccel"), Some("d3d11va"));
+        assert_eq!(value_of(&args, "-hwaccel_device"), Some("1"));
+        // Never auto with a device, never CUDA.
+        assert!(!args.iter().any(|a| a == "auto" || a == "cuda"));
+        // The hardware options are input options: before `-i`.
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        let hwaccel = args.iter().position(|a| a == "-hwaccel").unwrap();
+        assert!(hwaccel < input);
+        assert_eq!(args[input + 1], "clip.mp4");
+        // Tagged levels at info, so the device line can be read.
+        assert_eq!(value_of(&args, "-loglevel"), Some("level+info"));
+        assert!(args.iter().any(|a| a == "-nostats"));
+        assert_eq!(args.last().map(String::as_str), Some("pipe:1"));
+    }
+
+    #[test]
+    fn decoder_args_auto_and_none() {
+        let info = info_64x48();
+        let auto = decoder_args("a.mov", &info, Layout::Yuv420, 64, 48, 0, &HwAccel::Auto);
+        assert_eq!(value_of(&auto, "-hwaccel"), Some("auto"));
+        assert_eq!(value_of(&auto, "-hwaccel_device"), None);
+        let none = decoder_args("a.mov", &info, Layout::Yuv420, 64, 48, 0, &HwAccel::None);
+        assert_eq!(value_of(&none, "-hwaccel"), None);
+        assert_eq!(value_of(&none, "-hwaccel_device"), None);
+    }
+
+    #[test]
+    fn decoder_args_seek_scale_and_layout() {
+        let info = info_64x48();
+        // Frame 30 at 30000/1001 fps is 1.001 s.
+        let yuv = decoder_args("a.mov", &info, Layout::Yuv420, 64, 48, 30, &HwAccel::None);
+        assert_eq!(value_of(&yuv, "-ss"), Some("1.001000"));
+        assert_eq!(
+            value_of(&yuv, "-vf"),
+            Some("fps=30000/1001,scale=out_range=tv,format=yuv420p")
+        );
+        assert_eq!(value_of(&yuv, "-pix_fmt"), Some("yuv420p"));
+        // Scaled down, with alpha.
+        let rgba = decoder_args("a.mov", &info, Layout::Rgba, 32, 24, 0, &HwAccel::None);
+        assert_eq!(
+            value_of(&rgba, "-vf"),
+            Some("fps=30000/1001,scale=32:24,format=rgba,premultiply=inplace=1")
+        );
+        assert_eq!(value_of(&rgba, "-pix_fmt"), Some("rgba"));
+        let scaled = decoder_args("a.mov", &info, Layout::Yuv420, 32, 24, 0, &HwAccel::None);
+        assert_eq!(
+            value_of(&scaled, "-vf"),
+            Some("fps=30000/1001,scale=32:24:out_range=tv,format=yuv420p")
+        );
+    }
+
+    #[test]
+    fn hwaccel_env_and_policy() {
+        assert_eq!(HwMode::parse(None), HwMode::Card);
+        assert_eq!(HwMode::parse(Some("")), HwMode::Card);
+        assert_eq!(HwMode::parse(Some("none")), HwMode::None);
+        assert_eq!(HwMode::parse(Some("AUTO")), HwMode::Auto);
+        assert_eq!(HwMode::parse(Some(" card ")), HwMode::Card);
+        assert_eq!(
+            HwMode::parse(Some("cuda")),
+            HwMode::Card,
+            "unknown: default"
+        );
+
+        let card = || Some((2, "10de:24b0 (NVIDIA RTX A4000)".to_string()));
+        assert_eq!(
+            HwAccel::choose(HwMode::Card, card()),
+            HwAccel::D3d11va {
+                adapter: 2,
+                expect: "10de:24b0 (NVIDIA RTX A4000)".into()
+            }
+        );
+        // Card unknown (not D3D12, not Windows, no d3d11va in ffmpeg): as before.
+        assert_eq!(HwAccel::choose(HwMode::Card, None), HwAccel::Auto);
+        assert_eq!(HwAccel::choose(HwMode::Auto, card()), HwAccel::Auto);
+        assert_eq!(HwAccel::choose(HwMode::None, card()), HwAccel::None);
+    }
+
+    #[test]
+    fn ffmpeg_log_lines_are_sorted() {
+        // libavutil/hwcontext_d3d11va.c: "Using device %04x:%04x (%ls).\n".
+        assert_eq!(
+            classify("[AVHWDeviceContext @ 000001d2c5e0a940] [info] Using device 10de:2560 (NVIDIA GeForce RTX 3050 Ti Laptop GPU).\r"),
+            LogLine::Device("10de:2560 (NVIDIA GeForce RTX 3050 Ti Laptop GPU)".into())
+        );
+        // fftools/ffmpeg_dec.c, with -hwaccel auto.
+        assert_eq!(
+            classify("[vist#0:0/h264 @ 0x5581e0c0] [info] Using auto hwaccel type vaapi with new default device."),
+            LogLine::Device("hwaccel type vaapi with new default device".into())
+        );
+        assert_eq!(
+            classify("[h264 @ 0x55d1c2a3b4c0] [error] Invalid NAL unit size."),
+            LogLine::Error("[h264] Invalid NAL unit size.".into())
+        );
+        assert_eq!(
+            classify("[fatal] No such file or directory"),
+            LogLine::Error("No such file or directory".into())
+        );
+        assert_eq!(
+            classify("[hevc @ 000001d2c5e0a940] [warning] Failed setup for format d3d11: hwaccel initialisation returned error."),
+            LogLine::Warning("[hevc] Failed setup for format d3d11: hwaccel initialisation returned error.".into())
+        );
+        assert_eq!(
+            classify("[info]   Stream #0:0: Video: h264"),
+            LogLine::Other
+        );
+        assert_eq!(classify("untagged"), LogLine::Other);
+    }
+
+    #[test]
+    fn hwaccels_listing() {
+        let listing = "Hardware acceleration methods:\ncuda\ndxva2\nqsv\nd3d11va\nd3d12va\n\n";
+        assert!(hwaccels_list_d3d11va(listing));
+        assert!(!hwaccels_list_d3d11va(
+            "Hardware acceleration methods:\nvdpau\nvaapi\n"
+        ));
     }
 
     #[test]
