@@ -81,13 +81,16 @@ pub enum TransportChange {
     /// Pause without anything else — a control cue's pause: a stopped task
     /// it targets stays off stage.
     Hold,
-    /// Go to an absolute show time — the operator positioning the playhead,
-    /// or a control cue's jump. Keeps play/pause; a timeline that is off
-    /// stage (a stopped task) comes back on stage, paused there, showing
-    /// that frame.
+    /// Go to an absolute show time — the operator positioning the
+    /// playhead. Keeps play/pause; a timeline that is off stage (a stopped
+    /// task) comes back on stage, paused there, showing that frame.
     Seek(i64),
     /// Go relative to the current position, clamped at zero. Like `Seek`.
     SeekBy(i64),
+    /// Go to an absolute show time and pause there, on stage — a control
+    /// cue's jump: a running timeline stops on that frame, a stopped task
+    /// comes on stage, paused there.
+    Jump(i64),
     SetRate(i32),
     SetLoop(Option<i64>),
     /// Stop: pause at zero. With `deactivate` the timeline also goes off
@@ -141,6 +144,11 @@ pub fn next_state(
         TransportChange::SeekBy(delta) => {
             next.anchor_show_ns = position.saturating_add(delta).max(0);
             next.active = true;
+        }
+        TransportChange::Jump(show_ns) => {
+            next.anchor_show_ns = show_ns.max(0);
+            next.active = true;
+            next.playing = false;
         }
         TransportChange::SetRate(rate_permille) => next.rate_permille = rate_permille,
         TransportChange::SetLoop(loop_ns) => next.loop_ns = loop_ns.filter(|&l| l > 0),
@@ -230,6 +238,20 @@ mod tests {
         // A playing timeline keeps playing from there.
         let moved = next_state(&playing, TransportChange::Seek(7 * S), 2 * S);
         assert!(moved.active && moved.playing);
+    }
+
+    #[test]
+    fn a_jump_pauses_there_on_stage() {
+        let playing = next_state(&TransportState::INACTIVE, TransportChange::Play, 0);
+        // A running timeline stops on the frame it jumps to…
+        let jumped = next_state(&playing, TransportChange::Jump(7 * S), 2 * S);
+        assert!(jumped.active && !jumped.playing, "on stage, paused");
+        assert_eq!(jumped.show_time_at(9 * S), 7 * S);
+        // …and a stopped task comes on stage, paused there.
+        let stopped = next_state(&playing, TransportChange::Stop { deactivate: true }, S);
+        let jumped = next_state(&stopped, TransportChange::Jump(7 * S), 2 * S);
+        assert!(jumped.active && !jumped.playing, "on stage, paused");
+        assert_eq!(jumped.show_time_at(9 * S), 7 * S);
     }
 
     #[test]

@@ -73,7 +73,7 @@ Commands:
 | `runner_action` | `runner` (name or node id), `action` | see below |
 | `wake_runner` | `runner` | the Director sends a Wake-on-LAN packet to the MAC that Runner last reported |
 | `start_runner` | `runner` | the Director sends `{ "start_runner": <node id> }` (UDP, to the address and `launcher_port` that Runner last reported, default 7406); its supervisor, waiting since the Runner was closed, starts it |
-| `seek` | `show_ns ≥ 0` | jump; play state unchanged; a stopped task comes back on stage, paused there (a control cue's *jump* does the same) |
+| `seek` | `show_ns ≥ 0` | jump; play state unchanged; a stopped task comes back on stage, paused there (a control cue's *jump* also brings it on stage, but always pauses) |
 | `set_rate` | `rate_permille` (1000 = 1×, negative = reverse, ‖rate‖ ≤ 16000) | position stays continuous |
 | `set_loop` | `loop_ns` or `null` | wrap show time into `0..loop_ns` |
 | `load_show` | `document` (JSON object), optional `tag` | new show revision, distributed to Runners; replaces the show for everyone |
@@ -345,15 +345,15 @@ broadcasts them back. Other tools may ignore it.
   of the main timeline while active.
 * A control cue fires when its timeline, playing forward, reaches `at_s` —
   including when playback *starts* exactly on it (a `play` cue at 0 starts
-  its task with the show). The one exception: a cue that pauses or stops its
-  own timeline does not fire when playback starts on it, otherwise one could
-  never play on from a pause cue.
+  its task with the show). The one exception: a cue that pauses, stops or
+  jumps its own timeline (a jump pauses it) does not fire when playback
+  starts on it, otherwise one could never play on from a pause cue.
 * A task keeps running past its `duration_s` (which is the length shown in
   the editor) until it is stopped or a control cue acts on it.
   `action` is `pause`, `play`, `stop` or `jump` (to `to_s`); `target` is the
   timeline acted on — empty for the cue's own, `"main"`, or a task id. A
-  `jump` acts like `seek`: a running timeline keeps running from `to_s`, a
-  stopped task comes on stage, paused there. A `pause` aimed at a stopped
+  `jump` goes to `to_s` and pauses there, on stage: a running timeline stops
+  on that frame, a stopped task comes on stage, paused on it. A `pause` aimed at a stopped
   task leaves it off stage (the operator's pause brings it on, at 0). The
   Director schedules the resulting transport change for the exact cluster
   instant of the cue, ahead of time.
