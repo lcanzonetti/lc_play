@@ -427,6 +427,7 @@ impl Core {
                     node_id: hello.node_id.clone(),
                     machine: None,
                     online: true,
+                    audio_devices: Vec::new(),
                 });
             entry.name = hello.name.clone();
             self.dirty.notify_one();
@@ -626,6 +627,7 @@ impl Core {
         node.clock_skew_ns = Some(skew);
         node.frame_error = frame_error;
         let (key, machine) = (node.node_id.0.clone(), health.machine.clone());
+        let audio_devices = health.audio_devices.clone();
         let reporter = node.node_id.clone();
         node.health = Some(health);
         if let Some(grid) = self.update_grid(&mut st, &reporter) {
@@ -635,6 +637,13 @@ impl Core {
         if let (Some(known), Some(machine)) = (st.known_runners.get_mut(&key), machine) {
             if known.machine.as_ref() != Some(&machine) {
                 known.machine = Some(machine);
+                self.dirty.notify_one();
+            }
+        }
+        // And its sound devices, for assigning them while it is offline.
+        if let Some(known) = st.known_runners.get_mut(&key) {
+            if !audio_devices.is_empty() && known.audio_devices != audio_devices {
+                known.audio_devices = audio_devices;
                 self.dirty.notify_one();
             }
         }

@@ -179,6 +179,15 @@ function normalize(doc) {
     task.id ||= uid(); task.name ??= ''; task.duration_s ??= 30;
     task.tracks ??= []; task.control_cues ??= [];
   }
+  // Audio: the project's buses, and per Runner the device that plays them
+  // (see lc-proto/src/audio.rs).
+  const au = (doc.audio ??= {});
+  au.buses ??= [{ name: 'Left' }, { name: 'Right' }];
+  for (const b of au.buses) b.name ??= '';
+  au.runners ??= [];
+  for (const r of au.runners) {
+    Object.assign(r, Object.assign({ runner: '', output: null, output_channels: [], delay_ms: 0, gain_db: 0, input: null, ltc_channel: 0 }, r));
+  }
   // Every timeline — the document itself is the main one.
   for (const tl of [doc, ...doc.tasks]) {
     for (const cc of tl.control_cues) {
@@ -198,6 +207,8 @@ function normalize(doc) {
           start_s: 0, duration_s: 10, in_s: 0, loop: false, free_run: false,
           x: 0, y: 0, w: 640, h: 360, rotation: 0, opacity: 1, fade_in_s: 0, fade_out_s: 0, keep_aspect: false,
         }, c));
+        // Its sound: which bus each channel feeds (empty: channel n → bus n).
+        c.audio = Object.assign({ channel_buses: [], gain_db: 0, mute: false }, c.audio);
       }
     }
   }
@@ -240,6 +251,10 @@ const findVirtual = (id) => S.doc.stage.virtuals.find((v) => v.id === id) || nul
 const cuesShowing = (id) => tlIds().flatMap((tl) => tlObj(tl).tracks.flatMap((t) => t.cues))
   .filter((c) => c.source.type === 'virtual' && c.source.virtual === id);
 const assetOf = (cue) => (cue.source.type === 'asset' ? S.doc.assets.find((a) => a.id === cue.source.asset) : null);
+/** A cue of a sound file: heard, not seen (not drawn on the stage). */
+const isSoundOnly = (cue) => assetOf(cue)?.kind === 'audio';
+/** The system's one sample rate (lc_proto::audio::SAMPLE_RATE). */
+const SAMPLE_RATE = 48000;
 /** Ids of the selected cues: none, one, or several (box selection or
  *  Shift/Ctrl-click in the timeline). */
 const selCueIds = () => (S.sel?.type !== 'cue' ? [] : S.sel.ids?.length ? S.sel.ids : [S.sel.id]);
@@ -294,6 +309,7 @@ function defaultLayout() {
     'win-timeline':  { x: 0, y: top, w: W - right, h: H - top },
     'win-tasks':     { x: W - right, y: top, w: right, h: Math.round((H - top) * 0.4) },
     'win-runners':   { x: W - right, y: top + Math.round((H - top) * 0.4), w: right, h: H - top - Math.round((H - top) * 0.4) },
+    'win-audio':     { x: Math.round(W * 0.2), y: Math.round(H * 0.08), w: 560, h: Math.round(H * 0.75), visible: false },
     'win-log':       { x: Math.round(W * 0.25), y: Math.round(H * 0.15), w: Math.round(W * 0.5), h: Math.round(H * 0.5), visible: false },
   };
 }
@@ -652,7 +668,7 @@ function connect(url, protocol) {
     }
     S.connected = false;
     S.status = null;
-    renderCluster(); renderRunners();
+    renderCluster(); renderRunners(); renderAudio();
     // The Director may simply be restarting: keep trying.
     setTimeout(() => connect(url, protocol), 1000);
   };
@@ -744,7 +760,7 @@ function onMessage(msg) {
       S.clockOffsetNs = msg.cluster_ns - performance.now() * 1e6;
       pushTransport(msg.transport, MAIN);
       for (const [id, state] of Object.entries(msg.tasks || {})) pushTransport(state, id);
-      renderCluster(); renderRunners();
+      renderCluster(); renderRunners(); renderAudio();
       break;
     case 'runner_preview':
       S.previews[msg.name] = msg.outputs;
@@ -832,7 +848,7 @@ function record(before) {
 function afterChange(inspector = true) {
   if (!tlObj(S.tl)) S.tl = MAIN;      // the open timeline was deleted
   pruneSelection();
-  renderTimeline(); renderTasks(); renderRunners(true);
+  renderTimeline(); renderTasks(); renderRunners(true); renderAudio(true);
   if (inspector) renderInspector();
   renderAssetsIfChanged();
   scheduleSend();
@@ -891,13 +907,13 @@ function refreshAll() {
   if (!S.doc) return;
   if (!tlObj(S.tl)) S.tl = MAIN;
   pruneSelection();
-  renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
+  renderTimeline(); renderTasks(); renderRunners(true); renderAudio(true); renderInspector();
   renderAssetsIfChanged();
 }
 
 function select(sel) {
   S.sel = sel;
-  renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
+  renderTimeline(); renderTasks(); renderRunners(true); renderAudio(true); renderInspector();
   markOthers();
   sendPresence();
 }
@@ -977,12 +993,12 @@ function fitRect(mediaW, mediaH, enlarge) {
 }
 
 function addAssetCue(item, tl, ti, t) {
-  const kind = item.kind; // 'video' | 'image'
+  const kind = item.kind; // 'video' | 'image' | 'audio'
   // Record the asset in the show, with the URL Runners will fetch it from.
   const entry = { id: item.id, name: item.name, kind, ...assetFacts(item) };
   const cue = {
     name: item.name, source: { type: 'asset', asset: item.id },
-    duration_s: kind === 'video' && item.duration_s > 0 ? round2(item.duration_s) : 10,
+    duration_s: kind !== 'image' && item.duration_s > 0 ? round2(item.duration_s) : 10,
     ...fitRect(item.width || 1920, item.height || 1080, false),
   };
   // Upsert before the cue is added: validation requires the asset to exist.
@@ -1027,8 +1043,9 @@ async function loadLibrary() {
   try {
     const res = await fetch(`${S.assetsUrl}/api/library`);
     const { items } = await res.json();
-    // Audio-only files are listed by the Asset Manager but cannot be cued yet.
-    const usable = items.filter((i) => i.kind === 'video' || i.kind === 'image');
+    const usable = items.filter((i) => ['video', 'image', 'audio'].includes(i.kind));
+    // A sound file's length is its sound's (ffprobe is asked about pictures).
+    for (const i of usable) if (i.kind === 'audio' && !i.duration_s && i.audio?.frames) i.duration_s = i.audio.frames / SAMPLE_RATE;
     if (JSON.stringify(usable) !== JSON.stringify(S.library)) {
       S.library = usable;
       renderAssets();
@@ -1051,7 +1068,27 @@ function assetFacts(item) {
     path: item.play_path || item.path,
     width: item.width || 0, height: item.height || 0,
     duration_s: item.duration_s || 0,
+    audio: soundOf(item),
   };
+}
+
+/** The sound file the Asset Manager made of an item, as the show records
+ *  it (`Asset::audio`), or null: no sound, or not extracted yet. */
+function soundOf(item) {
+  const a = item.audio;
+  if (a?.state !== 'done') return null;
+  return { url: S.assetsUrl + a.url, size: a.size, path: a.path, channels: a.channels, frames: a.frames, offset_s: a.offset_s };
+}
+
+/** One line on an item's sound, for the asset list. */
+function soundBadge(item) {
+  const a = item.audio;
+  if (!a || a.state === 'none') return null;
+  const text = {
+    pending: 'sound: waiting', extracting: 'sound: extracting…',
+    done: `sound: ${a.channels} ch`, failed: 'sound: failed',
+  }[a.state] || a.state;
+  return el('span', { class: `opt opt-${a.state === 'extracting' ? 'optimizing' : a.state}`, title: a.error || '' }, text);
 }
 
 /** A file replaced on the Asset Manager keeps its id (ids come from the
@@ -1061,8 +1098,8 @@ function assetFacts(item) {
  *  date; Runners then fetch the new file. */
 function reconcileAssets() {
   if (!S.doc || !S.library) return;
-  const keys = ['url', 'size', 'path', 'width', 'height', 'duration_s'];
-  const facts = (x) => keys.map((k) => x[k] ?? '').join('|');
+  const keys = ['url', 'size', 'path', 'width', 'height', 'duration_s', 'audio'];
+  const facts = (x) => JSON.stringify(keys.map((k) => x[k] ?? null));
   const stale = S.doc.assets
     .map((a) => [a, S.library.find((i) => i.id === a.id)])
     .filter(([a, item]) => item && facts(assetFacts(item)) !== facts(a));
@@ -1220,8 +1257,10 @@ function assetRow(item, depth, into) {
     ondblclick: () => addAssetCue(item, S.tl, 0, showSeconds(S.tl)),
   },
     // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
-    el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
-    el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta, optimizeBadge(item))),
+    item.kind === 'audio'
+      ? el('div', { class: 'sound-thumb', title: 'Sound only' }, '♪')
+      : el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
+    el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta, optimizeBadge(item), soundBadge(item))),
     el('div', { class: 'btns' },
       item.kind === 'video' ? el('button', { title: 'Optimise again, with the current settings', onclick: (e) => { e.stopPropagation(); reoptimize(item); } }, '↻') : null,
       el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕')),
@@ -2052,6 +2091,7 @@ function drawCues(g, k, { area = null, visiting = null } = {}) {
         if (onStage && !onAir) S.onsets.delete(cue.id); // on air again later: afresh
         const others = onStage ? othersOn('cue', cue.id) : [];
         if (!onAir && !sels.has(cue) && !others.length) continue;
+        if (isSoundOnly(cue)) continue; // nothing to see
         if (area && !cueReaches(cue, area)) continue;
         // In a virtual display's picture, a cue showing a virtual display
         // being drawn is left out (a loop; the Runners do the same).
@@ -2185,7 +2225,7 @@ stage.addEventListener('mousedown', (e) => {
     for (const track of tlObj(tl).tracks) {
       for (const cue of [...track.cues].reverse()) {
         const visible = (active && t >= cue.start_s && t < cue.start_s + cue.duration_s) || sels.has(cue);
-        if (visible && cueContains(cue, cx, cy)) {
+        if (visible && !isSoundOnly(cue) && cueContains(cue, cx, cy)) {
           if (S.tl !== tl) S.tl = tl; // open the timeline the cue is on
           select({ type: 'cue', id: cue.id });
           drag = { ...start, kind: 'move', target: cue, orig: { ...cue } };
@@ -2368,7 +2408,7 @@ function renderTimeline() {
     for (const cue of track.cues) {
       const selected = isCueSelected(cue.id);
       lane.append(el('div', {
-        class: `cue ${cue.source.type}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
+        class: `cue ${cue.source.type}${isSoundOnly(cue) ? ' sound' : ''}${cue.free_run ? ' free' : ''}${selected ? ' sel' : ''}`, dataset: { id: cue.id },
         style: `left:${cue.start_s * pps}px;width:${cue.duration_s * pps}px`, title: cue.name,
       }, cue.name || (cue.source.type === 'virtual' ? findVirtual(cue.source.virtual)?.name : null)
         || ({ color: 'colour', sync_test: 'sync test', virtual: 'virtual' }[cue.source.type] || 'cue'),
@@ -2977,6 +3017,204 @@ function renderRunners(force = false) {
   }
 }
 
+// ───────────────────────────── audio ─────────────────────────────
+// Sound is routed in two steps (see lc-proto/src/audio.rs):
+//
+//   cue channel ──▶ project bus ──▶ device channel(s) of the Runner(s) that play it
+//
+// The buses are the project's (Left, Right, Sub …). Each Runner plays them on
+// one sound device of its computer, chosen here from the devices it reports:
+// for each channel of that device, the bus it plays. Each cue says which bus
+// each channel of its file feeds (in the Inspector). Moving a show to another
+// rig only changes this window.
+
+let audioKey = ''; // what the window was last built from
+
+/** The audio settings of Runner `name` in the show; created (inside an
+ *  edit) when `create` is set. */
+function runnerAudio(name, create = false) {
+  let r = S.doc.audio.runners.find((x) => x.runner === name) || null;
+  if (!r && create) {
+    r = { runner: name, output: null, output_channels: [], delay_ms: 0, gain_db: 0, input: null, ltc_channel: 0 };
+    S.doc.audio.runners.push(r);
+  }
+  return r;
+}
+
+/** The sound devices a Runner reported: live, else as last known. */
+function audioDevices(name) {
+  const { h, known } = runnerInfo(name);
+  return h?.audio_devices?.length ? h.audio_devices : known?.audio_devices || [];
+}
+
+const deviceKey = (d) => (d ? `${d.host}|${d.id}` : '');
+const deviceLabel = (d) => `${d.host}: ${d.name}`;
+
+/** Which Runners play bus `b`. */
+function busRunners(b) {
+  return S.doc.audio.runners.filter((r) => r.output && r.output_channels.includes(b)).map((r) => r.runner);
+}
+
+/** Remove bus `b`: what played or fed it plays or feeds nothing; what
+ *  referred to a later bus follows it down. */
+function removeBus(b) {
+  const shift = (v) => (v == null || v === b ? null : v > b ? v - 1 : v);
+  const used = busRunners(b).length || tlIds().some((tl) => tlObj(tl).tracks.some((t) => t.cues.some((c) => c.audio.channel_buses.includes(b))));
+  const go = () => edit(() => {
+    const au = S.doc.audio;
+    au.buses.splice(b, 1);
+    for (const r of au.runners) r.output_channels = r.output_channels.map(shift);
+    for (const tl of tlIds()) for (const t of tlObj(tl).tracks) for (const c of t.cues) c.audio.channel_buses = c.audio.channel_buses.map(shift);
+  });
+  if (!used) return go();
+  ask(`Remove bus ${b + 1} (${S.doc.audio.buses[b].name})? The Runner channels that play it and the cue channels that feed it are left unassigned.`).then((yes) => yes && go());
+}
+
+/** One device dropdown: `kind` 'output' or 'input'. */
+function deviceSelect(name, kind) {
+  const r = runnerAudio(name), current = r?.[kind] || null;
+  const count = kind === 'output' ? 'output_channels' : 'input_channels';
+  const devices = audioDevices(name).filter((d) => d[count] > 0);
+  const sel = el('select', { class: 'wide' }, el('option', { value: '' }, kind === 'output' ? 'None (no sound from this Runner)' : 'None'));
+  for (const d of devices) {
+    const def = kind === 'output' ? d.default_output : d.default_input;
+    sel.append(el('option', { value: deviceKey(d) }, `${deviceLabel(d)} (${d[count]} ch${def ? ', default' : ''})`));
+  }
+  // Set in the show but not reported (unplugged, or the Runner is offline).
+  if (current && !devices.some((d) => deviceKey(d) === deviceKey(current))) {
+    sel.append(el('option', { value: deviceKey(current) }, `${deviceLabel(current)} (not found)`));
+  }
+  sel.value = deviceKey(current);
+  sel.onchange = () => {
+    sel.blur();
+    const d = devices.find((x) => deviceKey(x) === sel.value) || null;
+    edit(() => {
+      const ra = runnerAudio(name, true);
+      ra[kind] = d ? { host: d.host, id: d.id, name: d.name } : null;
+      if (kind === 'output' && d) {
+        // Keep the mapping there is; a first device plays bus n on channel n.
+        const old = ra.output_channels, buses = S.doc.audio.buses.length;
+        ra.output_channels = Array.from({ length: Math.min(d.output_channels, 256) },
+          (_, k) => (old.length ? old[k] ?? null : k < buses ? k : null));
+      }
+    });
+  };
+  return sel;
+}
+
+/** For each output channel of the Runner's device, the bus it plays. */
+function channelMap(name) {
+  const r = runnerAudio(name);
+  const dev = audioDevices(name).find((d) => deviceKey(d) === deviceKey(r.output));
+  const n = Math.max(dev?.output_channels || 0, r.output_channels.length);
+  const buses = S.doc.audio.buses;
+  const grid = el('div', { class: 'chanmap' });
+  for (let k = 0; k < n; k++) {
+    const sel = el('select', {}, el('option', { value: '' }, '—'), ...buses.map((b, i) => el('option', { value: i }, `${i + 1} ${b.name}`)));
+    sel.value = r.output_channels[k] ?? '';
+    sel.onchange = () => {
+      sel.blur();
+      edit(() => {
+        const ra = runnerAudio(name, true);
+        const map = Array.from({ length: Math.max(n, ra.output_channels.length) }, (_, i) => ra.output_channels[i] ?? null);
+        map[k] = sel.value === '' ? null : Number(sel.value);
+        // No trailing silent channels kept beyond the device's own.
+        ra.output_channels = map;
+      });
+    };
+    grid.append(el('label', { dataset: { ch: k } }, el('span', { class: 'dim' }, `Out ${k + 1}`), sel, el('span', { class: 'meter' }, el('i'))));
+  }
+  return n > 16 ? el('details', {}, el('summary', {}, `Channels (${n})`), grid) : grid;
+}
+
+/** The live part of a Runner's card: what its output does, and meters. */
+function audioLive(name) {
+  const { h, online } = runnerInfo(name);
+  const a = h?.audio;
+  if (!online) return 'Offline.';
+  if (!a) return runnerAudio(name)?.output ? 'Waiting for the Runner…' : 'No output device: this Runner plays no sound.';
+  if (a.state === 'error') return el('span', { class: 'bad' }, `${a.device}: ${a.error || 'not working'}`);
+  return [
+    `${a.device} · ${a.channels} ch · ${a.sample_rate} Hz · ${a.buffer_frames} frames · latency ${a.latency_ms.toFixed(1)} ms`,
+    `clock ${a.drift_ppm >= 0 ? '+' : ''}${a.drift_ppm.toFixed(1)} ppm · in sync ±${Math.abs(Math.round(a.sync_error_us))} µs · ${a.voices} cue(s) playing`,
+    a.underruns ? `${a.underruns} dropout(s)` : null,
+    a.realigns ? `${a.realigns} re-alignment(s)` : null,
+  ].filter(Boolean).join(' · ');
+}
+
+/** Refresh the live lines and meters without rebuilding the window (that
+ *  would close an open dropdown). */
+function updateAudioLive() {
+  for (const card of document.querySelectorAll('#audio .runner[data-runner]')) {
+    const name = card.dataset.runner, live = card.querySelector('.audio-live');
+    const v = audioLive(name);
+    live.replaceChildren(...(Array.isArray(v) ? v : [v]));
+    const peaks = runnerInfo(name).h?.audio?.peaks || [];
+    for (const m of card.querySelectorAll('.chanmap label')) {
+      const p = peaks[Number(m.dataset.ch)] || 0;
+      // −60 dBFS … 0 dBFS across the bar.
+      const db = p > 0 ? 20 * Math.log10(p) : -120;
+      const bar = m.querySelector('.meter i');
+      bar.style.width = `${clamp((db + 60) / 60, 0, 1) * 100}%`;
+      bar.className = p >= 0.99 ? 'clip' : db > -6 ? 'hot' : '';
+    }
+  }
+}
+
+function renderAudio(force = false) {
+  const box = $('#audio');
+  if (!S.doc || !box) return;
+  const names = runnerNames();
+  const key = JSON.stringify([names.map((n) => [n, runnerInfo(n).online, audioDevices(n)]), S.doc.audio, S.connected]);
+  if (key === audioKey && !force) return updateAudioLive();
+  if (box.contains(document.activeElement) && ['SELECT', 'INPUT'].includes(document.activeElement.tagName) && !force) return updateAudioLive();
+  audioKey = key;
+  box.replaceChildren();
+  const au = S.doc.audio;
+
+  // The project's buses.
+  box.append(el('h4', {}, 'Project buses'));
+  au.buses.forEach((b, i) => {
+    const row = field(`${i + 1}`, b, 'name', { type: 'text' });
+    const who = busRunners(i);
+    row.append(el('span', { class: who.length === 1 ? 'dim' : 'warn', title: who.length > 1 ? 'Several Runners play this bus: they are within the clock sync of each other (well under a millisecond), which is right for separate zones but causes comb filtering on speakers that cover the same area.' : '' },
+      who.length ? who.join(', ') : 'not played'),
+    el('button', { class: 'small danger', title: 'Remove this bus', onclick: () => removeBus(i) }, '✕'));
+    box.append(row);
+  });
+  box.append(el('div', { class: 'btns' }, el('button', {
+    disabled: au.buses.length >= 128,
+    onclick: () => edit(() => S.doc.audio.buses.push({ name: `Bus ${S.doc.audio.buses.length + 1}` })),
+  }, '+ Bus')));
+
+  // Each Runner's device and mapping.
+  if (!names.length) box.append(el('div', { class: 'empty' }, S.connected ? 'No Runner is connected.' : 'Not connected to the Director.'));
+  for (const name of names) {
+    const { online } = runnerInfo(name);
+    const r = runnerAudio(name);
+    const card = el('div', { class: `runner${online ? '' : ' offline'}`, dataset: { runner: name } },
+      el('div', { class: 'runner-head' }, el('span', { class: 'name' }, name),
+        el('button', { class: 'small', disabled: !online, title: 'List its sound devices again (after plugging one in)', onclick: () => runnerAction(name, 'rescan_audio') }, 'Rescan devices')),
+      el('div', { class: 'audio-live note' }),
+      el('div', { class: 'row' }, el('label', {}, 'Output'), deviceSelect(name, 'output')));
+    if (r?.output) {
+      card.append(
+        field('Delay (ms)', r, 'delay_ms', { step: 1, set: (v) => clamp(v, -1000, 1000) }),
+        field('Level (dB)', r, 'gain_db', { step: 1, set: (v) => clamp(v, -120, 24) }),
+        channelMap(name),
+        note('Delay: added to everything this Runner plays, to line the sound up with the picture (projector or LED processor latency) or with a console downstream. Negative plays earlier.'));
+    }
+    card.append(el('div', { class: 'row' }, el('label', {}, 'LTC input'), deviceSelect(name, 'input')));
+    if (r?.input) {
+      card.append(
+        field('LTC channel', r, 'ltc_channel', { step: 1, min: 1, get: (v) => v + 1, set: (v) => Math.max(0, Math.round(v) - 1) }),
+        note('Read for timecode only. Chasing LTC is the next step: this version records the setting but does not read it yet.'));
+    }
+    box.append(card);
+  }
+  updateAudioLive();
+}
+
 /** Media being copied into a Runner's cache: one bar each. Until a file is
  *  complete, the cues that use it show the black-and-magenta placeholder on
  *  that Runner's outputs. */
@@ -3412,6 +3650,41 @@ function colorField(label, obj, key) {
 
 const note = (text) => el('div', { class: 'note' }, text);
 
+/** A cue's sound: level, mute, and which project bus each channel of its
+ *  file feeds (where a bus is heard is set per Runner, in the Audio window). */
+function soundFields(c, asset) {
+  const a = c.audio, buses = S.doc.audio.buses;
+  const rows = [el('h4', {}, 'Sound')];
+  if (!asset.audio) {
+    rows.push(note(asset.kind === 'audio'
+      ? 'The Asset Manager has not extracted this file\'s sound yet.'
+      : 'No sound: the file has none, or the Asset Manager has not extracted it yet.'));
+    return rows;
+  }
+  const n = asset.audio.channels;
+  // An empty list means channel n → bus n.
+  const busOf = (ch) => (a.channel_buses.length ? a.channel_buses[ch] ?? null : ch < buses.length ? ch : null);
+  rows.push(
+    field('Level (dB)', a, 'gain_db', { step: 1, set: (v) => clamp(v, -120, 24) }),
+    field('Mute', a, 'mute', { type: 'checkbox' }));
+  for (let ch = 0; ch < n; ch++) {
+    const sel = el('select', { class: 'wide' }, el('option', { value: '' }, '— none'),
+      ...buses.map((b, i) => el('option', { value: i }, `${i + 1} ${b.name}`)));
+    sel.value = busOf(ch) ?? '';
+    sel.onchange = () => {
+      sel.blur();
+      edit(() => {
+        const map = Array.from({ length: n }, (_, k) => busOf(k));
+        map[ch] = sel.value === '' ? null : Number(sel.value);
+        a.channel_buses = map;
+      });
+    };
+    rows.push(el('div', { class: 'row' }, el('label', {}, `Channel ${ch + 1}`), sel));
+  }
+  rows.push(note(`${n} channel(s), ${(asset.audio.frames / SAMPLE_RATE).toFixed(1)} s. The cue's fades apply to its sound. Sound plays at normal speed only (not at other rates, nor while scrubbing).`));
+  return rows;
+}
+
 /** A display's test pattern: drawn by its Runner over the content, fitted
  *  to the display, at a chosen rate, on the cluster clock (it moves whether
  *  the show plays or not, and every display is on the same step). */
@@ -3502,12 +3775,20 @@ function renderInspector() {
       field('Fade in (s)', c, 'fade_in_s', sec),
       field('Fade out (s)', c, 'fade_out_s', sec),
     );
-    if (asset?.kind === 'video') {
+    if (asset?.kind === 'video' || asset?.kind === 'audio') {
+      const what = asset.kind === 'video' ? 'video' : 'sound';
       box.append(
         field('In point (s)', c, 'in_s', sec),
-        field('Loop video', c, 'loop', { type: 'checkbox' }),
+        field(`Loop ${what}`, c, 'loop', { type: 'checkbox' }),
         field('Free run', c, 'free_run', { type: 'checkbox' }),
-        note('Free run: the video plays at normal speed from the moment the cue goes on air and keeps playing while the timeline is paused; it stops on its last frame unless Loop is on. Start and duration still decide when it is on air.'));
+        note(`Free run: the ${what} plays at normal speed from the moment the cue goes on air and keeps playing while the timeline is paused; it stops at its end unless Loop is on. Start and duration still decide when it is on air.`));
+    }
+    if (asset?.kind === 'video' || asset?.kind === 'audio') box.append(...soundFields(c, asset));
+    if (asset?.kind === 'audio') {
+      box.append(el('div', { class: 'btns' },
+        el('button', { onclick: () => seek(c.start_s, findCue(c.id).tl) }, 'Go to cue'),
+        el('button', { class: 'danger', onclick: deleteSelection }, 'Delete')));
+      return;
     }
     box.append(
       el('h4', {}, 'Position on stage'),

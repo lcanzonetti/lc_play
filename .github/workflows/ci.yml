@@ -21,11 +21,12 @@ jobs:
       # Mesa's software Vulkan driver (lavapipe) lets the engine's offscreen
       # GPU tests render real frames without a GPU.
       # Also: the web-view libraries the Producer's window links against on
-      # Linux, and ffmpeg for the Runner's video decoder test.
+      # Linux, ffmpeg for the Runner's video decoder test, and ALSA's
+      # headers for the Runner's sound output.
       - name: Install system libraries
         run: >
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          mesa-vulkan-drivers libwebkit2gtk-4.1-dev libgtk-3-dev ffmpeg
+          mesa-vulkan-drivers libwebkit2gtk-4.1-dev libgtk-3-dev ffmpeg libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -151,7 +151,8 @@ fn main() -> anyhow::Result<()> {
         cfg.announce = Some(discovery);
         cfg.allow_power = args.allow_power;
         cfg.supervised = supervised;
-        return tokio::runtime::Runtime::new()?.block_on(headless(cfg));
+        let assets = folders.assets.clone();
+        return tokio::runtime::Runtime::new()?.block_on(headless(cfg, assets));
     }
 
     // ---- windowed ----------------------------------------------------------
@@ -226,10 +227,15 @@ fn main() -> anyhow::Result<()> {
 
     let source = match local_show {
         Some(show) => ShowSource::Local(show),
-        None => ShowSource::Cluster {
-            runner_name,
-            assets: AssetCache::new(assets_dir),
-        },
+        None => {
+            let assets = AssetCache::new(assets_dir);
+            // The sound follows the cluster's show, as the picture does.
+            lc_runner::audio::start(playhead.clone(), runner_name.clone(), assets.clone());
+            ShowSource::Cluster {
+                runner_name,
+                assets,
+            }
+        }
     };
     let event_loop = EventLoop::new()?;
     let mut app = App::new(source, playhead);
@@ -444,9 +450,14 @@ fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("'{addr}' did not resolve to any address"))
 }
 
-/// Agent only: follow the Director and log what a renderer would show.
-async fn headless(cfg: AgentConfig) -> anyhow::Result<()> {
+/// Agent only (and sound): follow the Director and log what a renderer
+/// would show.
+async fn headless(cfg: AgentConfig, assets_dir: std::path::PathBuf) -> anyhow::Result<()> {
+    let name = cfg.name.clone();
     let agent = Agent::spawn(cfg);
+    // No picture, but sound: a Runner can be a playback machine for audio
+    // alone.
+    lc_runner::audio::start(agent.playhead.clone(), name, AssetCache::new(assets_dir));
     tracing::info!("headless runner {} started", agent.node_id);
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {

@@ -9,6 +9,7 @@
 //!     replicas behind a load balancer over shared storage. A semaphore bounds
 //!     concurrent transcodes per node.
 
+mod audio;
 mod config;
 mod error;
 mod handlers;
@@ -53,6 +54,7 @@ async fn main() {
     let bind = config.bind;
     let state = AppState::new(config, library, optimizer);
     optimize::spawn(state.clone());
+    audio::spawn(state.clone());
 
     let mut app = Router::new()
         .route("/", get(|| async { Html(PLAYER_HTML) }))
@@ -64,6 +66,7 @@ async fn main() {
         .route("/proxy/{id}", get(handlers::proxy::proxy_media))
         .route("/thumb/{id}", get(handlers::manage::thumbnail))
         .route("/optimized/{id}", get(optimize::serve))
+        .route("/audio/{id}", get(audio::serve))
         .route(
             "/api/optimize",
             get(optimize::get_settings).put(optimize::put_settings),

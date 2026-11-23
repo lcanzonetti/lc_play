@@ -135,7 +135,8 @@ and `quit` (the Runner program; after `quit` its supervisor waits for
 `start_runner`), `exit` (the Runner and its supervisor), `standby` / `resume` (close / reopen the
 outputs, staying connected), `reboot` and `power_off` (the computer; only if
 the Runner was started with `--allow-power`), `send_logs` (it replies with
-`logs`), `send_preview` (it replies with `preview`).
+`logs`), `send_preview` (it replies with `preview`), `rescan_audio` (list
+the sound devices again; the next `health` carries the new list).
 
 Transport commands take effect `lead_ns` (default 100 ms) after the Director
 receives them, simultaneously on all Runners. `timeline` on the `command`
@@ -204,9 +205,20 @@ frame-lock counter), `vblank` (the first output's refresh, which the Director
 builds the grid from), `downloads` (media being copied into its cache:
 `name`, `done` and `total` bytes, `bytes_per_s`, and `error` / `retry_in_s`
 while waiting to retry), and `machine`: `hostname`, `os`,
-`version`, `ip`, `mac`, `allow_power`, `supervised`, `launcher_port`. `cluster` carries
+`version`, `ip`, `mac`, `allow_power`, `supervised`, `launcher_port`.
+`audio_devices` lists its sound devices: `{ host, id, name,
+output_channels, input_channels, sample_rates, default_output,
+default_input }` (`host`: `WASAPI`, `ASIO`, `ALSA`, `CoreAudio` …; `id`:
+cpal's `host:device` identifier). `audio`, when the show gives it an
+output: `{ state: "running" | "error", error, device, channels,
+sample_rate, buffer_frames, latency_ms, drift_ppm, sync_error_us,
+underruns, realigns, voices, peaks }` — `drift_ppm` is the device's clock
+against the cluster's (what the resampler corrects), `sync_error_us` where
+the output is against where the cluster says it should be, `peaks` the
+peak per device channel (0..1) since the last report. `cluster` carries
 `known_runners`: every Runner the Director has seen (`name`, `node_id`,
-`machine`, `online`), so offline ones can be listed and woken.
+`machine`, `online`, `audio_devices`), so offline ones can be listed,
+woken and given a sound device.
 `runner_logs` / `runner_preview` are relayed to Producers and controllers,
 not to Runners.
 
@@ -289,8 +301,20 @@ broadcasts them back. Other tools may ignore it.
     { "id": "636c6970", "name": "clip.mp4", "kind": "video",
       "url": "http://10.0.0.1:7403/optimized/636c6970?v=1794930967",
       "size": 594087, "path": "Optimized/clip.mov",
-      "width": 1920, "height": 1080, "duration_s": 12.0 }
+      "width": 1920, "height": 1080, "duration_s": 12.0,
+      "audio": { "url": "http://10.0.0.1:7403/audio/636c6970?v=1794930968",
+                 "size": 4608116, "path": "Optimized/clip.mp4.wav",
+                 "channels": 2, "frames": 576000, "offset_s": 0.0 } }
   ],
+  "audio": {
+    "buses": [ { "name": "Left" }, { "name": "Right" }, { "name": "Sub" } ],
+    "runners": [
+      { "runner": "left",
+        "output": { "host": "ASIO", "id": "asio:RME Fireface USB", "name": "RME Fireface USB" },
+        "output_channels": [0, 1, null, 2], "delay_ms": 40, "gain_db": 0,
+        "input": null, "ltc_channel": 0 }
+    ]
+  },
   "control_cues": [
     { "id": "k1", "at_s": 30, "action": "pause", "target": "", "to_s": 0 },
     { "id": "k2", "at_s": 10, "action": "play", "target": "sting" }
@@ -305,7 +329,8 @@ broadcasts them back. Other tools may ignore it.
         "start_s": 0, "duration_s": 12, "in_s": 0, "loop": false, "free_run": false,
         "x": 0, "y": 0, "w": 1920, "h": 1080,
         "rotation": 0, "opacity": 1, "fade_in_s": 1, "fade_out_s": 1,
-        "keep_aspect": false }
+        "keep_aspect": false,
+        "audio": { "channel_buses": [0, 1], "gain_db": 0, "mute": false } }
     ] }
   ]
 }
@@ -374,6 +399,33 @@ broadcasts them back. Other tools may ignore it.
   and keeps playing while the timeline is paused, until it goes off air. At
   the end it holds the last frame, or loops from `in_s` if `loop` is set.
 * `free_run` on a track (legacy): the same for every cue on the track.
+* **Audio** (`crates/lc-proto/src/audio.rs`). A cue channel feeds a project
+  bus; a bus is heard on the device channels that play it, on every Runner
+  that maps it:
+  * `audio.buses`: the project's buses (at most 128), referred to by index.
+    Default: Left, Right.
+  * `audio.runners`: per Runner (`runner` = its `--name`): `output`, the
+    device (`host`, `id`, and `name`, used when the id is not found);
+    `output_channels`, for each device channel from the first the bus it
+    plays or `null` (several channels may play one bus; channels past the
+    list are silent); `delay_ms` (−1000..1000) added to everything it plays,
+    for lip-sync with the displays; `gain_db` (−120..24); `input` and
+    `ltc_channel`, the device and channel (from 0) LTC timecode is read from
+    (reserved: not read yet).
+  * A cue's `audio`: `channel_buses`, for each channel of its file the bus it
+    feeds or `null` — empty means channel *n* feeds bus *n*; `gain_db`
+    (−120..24); `mute`. Its fades are the cue's own.
+  * An asset's `audio` is its sound as the Asset Manager extracted it: a WAV
+    file (RF64 above 4 GB) of 32-bit float samples at 48 kHz, `channels`
+    (1..64), `frames` long; `offset_s` is the media time of its first sample
+    (audio stream start − video stream start). `null`: silent, or not
+    extracted yet. Runners cache it like media.
+  * `kind: "audio"` assets are sound only: their cues are heard, not drawn
+    (`x, y, w, h` are kept but unused).
+  * Sound plays at rate 1000 only (silent at other rates, as a scrubbed
+    timeline is); a `free_run` cue plays on whatever its timeline does. A
+    `loop`ing cue loops at the video's `duration_s` (sound and picture loop
+    together); a sound-only cue at the file's length.
 
 ## 6. OSC (Director, UDP 7405)
 
@@ -394,12 +446,13 @@ Bundles are accepted; their time tags are ignored.
 
 | Method & path | |
 |---|---|
-| `GET /api/library` | `{ count, items: [{ id, name, path, kind, size, mime, width, height, duration_s, source, stream_url, thumb_url, play_url, play_size, play_path, optimized }] }` — `play_*`: the file to play (the optimised copy when ready, else the original); `optimized` (videos): `{ state: "original" \| "pending" \| "optimizing" \| "done" \| "failed", source, progress?, rule?, error?, output?, output_size?, version? }` |
+| `GET /api/library` | `{ count, items: [{ id, name, path, kind, size, mime, width, height, duration_s, source, stream_url, thumb_url, play_url, play_size, play_path, optimized }] }` — `play_*`: the file to play (the optimised copy when ready, else the original); `optimized` (videos): `{ state: "original" \| "pending" \| "optimizing" \| "done" \| "failed", source, progress?, rule?, error?, output?, output_size?, version? }`; `audio` (videos and sound files): `{ state: "pending" \| "extracting" \| "done" \| "none" \| "failed", error?, url?, size?, path?, channels?, frames?, offset_s? }` — when `done`, what the show's asset `audio` holds |
 | `GET /api/optimize` | the codec map: `{ enabled, rules: { <source>: { output, chunks, snappy } } }`, sources `h264 hevc prores prores_alpha hap hap_alpha hap_q hap_r hap_q_alpha notchlc dxv other`, outputs `keep rechunk hap hap_alpha hap_q`, chunks 1–64 |
 | `PUT /api/optimize` | replace it (values out of range are corrected; returns what was stored) |
 | `POST /api/optimize/apply` | optimise again files made with other rules, retry failures: `{ queued }` |
 | `POST /api/items/{id}/optimize` | optimise one video again |
 | `GET /optimized/{id}` | the optimised copy, with `Range` (`404` if there is none) |
+| `GET /audio/{id}` | the item's sound as Runners play it (WAV, 32-bit float, 48 kHz), with `Range` (`404` until extracted, or if it has none) |
 | `POST /api/upload?name=<file name>` | body = the raw file; returns the item |
 | `DELETE /api/items/{id}` | removes the file |
 | `GET /stream/{id}` | the file, with `Range` support |

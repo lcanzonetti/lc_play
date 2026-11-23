@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 lc-hap.workspace = true
+lc-proto.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

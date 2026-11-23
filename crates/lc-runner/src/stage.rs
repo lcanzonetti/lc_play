@@ -124,6 +124,12 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
         let track_count = tracks.len();
         for (ti, track) in tracks.iter().enumerate() {
             for (ci, cue) in track.cues.iter().enumerate() {
+                // Sound only: the audio thread plays it; nothing to draw.
+                if let CueSource::Asset { asset } = &cue.source {
+                    if doc.asset(asset).is_some_and(|a| a.kind == AssetKind::Audio) {
+                        continue;
+                    }
+                }
                 let source = match &cue.source {
                     CueSource::Color { rgba } => Source::Color { rgba: *rgba },
                     CueSource::SyncTest { fps } => Source::SyncTest { fps: *fps },
@@ -153,6 +159,10 @@ pub fn build(doc: &ShowDocument, runner_name: &str, assets: &Arc<AssetCache>) ->
                                 match a.kind {
                                     AssetKind::Image => Source::Image { path },
                                     AssetKind::Video => Source::Video { path },
+                                    // Skipped above.
+                                    AssetKind::Audio => Source::Missing {
+                                        reason: "sound only".into(),
+                                    },
                                 }
                             }
                         },

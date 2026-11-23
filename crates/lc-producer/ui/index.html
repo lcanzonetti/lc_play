@@ -142,6 +142,12 @@
     <div class="win-grip"></div>
   </section>
 
+  <section class="win" id="win-audio" data-title="Audio">
+    <header class="win-head"><span class="win-title">Audio</span><button class="win-close" title="Hide">✕</button></header>
+    <div class="win-body scroll pad" id="audio"></div>
+    <div class="win-grip"></div>
+  </section>
+
   <section class="win" id="win-runners" data-title="Runners">
     <header class="win-head"><span class="win-title">Runners</span><button class="win-close" title="Hide">✕</button></header>
     <div class="win-body scroll pad" id="runners"></div>
@@ -153,7 +159,7 @@
 <div id="toast" hidden></div>
 <div id="opt-dialog" hidden><div class="box">
   <h3>Asset optimisation</h3>
-  <p class="dim">Videos are converted on the Asset Manager to the codec chosen here, by their codec. Originals are kept; converted copies go in its <code>Optimized</code> folder, with the same names. More chunks let a Runner unpack a frame on more CPU cores at once; without Snappy there is nothing to unpack, but files are about twice as large. Converted copies have no audio.</p>
+  <p class="dim">Videos are converted on the Asset Manager to the codec chosen here, by their codec. Originals are kept; converted copies go in its <code>Optimized</code> folder, with the same names. More chunks let a Runner unpack a frame on more CPU cores at once; without Snappy there is nothing to unpack, but files are about twice as large. Converted copies have no audio: each file's sound is extracted separately, for the Runners to play.</p>
   <label><input type="checkbox" id="opt-enabled"> Optimise new and changed files automatically</label>
   <table class="opt-table"><thead><tr><th>Source</th><th>Convert to</th><th>Chunks</th><th>Snappy</th></tr></thead><tbody id="opt-rows"></tbody></table>
   <div class="btns"><button id="opt-cancel">Cancel</button><button id="opt-save" title="Applies to files optimised from now on">Save</button><button id="opt-apply" class="primary" title="Also optimise again the files made with other settings, and retry failures">Save and apply to existing files</button></div>

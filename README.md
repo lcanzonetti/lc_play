@@ -43,8 +43,9 @@ Producer, upload media, and see it play, synchronised, on a Runner's outputs.
   go through ffmpeg with hardware decoding where available and YUV
   conversion on the GPU — much better than before, but still a copy of
   every frame through the CPU: fine for HD and some 4K layers, not for huge
-  walls. No audio. Reverse playback is smooth for HAP, choppy for other
-  codecs.
+  walls. Reverse playback is smooth for HAP, choppy for other codecs.
+* **Sound plays at normal speed only**, and LTC input is not read yet (see
+  Sound, below).
 * **No keyframe animation.** A cue has one position, size, rotation and
   opacity, plus fade in/out.
 * **Control cues are executed by the Director.** They are frame-exact on all
@@ -267,7 +268,8 @@ HAP files re-chunked, HAP Q Alpha kept as it is.
   `Optimized (LC Play)\` instead (chosen once, logged at start-up). Two
   originals that would get the same name (`clip.mp4` and `clip.mov`) get
   two copies: the second gets a `~tag`. The settings and a record of what
-  was made are in `.lcplay\`. Converted copies have no audio.
+  was made are in `.lcplay\`. Converted copies have no audio: each file's
+  sound is extracted separately (see Sound).
 - **Re-chunking HAP is lossless**: the compressed texture is kept bit for
   bit, only its split into chunks and the Snappy setting change — fast,
   and no quality is lost. A HAP file already stored as asked is used as it
@@ -288,6 +290,40 @@ HAP files re-chunked, HAP Q Alpha kept as it is.
 - Other formats go through ffmpeg's HAP encoder, which needs ffmpeg built
   with Snappy (the usual Windows builds are). Sizes are padded to a
   multiple of 4 pixels.
+
+### Sound
+
+Every Runner plays the cues' sound on a sound card of its own computer,
+through the system's drivers, sample-locked to the cluster clock like the
+picture.
+
+1. **Asset Manager**: each video or sound file's audio is extracted once,
+   in the background, into `Optimized\<file>.wav` (32-bit float, 48 kHz,
+   every channel). The Assets window shows `sound: 2 ch` when it is ready.
+   Sound files (`.wav`, `.mp3`, `.flac` …) can be cued like videos; they
+   are heard, not drawn.
+2. **Producer → Windows → Audio**: the project's **buses** (Left, Right
+   by default; add Sub, Centre, zones …), and for each Runner its **output
+   device** (from the devices it reports; *Rescan devices* after plugging
+   one in), which bus each device channel plays, a **delay** to line the
+   sound up with the displays (projector or LED processor latency), and a
+   level. The window shows each Runner's device, latency, clock drift,
+   sync error and per-channel meters.
+3. **Inspector**, on a cue with sound: which bus each channel of its file
+   feeds (by default channel 1 → bus 1, 2 → 2 …), level, mute. The cue's
+   fades are its sound's fades.
+
+A bus can be played by several Runners — in step within the clock sync,
+right for separate zones; two Runners' speakers covering the same area
+would comb-filter, and the window warns. Sound is silent at rates other
+than 1× and while scrubbing; a free-running cue plays on regardless.
+
+On Windows the default driver is **WASAPI** (shared mode; whatever rate the
+device is set to, LC Play resamples). **ASIO** needs a build with
+`--features asio` and Steinberg's ASIO SDK (`CPAL_ASIO_DIR` pointing at it,
+plus LLVM for bindgen). The ASIO SDK is under a dual licence; using its
+GPLv3 option makes such a build GPLv3 — fine for machines you operate
+yourself, not for distributing binaries under MIT.
 
 ### Where a Runner keeps its files
 
@@ -432,7 +468,12 @@ cargo test --workspace
 
 The Runner's GPU tests need a Vulkan adapter (on a headless Linux box:
 `apt install mesa-vulkan-drivers`) and its video test needs `ffmpeg`; without
-them those tests skip.
+them those tests skip. Building the Runner on Linux needs ALSA's headers
+(`apt install libasound2-dev`). The test of the whole audio path on a real
+device is run by hand: `cargo test -p lc-runner --test audio_device --
+--ignored --nocapture` (ALSA's `null` device by default; `LCPLAY_TEST_AUDIO`
+names another, `LCPLAY_TEST_SOAK_S` keeps it playing and checks it stays
+locked).
 
 ## License
 

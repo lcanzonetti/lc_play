@@ -62,6 +62,9 @@ pub struct Playhead {
     reload_requests: AtomicU64,
     /// Operator actions for the renderer (restart, standby, preview …).
     requests: Mutex<Vec<RunnerAction>>,
+    /// Incremented when the operator asks for the sound devices to be
+    /// listed again; the audio thread acts when it sees the number change.
+    audio_rescans: AtomicU64,
     /// Output pictures captured by the renderer, waiting to be sent.
     previews: Mutex<Option<Vec<OutputPreview>>>,
     /// Outputs closed on request.
@@ -85,6 +88,10 @@ pub struct Hardware {
     pub vblank: Option<lc_proto::VblankReport>,
     /// Media being copied into the cache.
     pub downloads: Vec<lc_proto::AssetDownload>,
+    /// Sound devices, as last listed.
+    pub audio_devices: Vec<lc_proto::audio::AudioDeviceInfo>,
+    /// The audio output, when the show gives this Runner one.
+    pub audio: Option<lc_proto::audio::AudioHealth>,
 }
 
 struct Inner {
@@ -118,6 +125,7 @@ impl Playhead {
             fps_bits: AtomicU32::new(0),
             reload_requests: AtomicU64::new(0),
             requests: Mutex::new(Vec::new()),
+            audio_rescans: AtomicU64::new(0),
             previews: Mutex::new(None),
             standby: AtomicBool::new(false),
             hardware: Mutex::new(Hardware::default()),
@@ -342,6 +350,37 @@ impl Playhead {
     /// number it has acted on.
     pub fn reload_requests(&self) -> u64 {
         self.reload_requests.load(Ordering::Relaxed)
+    }
+
+    /// Ask the audio thread to list the sound devices again.
+    pub fn request_audio_rescan(&self) {
+        self.audio_rescans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn audio_rescans(&self) -> u64 {
+        self.audio_rescans.load(Ordering::Relaxed)
+    }
+
+    /// Copies of every timeline's transports and the timebase they are in
+    /// (the audio thread hands them to its callback).
+    #[allow(clippy::type_complexity)]
+    pub fn timelines(
+        &self,
+    ) -> (
+        TransportTimeline,
+        Vec<(String, TransportTimeline)>,
+        Option<ClockId>,
+    ) {
+        let inner = self.lock();
+        (
+            inner.timeline.clone(),
+            inner
+                .tasks
+                .iter()
+                .map(|(id, tl)| (id.clone(), tl.clone()))
+                .collect(),
+            inner.timeline_clock,
+        )
     }
 
     /// Queue an operator action for the renderer.

@@ -408,9 +408,10 @@ crates/
   lc-net        control-channel client (WebSocket)
   lc-director   Core (state + command logic) · server (WS/HTTP) · store (persistence)
   lc-runner     agent · playhead · stage (document → layers) · assets (cache) ·
-                renderer (app, card, plan, render, content, video, show, virtuals)
+                renderer (app, card, plan, render, content, video, show, virtuals) ·
+                audio (device, mixer, resample, pcm)
   lc-assets     media HTTP server (library, Range streaming, upload, thumbnails,
-                optimisation jobs)
+                optimisation jobs, sound extraction)
   lc-hap        HAP frames (decode, encode, re-chunk) and QuickTime read/write
   lc-producer   the operator's application: serves the interface (ui/) and shows
                 it in a native window (system web view)
@@ -628,6 +629,89 @@ crosses the CPU once, so this path scales with CPU and memory bandwidth, not
 GPU. Because the decoder only runs forward, reverse playback is choppy
 (restarts are limited to four a second).
 
+### Audio
+
+Sound follows the same rule as the picture: **each sample is a pure
+function of the show, the transports and the cluster time at which it is
+heard.** Nothing is streamed between machines; every Runner computes its own
+samples, and two Runners playing one bus agree to within the clock sync
+(tens of microseconds on a LAN).
+
+**Routing** (`lc-proto/src/audio.rs`): cue channel → project bus (per cue)
+→ device channels (per Runner). The buses are the project's; which device
+plays them, and on which channels, is per Runner — moving a show to another
+rig changes only that mapping. A Runner has one output device (one cpal
+stream) and one input device, reserved for LTC.
+
+**Extraction** (`lc-assets/src/audio.rs`). Runners never decode audio at show
+time. The Asset Manager writes each file's first audio stream, once, as WAV
+(RF64 when over 4 GB), 32-bit float, 48 kHz, all channels, at
+`Optimized/<source path>.wav`, from the original (optimised HAP files carry
+no sound), whether video optimisation is on or not. It records the offset
+between the audio and video streams' start times, so lip-sync survives
+encoder delay and edit lists. A manifest (`.lcplay/audio.json`) keeps it
+from redoing work.
+
+**Runner** (`lc-runner/src/audio/`):
+
+* `mod.rs`, the control thread: lists devices (at start and on
+  `rescan_audio`), opens the show's device, turns the show into a *plan*
+  (per cue with sound: its timing, its memory-mapped file, its routes as
+  (file channel, device channel, gain) triples), fetches sidecars through
+  the asset cache, touches the pages about to be played (a page fault that
+  reads the disk must never happen in the callback), and every 5 ms
+  publishes a snapshot: a linear map local → cluster time, the transport
+  timelines, and per cue whether it can be heard in the next seconds (cues
+  that cannot are skipped, so a show with hundreds of cues costs what its
+  audible ones cost). Health goes into the playhead for the agent's report.
+* `mixer.rs`, run by the driver's thread, with no lock, no allocation and
+  no file access: the plan arrives through a channel (the old one goes back
+  to the control thread to be freed), the snapshot through an `ArcSwap`.
+  The **mixer** computes frames of the *cluster grid* (frame *g* = cluster
+  time *g*/48 kHz): for each cue, the media sample due at that cluster
+  instant (`in_s` + elapsed show time, or time on air for a free-running
+  cue; looped at the video's length when `loop` is on). A jump — seek,
+  pause, a timeline loop, a cue starting mid-file — crossfades over 5 ms;
+  a cue that starts at its in point starts on that exact sample; a file's
+  own loop is seamless.
+* The **engine** reads the grid at the positions of the device's frames.
+  The driver says when the callback's first frame will be heard; the cluster
+  clock says which cluster instant that is; minus the Runner's `delay_ms`,
+  that is the grid position the frame must carry. A PI loop on the
+  difference between where the resampler is and where it should be
+  steers its step: it learns the card's clock against the cluster's (tens
+  of ppm; up to ±1000 ppm, which also covers the cluster clock's own
+  slewing), and a step (a dropped buffer) is slewed out mostly by the
+  proportional term, so the drift learnt is barely disturbed. Errors over
+  20 ms are corrected by a jump with the 5 ms fades. 1000 ppm is a
+  sixtieth of a semitone.
+* `resample.rs`: polyphase windowed sinc, 32 taps, Kaiser β = 8 (about
+  80 dB stop band), 512 phases interpolated linearly, pass band ending at
+  0.92 × the lower Nyquist frequency. It also converts 48 kHz to whatever
+  rate the device runs at (WASAPI's mix format, the ASIO driver's rate), so
+  Windows' own converter is never in the path. Only the device channels the
+  plan uses are resampled.
+* `device.rs`: cpal. WASAPI (shared mode) by default on Windows; ASIO with
+  the `asio` feature (it needs Steinberg's ASIO SDK at build time, under its
+  GPLv3 option). cpal's `realtime` feature puts the audio thread in MMCSS
+  "Pro Audio" on Windows. A device that fails is reopened every 3 s.
+
+**Cost**, measured in a release build (share of one core of the development
+machine, a cloud VM; a Windows laptop will differ): one
+cue on a stereo device 0.7 %, sixteen cues 3 %, sixty-four cues on sixteen
+channels 11 % — the per-sample work of finding each cue's due sample
+dominates, and is the place to optimise if shows need it.
+
+**Limits of this version.** Sound plays at normal speed only (silent at
+other rates and while scrubbing). LTC input is configured but not read yet.
+Only the device's clock drift is corrected, not its absolute latency: what
+the driver reports is trusted, and `delay_ms` trims the rest by ear or by
+measurement. Several Runners on one bus are in step within the clock sync,
+which suits separate zones; speakers covering the same area from two
+Runners would comb-filter, and the Producer says so. Verified on Linux
+(ALSA, and a PulseAudio sink as a clocked virtual device); the Windows
+build type-checks but has not been run on a real card.
+
 ### Virtual displays
 
 A virtual display (`stage.virtuals`; WATCHOUT has the same idea under the
@@ -733,7 +817,8 @@ Still to do, roughly in order of how much they limit real use:
 
 | Area | Missing |
 |---|---|
-| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); decoding shared between cards (today a layer spanning two cards is decoded once on each of them); audio. |
+| Playback performance | Zero-copy hardware decode for non-HAP codecs (decoded frames stay on the GPU); decoding shared between cards (today a layer spanning two cards is decoded once on each of them). |
+| Audio | LTC chase on the input device; sound at rates other than 1×; level automation; testing on Windows with WASAPI and ASIO cards; Dante/AES67 with PTP-locked sample clocks. |
 | Sync | Verification of §3.3 on frame-locked hardware; Vulkan present barrier (`VK_NV_present_barrier`) for non-D3D12 Runners. |
 | Assets | Content hashing; optimisation (transcode to the playback codec) on ingest; prefetch progress reported to the Producer. |
 | Authoring | Keyframes/tweens; a warp editor; control cues executed by Runners (so they work without the Director). |

@@ -49,6 +49,7 @@ pub async fn describe(state: &AppState, item: MediaItem) -> ItemDto {
     let status = state
         .optimizer
         .status(&item, mtime, probe.and_then(|p| p.source));
+    let item_ref = item.clone();
     let mut dto = ItemDto::from(item);
     dto.probe = probe;
     // What a Runner should download: the optimised file once it exists,
@@ -61,6 +62,7 @@ pub async fn describe(state: &AppState, item: MediaItem) -> ItemDto {
         dto.play_path = out.clone();
     }
     dto.optimized = Some(status);
+    dto.audio = state.audio.status(&item_ref, mtime);
     dto
 }
 
@@ -227,6 +229,7 @@ pub async fn delete_item(
     tokio::fs::remove_file(&item.abs_path).await?;
     crate::handlers::proxy::remove_proxies(&state.config.media_dir, &id).await;
     state.optimizer.forget(&item.path);
+    state.audio.forget(&item.path);
     rescan(&state).await;
     tracing::info!(name = %item.name, "asset deleted");
     Ok(Json(serde_json::json!({ "deleted": item.name })))

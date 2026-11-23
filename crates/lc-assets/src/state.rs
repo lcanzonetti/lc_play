@@ -35,6 +35,8 @@ pub struct AppState {
     pub proxy_failed: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     /// Background conversion to the playback codec (the codec map).
     pub optimizer: Arc<crate::optimize::Optimizer>,
+    /// Background extraction of each file's sound for the Runners.
+    pub audio: Arc<crate::audio::Extractor>,
 }
 
 impl AppState {
@@ -43,6 +45,8 @@ impl AppState {
         library: Arc<Library>,
         optimizer: Arc<crate::optimize::Optimizer>,
     ) -> Self {
+        let audio =
+            crate::audio::Extractor::new(&config.media_dir, &config.ffmpeg, &config.ffprobe);
         let slots = Arc::new(Semaphore::new(config.max_transcodes));
         AppState {
             config: Arc::new(config),
@@ -54,6 +58,7 @@ impl AppState {
             proxy_slots: Arc::new(Semaphore::new(crate::handlers::proxy::PROXY_JOBS)),
             proxy_failed: Arc::default(),
             optimizer,
+            audio,
         }
     }
 }

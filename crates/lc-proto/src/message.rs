@@ -190,6 +190,9 @@ pub enum RunnerAction {
     SendLogs,
     /// Reply with pictures of the outputs (`ClientMessage::Preview`).
     SendPreview,
+    /// List the sound devices again (one was plugged in or out): the next
+    /// health report carries the new list.
+    RescanAudio,
 }
 
 /// One monitor attached to a Runner, as its window system reports it.
@@ -253,6 +256,12 @@ pub struct Health {
     /// placeholder until it is complete).
     #[serde(default)]
     pub downloads: Vec<AssetDownload>,
+    /// The sound devices this Runner has, for the Producer's Audio window.
+    #[serde(default)]
+    pub audio_devices: Vec<crate::audio::AudioDeviceInfo>,
+    /// The audio output, when the show gives this Runner one.
+    #[serde(default)]
+    pub audio: Option<Box<crate::audio::AudioHealth>>,
 }
 
 /// A Producer's user, as the other Producers show them.
@@ -451,6 +460,10 @@ pub struct KnownRunner {
     #[serde(default)]
     pub machine: Option<MachineInfo>,
     pub online: bool,
+    /// Its sound devices as last reported, so they can be assigned while it
+    /// is offline.
+    #[serde(default)]
+    pub audio_devices: Vec<crate::audio::AudioDeviceInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

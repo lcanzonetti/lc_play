@@ -47,6 +47,20 @@ base64 = "0.23.1"
 # (`unlock_fair`), so the window thread is never starved of it.
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 
+# Audio: the sound card through the operating system's own drivers (WASAPI,
+# or ASIO with the `asio` feature; ALSA / CoreAudio elsewhere), sidecar PCM
+# files read straight from a memory mapping, and lock-free hand-over of
+# state to the audio callback. `realtime`: cpal raises its audio thread
+# (MMCSS "Pro Audio" on Windows, RT scheduling on Linux).
+cpal = { version = "0.18.2", features = ["realtime"] }
+memmap2 = "0.9"
+arc-swap = "1"
+
+[features]
+# ASIO drivers on Windows. Needs Steinberg's ASIO SDK (`CPAL_ASIO_DIR`) and
+# LLVM to build; the SDK's licence (GPLv3 option) is why it is opt-in.
+asio = ["cpal/asio"]
+
 [dev-dependencies]
 # Integration tests run a real Director in-process next to several agents.
 lc-director.workspace = true

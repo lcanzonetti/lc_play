@@ -29,6 +29,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::audio::{AssetAudio, AudioSetup, CueAudio};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShowDocument {
@@ -46,6 +48,8 @@ pub struct ShowDocument {
     /// operator, by show control, or by a control cue. They render in front
     /// of the main timeline.
     pub tasks: Vec<Timeline>,
+    /// The project's audio buses and where each Runner plays them.
+    pub audio: AudioSetup,
 }
 
 /// An auxiliary timeline. (The main timeline is the show's own `tracks`,
@@ -114,6 +118,7 @@ impl Default for ShowDocument {
             tracks: Vec::new(),
             control_cues: Vec::new(),
             tasks: Vec::new(),
+            audio: AudioSetup::default(),
         }
     }
 }
@@ -290,6 +295,8 @@ pub enum AssetKind {
     #[default]
     Image,
     Video,
+    /// Sound only: its cues play on the audio buses and draw nothing.
+    Audio,
 }
 
 /// A media file the show uses, and where a Runner can fetch it.
@@ -315,6 +322,9 @@ pub struct Asset {
     pub height: u32,
     /// Zero for stills.
     pub duration_s: f64,
+    /// The file's sound, as a PCM file made by the Asset Manager. `None`:
+    /// silent (no audio stream, or not extracted yet).
+    pub audio: Option<AssetAudio>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -401,6 +411,9 @@ pub struct Cue {
     /// Authoring only (Runners ignore it): the Producer keeps `w : h` when
     /// one of them is changed, in the inspector or on the stage.
     pub keep_aspect: bool,
+    /// Sound of an asset cue (video with sound, or audio): which bus each
+    /// channel feeds, gain, mute. Its fades are the cue's own.
+    pub audio: CueAudio,
 }
 
 impl Default for Cue {
@@ -423,6 +436,7 @@ impl Default for Cue {
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             keep_aspect: false,
+            audio: CueAudio::default(),
         }
     }
 }
@@ -535,6 +549,22 @@ impl ShowDocument {
             }
         }
 
+        crate::audio::validate(&self.audio)?;
+        for a in &self.assets {
+            if let Some(audio) = &a.audio {
+                let ok = (1..=crate::audio::MAX_CUE_CHANNELS as u32).contains(&audio.channels)
+                    && audio.offset_s.is_finite()
+                    && audio.offset_s.abs() < 3600.0;
+                if !ok {
+                    return Err(format!(
+                        "asset '{}': its audio needs 1..{} channels and a finite offset",
+                        a.name,
+                        crate::audio::MAX_CUE_CHANNELS
+                    ));
+                }
+            }
+        }
+
         let mut virtual_ids = std::collections::HashSet::new();
         for v in &s.virtuals {
             let name = format!(
@@ -635,6 +665,8 @@ impl ShowDocument {
                     if !(c.w > 0.0 && c.h > 0.0) {
                         return Err(format!("{name}: width and height must be positive"));
                     }
+                    crate::audio::validate_cue(&c.audio, self.audio.buses.len())
+                        .map_err(|e| format!("{name}: {e}"))?;
                     match &c.source {
                         CueSource::Asset { asset } => {
                             if self.asset(asset).is_none() {

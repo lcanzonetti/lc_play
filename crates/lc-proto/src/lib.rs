@@ -27,6 +27,7 @@
 //!   evaluating the formula forever — that is what makes playback survive a
 //!   Director failure.
 
+pub mod audio;
 pub mod beacon;
 pub mod edit;
 pub mod message;

@@ -38,6 +38,9 @@ pub struct ItemDto {
     /// Videos: where the optimiser is with this file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimized: Option<crate::optimize::Status>,
+    /// Videos and sound files: their sound, as Runners play it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<crate::audio::Status>,
     /// Pixel size and duration, when `ffprobe` could read the file.
     #[serde(flatten)]
     pub probe: Option<crate::handlers::manage::Probe>,
@@ -54,6 +57,7 @@ impl From<MediaItem> for ItemDto {
             play_size: m.size,
             play_path: m.path.clone(),
             optimized: None,
+            audio: None,
             id: m.id,
             name: m.name,
             path: m.path,

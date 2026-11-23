@@ -16,6 +16,8 @@
 //!   canvas → outputs with warp and edge blend (wgpu + winit); video frames
 //!   from an `ffmpeg` child process. [`virtuals`]: virtual displays, canvas
 //!   areas rendered into pictures that cues show.
+//! * [`audio`] — the cues' sound on this computer's sound card, sample-
+//!   locked to the cluster clock like the picture.
 //!
 //! The split is what makes playback resilient: the renderer depends only on
 //! the playhead, never on the network.
@@ -23,6 +25,7 @@
 pub mod agent;
 pub mod app;
 pub mod assets;
+pub mod audio;
 pub mod card;
 pub mod content;
 #[cfg(windows)]

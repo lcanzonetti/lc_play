@@ -507,6 +507,7 @@ impl Link {
             RunnerAction::Standby | RunnerAction::Resume | RunnerAction::ReloadOutputs
                 if !self.renderer => {}
             RunnerAction::ReloadOutputs => self.playhead.request_reload(),
+            RunnerAction::RescanAudio => self.playhead.request_audio_rescan(),
             // Everything else concerns the outputs: the renderer's job.
             other => self.playhead.request(other),
         }
@@ -532,6 +533,8 @@ impl Link {
             output_health: hardware.output_health,
             vblank: hardware.vblank,
             downloads: hardware.downloads,
+            audio_devices: hardware.audio_devices,
+            audio: hardware.audio.map(Box::new),
         }
     }
 

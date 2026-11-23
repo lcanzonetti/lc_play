@@ -768,6 +768,8 @@ fn health_with_refresh(vblank_ns: i64, exact: bool) -> lc_proto::Health {
         standby: false,
         output_health: Vec::new(),
         downloads: Vec::new(),
+        audio_devices: Vec::new(),
+        audio: None,
         vblank: Some(lc_proto::VblankReport {
             vblank_ns,
             period_ps: 16_683_333_333,

@@ -293,3 +293,19 @@ pre.log { margin: 0; padding: 8px 10px; font: 11px/1.4 ui-monospace, Consolas, m
 .task.main:hover { background: none; }
 .task[draggable=true] { cursor: grab; }
 .num { font-variant-numeric: tabular-nums; } /* number fields (text inputs: arithmetic can be typed) */
+
+/* Audio */
+.sound-thumb { width: 64px; height: 36px; display: grid; place-items: center; background: #102a3a; color: #7fc8f8; border-radius: 2px; font-size: 18px; }
+.cue.sound { background: #163c52; border-color: #4aa8d8; } /* a sound-only cue */
+#audio .row .warn { color: #e0b040; font-size: 11px; white-space: nowrap; }
+#audio .row .dim { font-size: 11px; white-space: nowrap; }
+#audio .runner-head { display: flex; gap: 8px; align-items: center; }
+#audio .runner-head .name { flex: 1; }
+#audio .audio-live { margin: 4px 0; }
+#audio .bad { color: #e05050; }
+.chanmap { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 3px 10px; margin: 6px 0; }
+.chanmap label { display: grid; grid-template-columns: 44px 1fr; align-items: center; gap: 4px; font-size: 12px; }
+.chanmap .meter { grid-column: 1 / -1; height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.chanmap .meter i { display: block; height: 100%; width: 0; background: #5fbf6f; transition: width .2s linear; }
+.chanmap .meter i.hot { background: #e0b040; }
+.chanmap .meter i.clip { background: #e05050; }
