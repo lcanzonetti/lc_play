@@ -148,6 +148,10 @@ function normalize(doc) {
   doc.tracks ??= [];
   doc.control_cues ??= [];
   doc.tasks ??= [];
+  // Folders of the Assets window (Producer only; see "asset folders").
+  doc.asset_folders ??= [];
+  doc.asset_placement ??= {};
+  for (const f of doc.asset_folders) { f.id ||= uid(); f.name ??= ''; f.parent ??= ''; }
   const st = (doc.stage ??= {});
   st.width ??= 1920; st.height ??= 1080;
   st.background ??= [0, 0, 0, 1];
@@ -452,7 +456,7 @@ function markOthers() {
 // are still on their way applied on top.
 
 /** Lists whose elements are addressed by id (as in edit.rs). */
-const KEYED = new Set(['tracks', 'cues', 'displays', 'virtuals', 'tasks', 'control_cues', 'assets']);
+const KEYED = new Set(['tracks', 'cues', 'displays', 'virtuals', 'tasks', 'control_cues', 'assets', 'asset_folders']);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const keyedList = (list) => list.every((e) => isObj(e) && typeof e.id === 'string' && e.id);
@@ -830,6 +834,7 @@ function afterChange(inspector = true) {
   pruneSelection();
   renderTimeline(); renderTasks(); renderRunners(true);
   if (inspector) renderInspector();
+  renderAssetsIfChanged();
   scheduleSend();
 }
 
@@ -887,6 +892,7 @@ function refreshAll() {
   if (!tlObj(S.tl)) S.tl = MAIN;
   pruneSelection();
   renderTimeline(); renderTasks(); renderRunners(true); renderInspector();
+  renderAssetsIfChanged();
 }
 
 function select(sel) {
@@ -1170,28 +1176,56 @@ async function openOptimizeSettings() {
 }
 
 /** The asset list: files being uploaded from this window first, greyed out
- *  with a bar under each, then the Asset Manager's library. */
+ *  with a bar under each, then the Asset Manager's library, filed in the
+ *  show's folders (see "asset folders"): at each level the folders first, by
+ *  name, then the assets, in the library's order. */
 function renderAssets() {
+  // Not while a folder name is being typed: that would remove the field.
+  if (renamingFolder) { assetsRenderLater = true; return; }
+  assetsRenderLater = false;
+  S.assetsKey = foldersKey();
   const list = $('#asset-list');
   list.replaceChildren(...S.uploads.map(uploadRow));
   if (S.library === null) return list.append(el('div', { class: 'empty' }, `Asset Manager not reachable at ${S.assetsUrl}`));
-  if (!S.library.length && !S.uploads.length) return list.append(el('div', { class: 'empty' }, 'No media yet. Upload files, or drop them here.'));
-  for (const item of S.library) {
-    const meta = [item.width ? `${item.width}×${item.height}` : item.kind,
-      item.duration_s ? `${item.duration_s.toFixed(1)} s` : null].filter(Boolean).join(' · ');
-    list.append(el('div', {
-      class: 'asset', draggable: 'true', title: item.name,
-      ondragstart: (e) => e.dataTransfer.setData('text/lcplay-asset', item.id),
-      ondblclick: () => addAssetCue(item, S.tl, 0, showSeconds(S.tl)),
-    },
-      // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
-      el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
-      el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta, optimizeBadge(item))),
-      el('div', { class: 'btns' },
-        item.kind === 'video' ? el('button', { title: 'Optimise again, with the current settings', onclick: (e) => { e.stopPropagation(); reoptimize(item); } }, '↻') : null,
-        el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕')),
-    ));
+  if (!S.library.length && !S.uploads.length && !folderList().length) {
+    return list.append(el('div', { class: 'empty' }, 'No media yet. Upload files or folders, or drop them here.'));
   }
+  // What each folder holds ('' = the top level).
+  const kids = new Map();
+  const at = (id) => kids.get(id) || kids.set(id, { folders: [], items: [] }).get(id);
+  for (const f of folderList()) at(folderParent(f)).folders.push(f);
+  for (const item of S.library) at(assetFolder(item.id)).items.push(item);
+  // Assets in a folder and all its subfolders: the number on a folder row.
+  const count = (id) => at(id).items.length + at(id).folders.reduce((n, f) => n + count(f.id), 0);
+  const add = (id, depth) => {
+    for (const f of at(id).folders.sort(byName)) {
+      const open = !closedFolders.has(f.id);
+      list.append(folderRow(f, depth, count(f.id), open));
+      if (open) add(f.id, depth + 1);
+    }
+    for (const item of at(id).items) list.append(assetRow(item, depth, id));
+  };
+  add('', 0);
+}
+
+/** A library item's row. `into`: the folder it is in, where something dropped
+ *  on it goes. */
+function assetRow(item, depth, into) {
+  const meta = [item.width ? `${item.width}×${item.height}` : item.kind,
+    item.duration_s ? `${item.duration_s.toFixed(1)} s` : null].filter(Boolean).join(' · ');
+  return el('div', {
+    class: 'asset', draggable: 'true', title: item.name, dataset: { into, item: item.id },
+    style: depth ? `margin-left:${depth * INDENT}px` : null,
+    ondragstart: (e) => e.dataTransfer.setData('text/lcplay-asset', item.id),
+    ondblclick: () => addAssetCue(item, S.tl, 0, showSeconds(S.tl)),
+  },
+    // `?v=size`: a replaced file gets a new URL, so no stale cached thumbnail.
+    el('img', { src: `${S.assetsUrl}/thumb/${item.id}?v=${item.size}`, loading: 'lazy', draggable: 'false' }),
+    el('div', {}, el('div', { class: 'name' }, item.name), el('div', { class: 'meta' }, meta, optimizeBadge(item))),
+    el('div', { class: 'btns' },
+      item.kind === 'video' ? el('button', { title: 'Optimise again, with the current settings', onclick: (e) => { e.stopPropagation(); reoptimize(item); } }, '↻') : null,
+      el('button', { class: 'danger', title: 'Delete from the Asset Manager', onclick: (e) => { e.stopPropagation(); deleteAsset(item); } }, '✕')),
+  );
 }
 
 async function deleteAsset(item) {
@@ -1204,6 +1238,201 @@ async function deleteAsset(item) {
     toast(`Could not delete ${item.name}: Asset Manager not reachable`);
   }
   loadLibrary();
+}
+
+// ───────────────────────────── asset folders ─────────────────────────────
+// Folders in the Assets window organise the library for this show only. They
+// are kept in the show document, like everything else the operator builds,
+// and are never folders on disk: the Asset Manager's files stay where they
+// are (flat in its media folder, for uploads). Two fields, which only the
+// Producer reads (the Director keeps them, Runners ignore them):
+//
+//   asset_folders:   [{ id, name, parent }]   parent: a folder id; '' = top level
+//   asset_placement: { <library item id>: <folder id> }   no entry = top level
+//
+// A flat list with parent links rather than folders nested inside folders:
+// moving a folder is one field, and the document does not get one level
+// deeper with every subfolder. Placement is a map rather than a list per
+// folder, so two people filing different assets at the same time change
+// different keys (diffDoc makes one `set` per key) and both changes survive.
+// Library ids come from the file name, so a file replaced under the same name
+// stays where it was filed.
+//
+// What a folder or an asset points at may be gone (removed by someone else at
+// the same moment), and two people may move two folders into each other.
+// Neither is an error: such a folder or asset is shown at the top level.
+
+const INDENT = 14; // px per folder level
+let renamingFolder = false;    // a folder name is being typed: renderAssets waits
+let assetsRenderLater = false; // …and runs when the name is done
+let draggedFolder = null;      // id of the folder being dragged in the list
+
+// Which folders are closed: per computer, like the window layout.
+const CLOSED_KEY = 'lcplay.closedFolders';
+const closedFolders = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(CLOSED_KEY) || '[]')); } catch { return new Set(); }
+})();
+function saveClosed() {
+  try { localStorage.setItem(CLOSED_KEY, JSON.stringify([...closedFolders])); } catch { /* not kept: fine */ }
+}
+
+const folderList = () => S.doc?.asset_folders || [];
+const findFolder = (id) => (id ? folderList().find((f) => f.id === id) || null : null);
+const byName = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+const foldersKey = () => JSON.stringify([S.doc?.asset_folders, S.doc?.asset_placement]);
+/** After a change to the show: redraw the list only if its folders changed
+ *  (this runs on every mouse-move of a drag). */
+function renderAssetsIfChanged() { if (foldersKey() !== S.assetsKey) renderAssets(); }
+
+/** The folder `f` is shown in: its parent, or the top level ('') when the
+ *  parent is gone or its parents lead back to `f` itself. */
+function folderParent(f) {
+  if (!findFolder(f.parent)) return '';
+  const seen = new Set();
+  for (let p = findFolder(f.parent); p && !seen.has(p.id); p = findFolder(p.parent)) {
+    if (p.id === f.id) return '';
+    seen.add(p.id);
+  }
+  return f.parent;
+}
+
+/** The folder a library item is shown in ('' = top level). */
+const assetFolder = (id) => findFolder(S.doc?.asset_placement?.[id])?.id || '';
+
+/** Is folder `id` the folder `ancestor`, or inside it? */
+function isWithin(id, ancestor) {
+  for (let f = findFolder(id), n = 0; f && n <= folderList().length; f = findFolder(folderParent(f)), n++) {
+    if (f.id === ancestor) return true;
+  }
+  return false;
+}
+
+/** "Show A / Intro": where a folder is, for messages. */
+function folderPath(id) {
+  const names = [];
+  for (let f = findFolder(id), n = 0; f && n <= folderList().length; f = findFolder(folderParent(f)), n++) names.unshift(f.name);
+  return names.join(' / ');
+}
+
+/** Put a library item in a folder ('' = top level). Inside an edit. */
+function setPlacement(id, folder) {
+  if (folder) S.doc.asset_placement[id] = folder;
+  else delete S.doc.asset_placement[id];
+}
+
+/** The folder `name` under `parent`, made if there is none. Inside an edit. */
+function folderNamed(name, parent) {
+  const found = folderList().find((f) => f.name === name && folderParent(f) === parent);
+  if (found) return found.id;
+  const id = uid();
+  S.doc.asset_folders.push({ id, name, parent });
+  return id;
+}
+
+/** "New folder", or "New folder 2"… if that name is taken at this level. */
+function freeFolderName(parent, base = 'New folder') {
+  const taken = new Set(folderList().filter((f) => folderParent(f) === parent).map((f) => f.name));
+  let name = base;
+  for (let n = 2; taken.has(name); n++) name = `${base} ${n}`;
+  return name;
+}
+
+function newFolder(parent = '') {
+  if (!S.doc) return toast('No show yet: connecting to the Director…');
+  const id = uid();
+  edit(() => S.doc.asset_folders.push({ id, name: freeFolderName(parent), parent }), { inspector: false });
+  if (closedFolders.delete(parent)) { saveClosed(); renderAssets(); } // so the new folder is in view
+  renameFolder(id);
+}
+
+/** Type a folder's new name in place: Enter or leaving the field keeps it,
+ *  Escape does not. */
+function renameFolder(id) {
+  const row = [...document.querySelectorAll('#asset-list .folder')].find((r) => r.dataset.folder === id);
+  const f = findFolder(id);
+  if (!row || !f) return;
+  const input = el('input', { type: 'text', class: 'rename', value: f.name, spellcheck: 'false', autocomplete: 'off' });
+  let done = false;
+  const finish = (keep) => {
+    if (done) return;
+    done = true;
+    renamingFolder = false;
+    const name = input.value.trim(), g = findFolder(id);
+    if (keep && g && name && name !== g.name) edit(() => { g.name = name; }, { inspector: false });
+    renderAssets();
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  for (const ev of ['click', 'dblclick', 'mousedown']) input.addEventListener(ev, (e) => e.stopPropagation());
+  row.draggable = false; // selecting text in the field must not drag the row
+  row.querySelector('.name').replaceWith(input);
+  renamingFolder = true;
+  input.focus();
+  input.select();
+}
+
+/** Remove a folder. What it holds (assets and folders) moves up one level:
+ *  no file is deleted, and nothing is lost from the list. */
+function removeFolder(id) {
+  const f = findFolder(id);
+  if (!f) return;
+  const up = folderParent(f);
+  edit(() => {
+    for (const g of S.doc.asset_folders) if (g.parent === id) g.parent = up;
+    for (const [item, folder] of Object.entries(S.doc.asset_placement)) if (folder === id) setPlacement(item, up);
+    S.doc.asset_folders.splice(S.doc.asset_folders.indexOf(f), 1);
+  }, { inspector: false });
+  closedFolders.delete(id);
+  saveClosed();
+  toast(`Folder "${f.name}" removed; what it held moved up a level. No file was deleted.`, true);
+}
+
+function toggleFolder(id) {
+  if (!closedFolders.delete(id)) closedFolders.add(id);
+  saveClosed();
+  renderAssets();
+}
+
+/** File a library item in a folder ('' = top level). */
+function fileAsset(id, folder) {
+  if (!S.doc || (folder && !findFolder(folder)) || assetFolder(id) === folder) return;
+  edit(() => setPlacement(id, folder), { inspector: false });
+}
+
+/** Move a folder into another one ('' = top level). Not into itself or one
+ *  of its own subfolders. */
+function moveFolder(id, into) {
+  const f = findFolder(id);
+  if (!f || (into && !findFolder(into)) || isWithin(into, id) || folderParent(f) === into) return;
+  edit(() => { f.parent = into; }, { inspector: false });
+}
+
+function folderRow(f, depth, count, open) {
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
+  return el('div', {
+    class: 'folder', draggable: 'true', title: f.name, dataset: { into: f.id, folder: f.id },
+    style: depth ? `margin-left:${depth * INDENT}px` : null,
+    onclick: () => toggleFolder(f.id),
+    ondragstart: (e) => {
+      draggedFolder = f.id;
+      e.dataTransfer.setData('text/lcplay-folder', f.id);
+      e.dataTransfer.effectAllowed = 'move';
+    },
+    ondragend: () => { draggedFolder = null; },
+  },
+    el('span', { class: 'twisty' }, open ? '▾' : '▸'),
+    el('span', { class: 'icon' }),
+    el('span', { class: 'name', ondblclick: stop(() => renameFolder(f.id)) }, f.name || 'Untitled'),
+    el('span', { class: 'count', title: `${count} asset${count === 1 ? '' : 's'}, subfolders included` }, String(count)),
+    el('div', { class: 'btns' },
+      el('button', { title: 'New folder inside this one', onclick: stop(() => newFolder(f.id)) }, '+'),
+      el('button', { title: 'Rename (or double-click the name)', onclick: stop(() => renameFolder(f.id)) }, '✎'),
+      el('button', { class: 'danger', title: 'Remove this folder. What it holds moves up one level; no file is deleted.', onclick: stop(() => removeFolder(f.id)) }, '✕')),
+  );
 }
 
 // ───────────────────────────── uploads ─────────────────────────────
@@ -1230,10 +1459,110 @@ async function deleteAsset(item) {
 /** "640 KB", "2.9 MB", "850 MB", "3.40 GB". */
 const mb = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(b < 1e8 ? 1 : 0)} MB` : `${Math.round(b / 1e3)} KB`);
 
-function uploadFiles(files) {
-  for (const file of files) S.uploads.push({ key: uid(), file, name: file.name, size: file.size, sent: 0, state: 'waiting' });
+/** Queue files for upload. `folder`: the show folder each lands in once
+ *  stored ('' = top level); undefined leaves a replaced file where it was. */
+function uploadFiles(files, folder) {
+  queueUploads(files.map((file) => ({ file, folder })));
+}
+
+function queueUploads(list) {
+  for (const { file, folder } of list) S.uploads.push({ key: uid(), file, folder, name: file.name, size: file.size, sent: 0, state: 'waiting' });
   renderAssets();
   pumpUploads();
+}
+
+// Media the Asset Manager stores: lc-assets/src/library.rs, VIDEO_EXTS,
+// IMAGE_EXTS and AUDIO_EXTS. Files found inside an uploaded folder that are
+// not media (notes, project files, Thumbs.db) are skipped rather than sent
+// to be refused one by one. A file given on its own is always sent: the
+// Asset Manager's answer says why it is refused.
+const MEDIA_EXTS = new Set(['mp4', 'mkv', 'webm', 'avi', 'mov', 'm4v', 'flv', 'wmv', 'mpeg', 'mpg', 'ts', 'm2ts', '3gp',
+  'png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp',
+  'mp3', 'flac', 'aac', 'ogg', 'oga', 'opus', 'wav', 'm4a', 'wma', 'aiff', 'alac']);
+const isMedia = (name) => !name.startsWith('.') && MEDIA_EXTS.has(name.split('.').pop().toLowerCase());
+
+/** File an uploaded item in the folder it was uploaded into. Not an undo
+ *  step (like reconcileAssets): it completes the upload, which undo does not
+ *  reverse either. A folder removed meanwhile: the item stays where it was. */
+function placeUploaded(id, folder) {
+  if (!S.doc || (folder && !findFolder(folder)) || assetFolder(id) === folder) return;
+  setPlacement(id, folder);
+  afterChange(false);
+}
+
+/** Upload what was found in folders: [{ file, dirs }], `dirs` being the
+ *  folders it was in ('Show A/Intro/x.mov' → ['Show A', 'Intro']; [] for a
+ *  file given on its own). The same folders are made in the show, under
+ *  `into` (or found, if they are already there: uploading a folder again
+ *  does not make a second one), and each file is filed in its own. On disk
+ *  the files are stored side by side as always: a name that comes twice is
+ *  one file, the last uploaded. */
+function uploadTree(found, into) {
+  const skipped = [], keep = [];
+  for (const x of found) {
+    if (x.dirs.some((d) => d.startsWith('.'))) continue; // hidden folders (.git, .DS_Store…): not content
+    if (x.dirs.length && !isMedia(x.file.name)) skipped.push(x.file.name);
+    else keep.push(x);
+  }
+  // Folders in the order the files come, which is the folder's own (sorted)
+  // order: in one edit, so one undo removes them all.
+  const inFolders = keep.filter((x) => x.dirs.length);
+  if (inFolders.length && S.doc) {
+    edit(() => {
+      for (const x of inFolders) x.folder = x.dirs.reduce((parent, name) => folderNamed(name, parent), into);
+    }, { inspector: false });
+  }
+  queueUploads(keep.map((x) => ({ file: x.file, folder: x.folder ?? into })));
+  if (skipped.length) {
+    toast(`${skipped.length} file${skipped.length === 1 ? ' is' : 's are'} not media and ${skipped.length === 1 ? 'was' : 'were'} skipped: `
+      + skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ', …' : ''), true);
+  }
+  if (!keep.length && !skipped.length) toast('Nothing to upload: the folder is empty.', true);
+}
+
+/** The files of a drop, with the folders they were in, for uploadTree.
+ *  Folders are read through the File and Directory Entries API. Its entries
+ *  must be taken during the drop event itself (the browser empties the
+ *  DataTransfer afterwards), so this is called first, before any await, and
+ *  returns a function that reads them. Null when the browser offers no
+ *  entries: then only plain files can be taken. */
+function droppedEntries(dt) {
+  const entries = [...(dt.items || [])].filter((i) => i.kind === 'file').map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  if (!entries.length) return null;
+  return async () => {
+    const out = [];
+    const file = (entry) => new Promise((resolve, reject) => entry.file(resolve, reject));
+    const walk = async (entry, dirs) => {
+      if (entry.isFile) {
+        out.push({ file: await file(entry), dirs });
+      } else if (entry.isDirectory) {
+        // readEntries gives a folder's entries a batch at a time (100 in
+        // Chromium): call it until it returns none.
+        const reader = entry.createReader(), all = [];
+        for (;;) {
+          const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+          if (!batch.length) break;
+          all.push(...batch);
+        }
+        all.sort(byName);
+        for (const e of all) await walk(e, [...dirs, entry.name]);
+      }
+    };
+    for (const e of entries) await walk(e, []);
+    return out;
+  };
+}
+
+/** Files and folders dropped on the asset list, into the show folder
+ *  `into` ('' = top level). */
+async function uploadDropped(dt, into) {
+  const read = droppedEntries(dt);
+  if (!read) return uploadFiles([...dt.files], into);
+  try {
+    uploadTree(await read(), into);
+  } catch (e) {
+    toast(`Cannot read what was dropped: ${e?.message || e}`);
+  }
 }
 
 /** Start the next waiting upload, unless one is being sent. */
@@ -1254,8 +1583,10 @@ function sendUpload(u) {
     u.sent = u.size;
     updateUploadRow(u);
     pumpUploads();
-    let kind = '';
-    try { kind = JSON.parse(xhr.responseText).kind; } catch { /* only used for the message */ }
+    let item = {};
+    try { item = JSON.parse(xhr.responseText); } catch { /* only used to file it, and for the message */ }
+    const kind = item.kind;
+    if (u.folder !== undefined && item.id) placeUploaded(item.id, u.folder);
     // The library now has the file: list it, then drop the upload row, so
     // the row is replaced rather than disappearing and coming back.
     await loadLibrary();
@@ -1318,7 +1649,9 @@ function uploadRow(u) {
   const row = el('div', { class: 'asset upload', dataset: { upload: u.key } },
     el('div', { class: 'up-thumb' }, ext),
     el('div', {}, el('div', { class: 'name' }, u.name),
-      el('div', { class: 'meta' }, status, replaces ? el('span', { class: 'up-note' }, 'replaces the file of the same name') : null)),
+      el('div', { class: 'meta' }, status,
+        u.folder && findFolder(u.folder) ? el('span', { class: 'up-note' }, `into ${folderPath(u.folder)}`) : null,
+        replaces ? el('span', { class: 'up-note' }, 'replaces the file of the same name') : null)),
     el('div', { class: 'btns' }, retry, cancel),
     el('div', { class: 'bar' }, fill));
   u.ui = { row, status, fill, retry, cancel };
@@ -3400,14 +3733,42 @@ $('#file-open').onchange = async (e) => {
 $('#btn-upload').onclick = () => $('#file-upload').click();
 $('#btn-optimize').onclick = () => openOptimizeSettings();
 $('#file-upload').onchange = (e) => { uploadFiles([...e.target.files]); e.target.value = ''; };
+$('#btn-upload-folder').onclick = () => $('#folder-upload').click();
+// A folder picked: its files, with the folders they are in (their path
+// relative to the folder chosen, which comes first).
+$('#folder-upload').onchange = (e) => {
+  const found = [...e.target.files].map((file) => ({ file, dirs: (file.webkitRelativePath || file.name).split('/').slice(0, -1) }));
+  e.target.value = '';
+  uploadTree(found, '');
+};
+$('#btn-new-folder').onclick = () => newFolder('');
 
-// Files dropped on the asset panel are uploaded.
+// Dropped on the asset list: files and folders from the computer (uploaded),
+// assets and folders of the list itself (filed). Where they go: the folder
+// row under the pointer, or the folder of the asset under it, or else the
+// top level. Every row says which in its data-into.
 const assetList = $('#asset-list');
-assetList.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('Files')) { e.preventDefault(); assetList.classList.add('drop'); } });
-assetList.addEventListener('dragleave', () => assetList.classList.remove('drop'));
+const dropInto = (e) => e.target.closest?.('[data-into]')?.dataset.into ?? '';
+const dropKinds = ['Files', 'text/lcplay-asset', 'text/lcplay-folder'];
+function markDrop(into) {
+  assetList.classList.toggle('drop', into === '');
+  for (const r of assetList.querySelectorAll('.folder')) r.classList.toggle('drop-into', r.dataset.folder === into);
+}
+assetList.addEventListener('dragover', (e) => {
+  if (!dropKinds.some((k) => e.dataTransfer.types.includes(k))) return;
+  const into = dropInto(e);
+  // A folder cannot go into itself or one of its subfolders.
+  if (draggedFolder && into && isWithin(into, draggedFolder)) return markDrop(null);
+  e.preventDefault();
+  markDrop(into);
+});
+assetList.addEventListener('dragleave', (e) => { if (!assetList.contains(e.relatedTarget)) markDrop(null); });
 assetList.addEventListener('drop', (e) => {
-  assetList.classList.remove('drop');
-  if (e.dataTransfer.files.length) { e.preventDefault(); uploadFiles([...e.dataTransfer.files]); }
+  markDrop(null);
+  const into = dropInto(e), dt = e.dataTransfer;
+  if (dt.types.includes('Files')) { e.preventDefault(); uploadDropped(dt, into); }
+  else if (dt.types.includes('text/lcplay-asset')) { e.preventDefault(); fileAsset(dt.getData('text/lcplay-asset'), into); }
+  else if (dt.types.includes('text/lcplay-folder')) { e.preventDefault(); moveFolder(dt.getData('text/lcplay-folder'), into); }
 });
 
 window.addEventListener('keydown', (e) => {

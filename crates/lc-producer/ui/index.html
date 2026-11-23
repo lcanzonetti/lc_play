@@ -75,8 +75,13 @@
       <button id="btn-upload">Upload…</button>
       <button id="btn-optimize" title="What each codec is converted to, in how many chunks, with or without Snappy">Optimise…</button>
       <input type="file" id="file-upload" multiple hidden>
+      <input type="file" id="folder-upload" webkitdirectory multiple hidden>
       <button class="win-close" title="Hide">✕</button></header>
     <div class="win-body col">
+      <div class="toolbar">
+        <button id="btn-upload-folder" class="small" title="Upload a whole folder: its media files are uploaded and filed in folders of the same names (you can also drop folders on the list)">Upload folder…</button>
+        <button id="btn-new-folder" class="small" title="A folder to organise the list. It is kept in the show; no file moves on the Asset Manager. Drag assets and folders onto it.">+ Folder</button>
+      </div>
       <div id="asset-list" class="scroll grow"></div>
       <div class="foot">
         <button id="btn-color">+ Colour cue</button>

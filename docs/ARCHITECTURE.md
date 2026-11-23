@@ -552,6 +552,15 @@ original of exactly the same size is not detected. Content hashing is the
 planned fix. (Optimised copies carry their version in the URL, `?v=`, so
 re-optimising is always detected.)
 
+Folders in the Producer's Assets window are part of the show
+(`asset_folders`, `asset_placement`; PROTOCOL.md §5), not of the Asset
+Manager: they organise the list for that show, and filing an asset moves no
+file. Uploads stay flat in the media folder whatever folder they are
+uploaded into, so two files of the same name in different folders are one
+file (the last uploaded). A folder given to the Producer (picked, or
+dropped) is uploaded file by file, and its folders are made in the show,
+reusing those of the same name at the same place.
+
 ### Optimisation (Asset Manager)
 
 `lc-assets/src/optimize.rs`. ffprobe classifies each video (codec name,

@@ -342,8 +342,9 @@ fn insertion_point(list: &[Value], after: Option<&str>) -> usize {
     }
 }
 
-/// The lists whose elements are addressed by id.
-pub const KEYED_LISTS: [&str; 7] = [
+/// The lists whose elements are addressed by id. (`asset_folders`: the
+/// Producer's folders of the Assets window, which only it reads.)
+pub const KEYED_LISTS: [&str; 8] = [
     "tracks",
     "cues",
     "displays",
@@ -351,6 +352,7 @@ pub const KEYED_LISTS: [&str; 7] = [
     "tasks",
     "control_cues",
     "assets",
+    "asset_folders",
 ];
 
 /// Give every element of the keyed lists an id, where one is missing (a
@@ -627,6 +629,42 @@ mod tests {
     fn depth_is_measured() {
         assert_eq!(depth(&json!(1)), 0);
         assert_eq!(depth(&json!({ "a": [ { "b": 1 } ] })), 3);
+    }
+
+    #[test]
+    fn asset_folders_are_kept_and_edited_like_any_list() {
+        // The Producer's folders (a keyed list) and where each asset is
+        // filed (a map): two people filing different assets both keep their
+        // change, and the show still reads and validates as a show. (An
+        // older show has neither field: both are created.)
+        let mut d = json!({ "name": "show", "tracks": [] });
+        apply(
+            &mut d,
+            &ops(
+                json!([{ "op": "insert", "path": ["asset_folders"], "after": null,
+                "value": { "id": "f1", "name": "Show A", "parent": "" } }]),
+            ),
+        )
+        .unwrap();
+        let alice =
+            ops(json!([{ "op": "set", "path": ["asset_placement", "636c6970"], "value": "f1" }]));
+        let bob =
+            ops(json!([{ "op": "set", "path": ["asset_placement", "6c6f676f"], "value": "f1" }]));
+        apply(&mut d, &alice).unwrap();
+        apply(&mut d, &bob).unwrap();
+        assert_eq!(
+            d["asset_placement"],
+            json!({ "636c6970": "f1", "6c6f676f": "f1" })
+        );
+        // Moving a folder is one field.
+        apply(
+            &mut d,
+            &ops(json!([{ "op": "set", "path": ["asset_folders", { "id": "f1" }, "parent"], "value": "f0" }])),
+        )
+        .unwrap();
+        assert_eq!(d["asset_folders"][0]["parent"], "f0");
+        let show: crate::show::ShowDocument = serde_json::from_value(d).unwrap();
+        show.validate().unwrap();
     }
 
     #[test]

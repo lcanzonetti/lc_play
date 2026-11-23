@@ -335,6 +335,14 @@ broadcasts them back. Other tools may ignore it.
 * The first track is in front.
 * `keep_aspect` (cues, virtual displays) is for the Producer only: it keeps
   width : height when one is changed. Runners ignore it.
+* `asset_folders` and `asset_placement` are for the Producer only: the
+  folders its Assets window shows, which organise the library for this show
+  and are not folders on the Asset Manager. `asset_folders` is a list of
+  `{ "id", "name", "parent" }` (`parent`: another folder's id, `""` for the
+  top level); `asset_placement` maps a library item id to the id of the
+  folder it is filed in (no entry: top level). A folder whose parent is gone,
+  or whose parents lead back to itself, is shown at the top level; so is an
+  item filed in a folder that is gone. Runners ignore both.
 * `runner` is a Runner's `--name`; empty means any Runner.
 * A display's `test_pattern` (optional): `{ "kind": "lines" | "counter",
   "fps": 60 }` — drawn by its Runner over the content, on that display only,
