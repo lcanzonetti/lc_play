@@ -1,0 +1,13 @@
+[package]
+name = "lc-deck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A presentation deck (slides, shapes, text, transitions, click steps) independent of the file format it was read from"
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

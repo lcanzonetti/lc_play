@@ -10,6 +10,8 @@
 #   lc-director   coordinator: authoritative state + master clock
 #   lc-runner     display server: sync agent + wgpu renderer
 #   lc-assets     asset manager: HTTP media store / transcoder
+#   lc-deck       presentation model shared by every presentation format
+#   lc-ooxml      PowerPoint .pptx reader into lc-deck
 #   lc-ctl        command-line controller
 #   lc-producer   operator's web interface
 #   lc-play       all-in-one launcher for a single machine
@@ -21,6 +23,8 @@ members = [
     "crates/lc-net",
     "crates/lc-director",
     "crates/lc-hap",
+    "crates/lc-deck",
+    "crates/lc-ooxml",
     "crates/lc-runner",
     "crates/lc-assets",
     "crates/lc-ctl",
@@ -44,6 +48,8 @@ lc-discovery = { path = "crates/lc-discovery" }
 lc-net = { path = "crates/lc-net" }
 lc-director = { path = "crates/lc-director" }
 lc-hap = { path = "crates/lc-hap" }
+lc-deck = { path = "crates/lc-deck" }
+lc-ooxml = { path = "crates/lc-ooxml" }
 
 anyhow = "1"
 axum = "0.8"

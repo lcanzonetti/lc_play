@@ -412,11 +412,14 @@ crates/
   lc-assets     media HTTP server (library, Range streaming, upload, thumbnails,
                 optimisation jobs)
   lc-hap        HAP frames (decode, encode, re-chunk) and QuickTime read/write
+  lc-deck       presentation model (slides, shapes, text, transitions, click
+                steps), independent of the file format. No I/O.
+  lc-ooxml      PowerPoint .pptx reader into lc-deck (see PRESENTATIONS.md)
   lc-producer   the operator's application: serves the interface (ui/) and shows
                 it in a native window (system web view)
   lc-ctl        command-line controller, reference protocol client
   lc-play       launcher: all of the above on one machine
-docs/           this file, PROTOCOL.md
+docs/           this file, PROTOCOL.md, PRESENTATIONS.md
 ```
 
 Dependency direction: `proto ← time ← {director, runner}`; `discovery` and
